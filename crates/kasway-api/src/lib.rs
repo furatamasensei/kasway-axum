@@ -58,6 +58,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/failures", get(handlers::internal_observability::failures))
         .route("/internal/payment-ops/tn10/status", get(handlers::internal_observability::tn10_status))
         // --- Internal SLO (DB-derived) ---
+        .route("/internal/payment-ops/status", get(handlers::payment_launch::internal_status))
         .route("/internal/payment-ops/slo", get(handlers::internal_slo::slo))
         .route("/internal/payment-ops/slo/queues", get(handlers::internal_slo::queues))
         .route("/internal/payment-ops/slo/incidents", get(handlers::internal_slo::incidents))
@@ -185,6 +186,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/payments/ops/exports/:id", get(handlers::payment_operations_exports::show))
         .route("/api/payments/ops/exports/:id/download", get(handlers::payment_operations_exports::download))
+        // --- Payment-ops launch status (auth) ---
+        .route("/api/payments/ops/status", get(handlers::payment_launch::status))
         // --- Payment-ops analytics (auth) ---
         .route("/api/payments/ops/analytics/summary", get(handlers::payment_analytics::summary))
         .route("/api/payments/ops/analytics/timeseries", get(handlers::payment_analytics::timeseries))
@@ -221,6 +224,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/support/payments/webhook-deliveries/:id", get(handlers::payment_support_operations::get_webhook_delivery))
         .route("/api/support/payments/invoices/:id/notes", post(handlers::payment_support_operations::add_invoice_note))
         .route("/api/support/payments/invoices/:id/evidence-packs/regenerate", post(handlers::payment_support_operations::regenerate_evidence_pack))
+        .route("/api/support/payments/webhook-deliveries/:id/replay", post(handlers::payment_support_operations::replay_webhook_delivery))
         // --- Payment audit token-read endpoints (public; grant token + scope) ---
         .route("/api/payments/audit/:token/statements", get(handlers::payment_audit_access::statements))
         .route("/api/payments/audit/:token/exports", get(handlers::payment_audit_access::exports))

@@ -2,7 +2,7 @@
 
 This document maps every HTTP endpoint defined in `start/routes.ts` of the AdonisJS API, with full paths reconstructed from all enclosing group prefixes, controller handlers, route-level middleware (beyond the tier middleware), and porting status. Use it as the authoritative checklist for the Rust/Axum port so no endpoint is missed.
 
-Coverage: 231 / 249 ported
+Coverage: 234 / 249 ported
 
 ## Framework-provided (transmit SSE)
 
@@ -30,7 +30,7 @@ Coverage: 231 / 249 ported
 | 5 | GET | /internal/payment-ops/slo | internal_payment_ops_slo_controller.ts@slo | internal_slo_obs_test (DB indicators) | ✅ |
 | 6 | GET | /internal/payment-ops/slo/queues | internal_payment_ops_slo_controller.ts@queues | internal_slo_obs_test | ✅ |
 | 7 | GET | /internal/payment-ops/slo/incidents | internal_payment_ops_slo_controller.ts@incidents | internal_slo_obs_test | ✅ |
-| 8 | GET | /internal/payment-ops/status | payment_launch_controller.ts@internalStatus | — | ⬜ |
+| 8 | GET | /internal/payment-ops/status | payment_launch_controller.ts@internalStatus | launch_status_test (queue=SLO, storage=fs, tn10 disabled) | ✅ |
 | 9 | GET | /internal/payment-ops/security/launch-gate | internal_security_launch_gate_controller.ts@show | internal_static_test (findings.json absent → static default) | ✅ |
 | 10 | GET | /internal/payment-ops/tn10/status | internal_tn10_node_controller.ts@show | internal_slo_obs_test (disabled report; live RPC external) | ✅ |
 | 11 | GET | /internal/payment-ops/tocatta/silverscript/status | internal_silverscript_controller.ts@show | — | ⬜ |
@@ -231,7 +231,7 @@ Coverage: 231 / 249 ported
 | 181 | GET | /api/payments/ops/retention-policy | payment_retention_policies_controller.ts@policy | — | ✅ |
 | 182 | PUT | /api/payments/ops/retention-policy | payment_retention_policies_controller.ts@updatePolicy | — | ✅ |
 | 183 | GET | /api/payments/ops/retention-runs | payment_retention_policies_controller.ts@retentionRuns | — | ✅ |
-| 184 | GET | /api/payments/ops/status | payment_launch_controller.ts@status | — | ⬜ |
+| 184 | GET | /api/payments/ops/status | payment_launch_controller.ts@status | launch_status_test | ✅ |
 | 185 | GET | /api/payments/ops/invoices | payment_operations_controller.ts@invoices | — | ✅ |
 | 186 | GET | /api/payments/ops/invoices/:id | payment_operations_controller.ts@invoiceDetail | — | ✅ |
 | 187 | GET | /api/payments/ops/invoices/:id/adjustments | payment_adjustments_controller.ts@index | — | ✅ |
@@ -299,7 +299,7 @@ Coverage: 231 / 249 ported
 | 244 | GET | /api/support/payments/exceptions | support_payment_operations_controller.ts@exceptions | support_payments_test (cross-merchant via payment_exceptions::derive_user_exceptions) | ✅ |
 | 245 | GET | /api/support/payments/webhook-deliveries/:id | support_payment_operations_controller.ts@getWebhookDelivery | support_payments_test | ✅ |
 | 246 | POST | /api/support/payments/invoices/:id/notes | support_payment_operations_controller.ts@addInvoiceNote | support_payments_test | ✅ |
-| 247 | POST | /api/support/payments/webhook-deliveries/:id/replay | support_payment_operations_controller.ts@replayWebhookDelivery | external (redelivery job) | ⬜🔒 |
+| 247 | POST | /api/support/payments/webhook-deliveries/:id/replay | support_payment_operations_controller.ts@replayWebhookDelivery | support_payments_test (replay row; delivery job stubbed) | ✅ |
 | 248 | POST | /api/support/payments/invoices/:id/evidence-packs/regenerate | support_payment_operations_controller.ts@regenerateEvidencePack | support_payments_test (queued; build job external) | ✅ |
 
 ## Admin — queue dashboard (middleware.adminQueueDashboard)

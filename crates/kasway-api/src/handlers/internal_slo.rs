@@ -249,23 +249,28 @@ async fn build_indicators(state: &AppState, now: DateTime<Utc>) -> AppResult<Val
     }))
 }
 
-/// `GET /internal/payment-ops/slo`
-pub async fn slo(_token: InternalToken, State(state): State<AppState>) -> AppResult<Json<Value>> {
+/// SLO report Value (shared by the `slo` handler and PaymentLaunchService).
+pub(crate) async fn report_value(state: &AppState) -> AppResult<Value> {
     let now = Utc::now();
-    let ind = build_indicators(&state, now).await?;
+    let ind = build_indicators(state, now).await?;
     let statuses: Vec<&str> = ["indexerFreshness", "observationIngestionLag", "matchJobLag", "settlementJobLag", "webhookFinalFailureRate", "asyncExportSuccessRate", "notificationJobs"]
         .iter().map(|k| ind[*k]["status"].as_str().unwrap()).collect();
     let overall = max_status(&statuses);
     let incidents = compose_incidents(&ind, now);
     let warn = incidents.iter().filter(|i| i["status"] == "open" && i["severity"] == "warn").count() as i64;
     let critical = incidents.iter().filter(|i| i["status"] == "open" && i["severity"] == "critical").count() as i64;
-    Ok(Json(json!({
+    Ok(json!({
         "generatedAt": iso(now),
         "overallStatus": overall,
         "thresholds": config(),
         "incidents": { "critical": critical, "warn": warn, "open": warn + critical },
         "indicators": ind,
-    })))
+    }))
+}
+
+/// `GET /internal/payment-ops/slo`
+pub async fn slo(_token: InternalToken, State(state): State<AppState>) -> AppResult<Json<Value>> {
+    Ok(Json(report_value(&state).await?))
 }
 
 /// `GET /internal/payment-ops/slo/incidents`
@@ -284,10 +289,15 @@ pub async fn incidents(_token: InternalToken, State(state): State<AppState>) -> 
 
 /// `GET /internal/payment-ops/slo/queues`
 pub async fn queues(_token: InternalToken, State(state): State<AppState>) -> AppResult<Json<Value>> {
+    Ok(Json(queues_value(&state).await?))
+}
+
+/// Queue snapshot Value (shared by the `queues` handler and PaymentLaunchService).
+pub(crate) async fn queues_value(state: &AppState) -> AppResult<Value> {
     let now = Utc::now();
-    let indexer = indexer_freshness(&state, now).await?;
-    let match_lag = observation_age_indicator(&state, &["pending"], now, 300, 900).await?;
-    let settle_lag = observation_age_indicator(&state, &["matched"], now, 600, 1800).await?;
+    let indexer = indexer_freshness(state, now).await?;
+    let match_lag = observation_age_indicator(state, &["pending"], now, 300, 900).await?;
+    let settle_lag = observation_age_indicator(state, &["matched"], now, 600, 1800).await?;
 
     // webhook delivery queue (all-time backlog + oldest pending/delivering)
     let wh_rows = sqlx::query_as::<_, (String, i64)>("SELECT status, COUNT(*) FROM webhook_deliveries GROUP BY status").fetch_all(&state.db.pool).await?;
@@ -322,7 +332,7 @@ pub async fn queues(_token: InternalToken, State(state): State<AppState>) -> App
     let ex_success_status = rate_status(ex_failure_rate, 1.0 - 0.95, 1.0 - 0.8, 5, ex_totals);
     let ex_status = max_status(&[ex_age_status, ex_success_status]);
 
-    let notif = notification_counts(&state, now).await?;
+    let notif = notification_counts(state, now).await?;
 
     let reconcile_status = max_status(&[match_lag["status"].as_str().unwrap(), settle_lag["status"].as_str().unwrap()]);
     let reconcile_age = max_finite(match_lag["ageSeconds"].as_i64(), settle_lag["ageSeconds"].as_i64());
@@ -337,7 +347,7 @@ pub async fn queues(_token: InternalToken, State(state): State<AppState>) -> App
         { "name": "exports", "status": ex_status, "backlog": { "queued": equeued, "running": erunning, "succeeded": esucceeded, "failed": efailed, "expired": eexpired, "other": eother }, "oldestAgeSeconds": ex_oldest_age, "oldestItemAt": ex_oldest, "threshold": { "warnSeconds": 900, "criticalSeconds": 3600 }, "metadata": { "source": "payment_operation_exports", "successRate": ex_success_rate } },
         { "name": "payment_notifications", "status": notif["status"], "backlog": { "warningAndInfo": notif["successCount"], "critical": notif["failureCount"] }, "oldestAgeSeconds": Value::Null, "oldestItemAt": Value::Null, "threshold": { "warnFailures": 3, "criticalFailures": 12 }, "metadata": { "lookbackHours": 1 } }
     ]);
-    Ok(Json(json!({ "generatedAt": iso(now), "queues": queues })))
+    Ok(json!({ "generatedAt": iso(now), "queues": queues }))
 }
 
 fn max_finite(a: Option<i64>, b: Option<i64>) -> Value {

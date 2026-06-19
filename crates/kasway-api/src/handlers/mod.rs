@@ -29,6 +29,7 @@ pub mod payment_evidence_packs;
 pub mod payment_exceptions;
 pub mod payment_financial_reporting;
 pub mod payment_financial_statements;
+pub mod payment_launch;
 pub mod payment_notifications;
 pub mod payment_operations;
 pub mod payment_operations_exports;
