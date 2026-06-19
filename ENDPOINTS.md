@@ -2,7 +2,7 @@
 
 This document maps every HTTP endpoint defined in `start/routes.ts` of the AdonisJS API, with full paths reconstructed from all enclosing group prefixes, controller handlers, route-level middleware (beyond the tier middleware), and porting status. Use it as the authoritative checklist for the Rust/Axum port so no endpoint is missed.
 
-Coverage: 230 / 249 ported
+Coverage: 231 / 249 ported
 
 ## Framework-provided (transmit SSE)
 
@@ -63,7 +63,7 @@ Coverage: 230 / 249 ported
 | 38 | GET | /internal/payment-ops/tocatta/production/incidents | internal_tocatta_production_controller.ts@incidents | internal_static_test | ✅ |
 | 39 | GET | /internal/payment-ops/tocatta/production/communications | internal_tocatta_production_controller.ts@communications | internal_static_test | ✅ |
 | 40 | GET | /internal/payment-ops/kpr1/status | internal_kpr1_payment_ops_controller.ts@status | — | ⬜ |
-| 41 | GET | /internal/payment-ops/kpr1/conformance | internal_kpr1_payment_ops_controller.ts@conformance | — | ⬜ |
+| 41 | GET | /internal/payment-ops/kpr1/conformance | internal_kpr1_payment_ops_controller.ts@conformance | internal_misc_test (fixture+ed25519 verifier, all checks pass) | ✅ |
 | 42 | GET | /internal/payment-ops/kpr1/intents/:intentId/evidence | internal_kpr1_payment_ops_controller.ts@evidence | internal_misc_test | ✅ |
 | 43 | GET | /internal/payment-ops/merchants | internal_payment_ops_observability_controller.ts@merchants | internal_slo_obs_test | ✅ |
 | 44 | GET | /internal/payment-ops/merchants/:id | internal_payment_ops_observability_controller.ts@merchant | internal_slo_obs_test (404 merchant not found, 400 bad id) | ✅ |

@@ -69,3 +69,25 @@ async fn kpr1_evidence_requires_internal_token() {
     let app = common::spawn_app().await;
     assert_eq!(app.client.get(app.url("/internal/payment-ops/kpr1/intents/x/evidence")).send().await.unwrap().status(), 401);
 }
+
+#[tokio::test]
+async fn kpr1_conformance_all_checks_pass() {
+    let app = common::spawn_app().await;
+    let res: Value = app.client.get(app.url("/internal/payment-ops/kpr1/conformance"))
+        .bearer_auth(common::INTERNAL_TOKEN).send().await.unwrap().json().await.unwrap();
+    let checks = res["checks"].as_array().unwrap();
+    // surface any failing check for debuggability
+    let failed: Vec<&Value> = checks.iter().filter(|c| c["status"] != "pass").collect();
+    assert!(failed.is_empty(), "failing checks: {failed:#?}");
+    assert_eq!(res["ready"], true);
+    assert_eq!(res["fixtureVersion"], "2026-05-24");
+    assert!(checks.iter().any(|c| c["key"] == "kpr1.conformance.signature"));
+    assert!(checks.iter().any(|c| c["key"] == "kpr1.conformance.canonicalJson"));
+    assert!(checks.iter().any(|c| c["key"].as_str().unwrap().starts_with("kpr1.conformance.outputs.")));
+}
+
+#[tokio::test]
+async fn kpr1_conformance_requires_internal_token() {
+    let app = common::spawn_app().await;
+    assert_eq!(app.client.get(app.url("/internal/payment-ops/kpr1/conformance")).send().await.unwrap().status(), 401);
+}

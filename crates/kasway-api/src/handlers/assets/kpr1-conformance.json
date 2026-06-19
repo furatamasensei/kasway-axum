@@ -1,0 +1,469 @@
+{
+  "fixtureVersion": "2026-05-24",
+  "standard": "KPR-1",
+  "description": "Static wallet conformance fixture for KPR-1 canonical JSON, intent hashing, QR parsing, output verification, Ed25519 signature verification, and TN10 mobile wallet safety checks.",
+  "canonicalization": {
+    "json": "UTF-8 JSON with object keys sorted lexicographically at every object level. Arrays preserve order. Omit fields with undefined values before serialization.",
+    "intentHash": "sha256(canonical signed intent JSON)",
+    "signaturePayload": "canonical unsigned intent JSON",
+    "signatureAlgorithm": "ed25519"
+  },
+  "keys": {
+    "keyId": "kpr1-fixture-ed25519-2026-05",
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAS+tkd3uQUAel0noOGWldY0Q3KMwv092fA1idyshS6AI=\n-----END PUBLIC KEY-----\n",
+    "wrongPublicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAkZKwSlDgd5qVEegOBmvd6DmHw1DO3TOE/AIS3jccu/s=\n-----END PUBLIC KEY-----\n"
+  },
+  "validIntent": {
+    "intent": {
+      "version": "kpr-1",
+      "network": "tn10",
+      "asset": "KAS",
+      "intentId": "kpr1_conformance_0001",
+      "invoiceId": "inv_conformance_0001",
+      "amountSompi": "100000000",
+      "expiresAt": "2026-06-01T12:00:00.000Z",
+      "template": {
+        "id": "split_settlement",
+        "version": "v1",
+        "scriptHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "outputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "97000000"
+        },
+        {
+          "role": "kasway_fee",
+          "address": "kaspatest:qkaswayfeeconformance000000000000000000000000",
+          "amountSompi": "3000000"
+        }
+      ],
+      "refund": {
+        "addressRequiredFromWallet": true,
+        "timeoutSeconds": 1800
+      },
+      "merchant": {
+        "name": "Kasway Conformance Merchant",
+        "domain": "checkout.kasway.test"
+      },
+      "display": {
+        "memo": "Invoice inv_conformance_0001",
+        "currencyCode": "KAS"
+      },
+      "signature": {
+        "alg": "ed25519",
+        "keyId": "kpr1-fixture-ed25519-2026-05",
+        "value": "uwj9axys0LoLkXmdXVzc0hvllB8BroH8W1FqE5DiSh4NnrbJUKEgi9iISPuyxeIZO34BiWk4gGbj66ZTEoI/Cg=="
+      }
+    },
+    "unsignedCanonicalJson": "{\"amountSompi\":\"100000000\",\"asset\":\"KAS\",\"display\":{\"currencyCode\":\"KAS\",\"memo\":\"Invoice inv_conformance_0001\"},\"expiresAt\":\"2026-06-01T12:00:00.000Z\",\"intentId\":\"kpr1_conformance_0001\",\"invoiceId\":\"inv_conformance_0001\",\"merchant\":{\"domain\":\"checkout.kasway.test\",\"name\":\"Kasway Conformance Merchant\"},\"network\":\"tn10\",\"outputs\":[{\"address\":\"kaspatest:qmerchantconformance000000000000000000000000000\",\"amountSompi\":\"97000000\",\"role\":\"merchant_net\"},{\"address\":\"kaspatest:qkaswayfeeconformance000000000000000000000000\",\"amountSompi\":\"3000000\",\"role\":\"kasway_fee\"}],\"refund\":{\"addressRequiredFromWallet\":true,\"timeoutSeconds\":1800},\"template\":{\"id\":\"split_settlement\",\"scriptHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"version\":\"v1\"},\"version\":\"kpr-1\"}",
+    "signedCanonicalJson": "{\"amountSompi\":\"100000000\",\"asset\":\"KAS\",\"display\":{\"currencyCode\":\"KAS\",\"memo\":\"Invoice inv_conformance_0001\"},\"expiresAt\":\"2026-06-01T12:00:00.000Z\",\"intentId\":\"kpr1_conformance_0001\",\"invoiceId\":\"inv_conformance_0001\",\"merchant\":{\"domain\":\"checkout.kasway.test\",\"name\":\"Kasway Conformance Merchant\"},\"network\":\"tn10\",\"outputs\":[{\"address\":\"kaspatest:qmerchantconformance000000000000000000000000000\",\"amountSompi\":\"97000000\",\"role\":\"merchant_net\"},{\"address\":\"kaspatest:qkaswayfeeconformance000000000000000000000000\",\"amountSompi\":\"3000000\",\"role\":\"kasway_fee\"}],\"refund\":{\"addressRequiredFromWallet\":true,\"timeoutSeconds\":1800},\"signature\":{\"alg\":\"ed25519\",\"keyId\":\"kpr1-fixture-ed25519-2026-05\",\"value\":\"uwj9axys0LoLkXmdXVzc0hvllB8BroH8W1FqE5DiSh4NnrbJUKEgi9iISPuyxeIZO34BiWk4gGbj66ZTEoI/Cg==\"},\"template\":{\"id\":\"split_settlement\",\"scriptHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"version\":\"v1\"},\"version\":\"kpr-1\"}",
+    "expectedHash": "2cee12bf9dfdfcc2eee5047ee12539c36e7f47ae42da0d025f8f62f0b0b137aa",
+    "qrUri": "kaspa-payment:v1?request=https%3A%2F%2Fcheckout.kasway.test%2Fapi%2Fcheckout%2Finvoices%2Finv_conformance_0001%2Fkpr1-intent&hash=2cee12bf9dfdfcc2eee5047ee12539c36e7f47ae42da0d025f8f62f0b0b137aa&network=tn10&expires=1780315200"
+  },
+  "validOutputExamples": [
+    {
+      "name": "exact_required_outputs",
+      "scriptHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "outputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "97000000"
+        },
+        {
+          "role": "kasway_fee",
+          "address": "kaspatest:qkaswayfeeconformance000000000000000000000000",
+          "amountSompi": "3000000"
+        }
+      ],
+      "expectedResult": "valid"
+    },
+    {
+      "name": "tax_split_required_outputs",
+      "scriptHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "intentOutputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "95000000"
+        },
+        {
+          "role": "tax",
+          "address": "kaspatest:qtaxconformance0000000000000000000000000000",
+          "amountSompi": "2000000"
+        },
+        {
+          "role": "kasway_fee",
+          "address": "kaspatest:qkaswayfeeconformance000000000000000000000000",
+          "amountSompi": "3000000"
+        }
+      ],
+      "outputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "95000000"
+        },
+        {
+          "role": "tax",
+          "address": "kaspatest:qtaxconformance0000000000000000000000000000",
+          "amountSompi": "2000000"
+        },
+        {
+          "role": "kasway_fee",
+          "address": "kaspatest:qkaswayfeeconformance000000000000000000000000",
+          "amountSompi": "3000000"
+        }
+      ],
+      "expectedResult": "valid"
+    }
+  ],
+  "invalidOutputExamples": [
+    {
+      "name": "missing_kasway_fee_output",
+      "scriptHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "outputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "97000000"
+        }
+      ],
+      "expectedFailureReason": "missing_required_kasway_fee_output"
+    },
+    {
+      "name": "wrong_merchant_amount",
+      "scriptHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "outputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "96000000"
+        },
+        {
+          "role": "kasway_fee",
+          "address": "kaspatest:qkaswayfeeconformance000000000000000000000000",
+          "amountSompi": "3000000"
+        }
+      ],
+      "expectedFailureReason": "missing_required_merchant_net_output"
+    },
+    {
+      "name": "wrong_script_hash",
+      "scriptHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "outputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "97000000"
+        },
+        {
+          "role": "kasway_fee",
+          "address": "kaspatest:qkaswayfeeconformance000000000000000000000000",
+          "amountSompi": "3000000"
+        }
+      ],
+      "expectedFailureReason": "script_hash_mismatch"
+    },
+    {
+      "name": "missing_tax_output_when_required",
+      "scriptHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "intentOutputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "95000000"
+        },
+        {
+          "role": "tax",
+          "address": "kaspatest:qtaxconformance0000000000000000000000000000",
+          "amountSompi": "2000000"
+        },
+        {
+          "role": "kasway_fee",
+          "address": "kaspatest:qkaswayfeeconformance000000000000000000000000",
+          "amountSompi": "3000000"
+        }
+      ],
+      "outputs": [
+        {
+          "role": "merchant_net",
+          "address": "kaspatest:qmerchantconformance000000000000000000000000000",
+          "amountSompi": "95000000"
+        },
+        {
+          "role": "kasway_fee",
+          "address": "kaspatest:qkaswayfeeconformance000000000000000000000000",
+          "amountSompi": "3000000"
+        }
+      ],
+      "expectedFailureReason": "missing_required_tax_output"
+    }
+  ],
+  "signatureVerificationExamples": [
+    {
+      "name": "valid_signature",
+      "canonicalPayload": "validIntent.unsignedCanonicalJson",
+      "signature": "validIntent.intent.signature.value",
+      "publicKey": "keys.publicKeyPem",
+      "expectedValid": true
+    },
+    {
+      "name": "wrong_public_key",
+      "canonicalPayload": "validIntent.unsignedCanonicalJson",
+      "signature": "validIntent.intent.signature.value",
+      "publicKey": "keys.wrongPublicKeyPem",
+      "expectedValid": false
+    },
+    {
+      "name": "tampered_amount_after_signing",
+      "tamperedField": "amountSompi",
+      "tamperedValue": "100000001",
+      "expectedTamperedHash": "9e0d9134d15fb4bf12215ad1c1108227bb9250f18568523e47e162669925a396",
+      "expectedValid": false
+    }
+  ],
+  "qrParserNegativeCases": [
+    {
+      "name": "wrong_scheme",
+      "uri": "kaspa:kaspatest:qmerchantconformance000000000000000000000000000?amount=1",
+      "expectedFailureReason": "unsupported_scheme"
+    },
+    {
+      "name": "missing_hash",
+      "uri": "kaspa-payment:v1?request=https%3A%2F%2Fcheckout.kasway.test%2Fapi%2Fcheckout%2Finvoices%2Finv_conformance_0001%2Fkpr1-intent&network=tn10&expires=1780315200",
+      "expectedFailureReason": "missing_hash"
+    },
+    {
+      "name": "non_https_request",
+      "uri": "kaspa-payment:v1?request=http%3A%2F%2Fcheckout.kasway.test%2Fapi%2Fcheckout%2Finvoices%2Finv_conformance_0001%2Fkpr1-intent&hash=2cee12bf9dfdfcc2eee5047ee12539c36e7f47ae42da0d025f8f62f0b0b137aa&network=tn10&expires=1780315200",
+      "expectedFailureReason": "request_url_must_be_https"
+    },
+    {
+      "name": "mainnet_rejected_for_mvp",
+      "uri": "kaspa-payment:v1?request=https%3A%2F%2Fcheckout.kasway.test%2Fapi%2Fcheckout%2Finvoices%2Finv_conformance_0001%2Fkpr1-intent&hash=2cee12bf9dfdfcc2eee5047ee12539c36e7f47ae42da0d025f8f62f0b0b137aa&network=mainnet&expires=1780315200",
+      "expectedFailureReason": "unsupported_network"
+    },
+    {
+      "name": "expired_hint",
+      "uri": "kaspa-payment:v1?request=https%3A%2F%2Fcheckout.kasway.test%2Fapi%2Fcheckout%2Finvoices%2Finv_conformance_0001%2Fkpr1-intent&hash=2cee12bf9dfdfcc2eee5047ee12539c36e7f47ae42da0d025f8f62f0b0b137aa&network=tn10&expires=1",
+      "expectedFailureReason": "request_expired"
+    }
+  ],
+  "verifierNegativeCases": [
+    {
+      "name": "intent_expired",
+      "mutate": { "expiresAt": "2020-01-01T00:00:00.000Z" },
+      "expectedFailureReason": "intent_expired"
+    },
+    {
+      "name": "network_or_asset_mismatch",
+      "mutate": { "network": "mainnet" },
+      "expectedFailureReason": "network_or_asset_mismatch"
+    },
+    {
+      "name": "amount_mismatch",
+      "observedAmountSompi": "99999999",
+      "expectedFailureReason": "amount_mismatch"
+    },
+    {
+      "name": "tx_id_mismatch",
+      "submittedTxId": "kpr1_conformance_tx",
+      "observedTxId": "kpr1_conformance_tx_replacement",
+      "expectedFailureReason": "tx_id_mismatch"
+    },
+    {
+      "name": "missing_full_output_data",
+      "observedMetadata": {},
+      "expectedFailureReason": "missing_full_output_data"
+    }
+  ],
+  "displayExpectations": {
+    "appName": "Kasway TN10 Wallet",
+    "networkBadge": "TN10 testnet only",
+    "mustShow": [
+      "merchant.name",
+      "amountSompi",
+      "network",
+      "asset",
+      "expiresAt",
+      "outputs.merchant_net",
+      "outputs.kasway_fee",
+      "outputs.tax_when_present"
+    ],
+    "mustNotOffer": [
+      "plain_address_fallback",
+      "mainnet_toggle",
+      "seed_upload",
+      "private_key_upload"
+    ]
+  },
+  "explorerWalletVerificationSample": {
+    "endpoint": "/api/explorer/kpr1/intents/kpr1_conformance_0001/wallet-verification",
+    "lookup": {
+      "type": "intent_id",
+      "value": "kpr1_conformance_0001",
+      "matched": true
+    },
+    "payment": {
+      "rail": "kpr1_covenant",
+      "intentId": "kpr1_conformance_0001",
+      "invoicePublicId": "inv_conformance_0001",
+      "canonicalHash": "2cee12bf9dfdfcc2eee5047ee12539c36e7f47ae42da0d025f8f62f0b0b137aa",
+      "network": "tn10",
+      "assetId": "KAS",
+      "amountSompi": "100000000",
+      "publicState": "not_observed"
+    },
+    "wallet": {
+      "canonicalIntent": "validIntent.intent"
+    }
+  },
+  "submitPayloadExamples": [
+    {
+      "name": "self_broadcast_tx_id_only",
+      "payload": {
+        "txId": "kpr1_conformance_tx"
+      },
+      "forbiddenFields": ["seedPhrase", "privateKey", "xprv", "mnemonic", "secretKey"]
+    },
+    {
+      "name": "signed_transaction_relay",
+      "payload": {
+        "txId": "kpr1_conformance_tx_relay",
+        "signedTransaction": {
+          "format": "mock-kaspa-signed-transaction",
+          "network": "tn10",
+          "outputsHash": "fixture-required-outputs-hash"
+        },
+        "allowOrphan": false
+      },
+      "forbiddenFields": ["seedPhrase", "privateKey", "xprv", "mnemonic", "secretKey"]
+    }
+  ],
+  "walletMvpStatus": {
+    "repository": "../kasway-kpr1-wallet",
+    "appName": "Kasway TN10 Wallet",
+    "network": "tn10",
+    "signingBoundary": "Wallet signs locally; Kasway receives only txId or already-signed transaction payloads.",
+    "kaspaWasmStatus": "mock_adapter_until_provenance_validated",
+    "secureStorageStatus": "native_adapter_boundary_present; plugin smoke tests deferred",
+    "mainnetStatus": "not_supported"
+  },
+  "walletExtensionMvpStatus": {
+    "repository": "../kasway-kpr1-extension",
+    "appName": "Kasway TN10 Extension Wallet",
+    "framework": "WXT + Vue + TypeScript",
+    "browserTarget": "chromium_mv3",
+    "network": "tn10",
+    "permissions": "minimal_storage_and_narrow_kasway_localhost_hosts",
+    "providerApiStatus": "not_supported",
+    "kaspaWasmStatus": "mock_adapter_until_provenance_validated",
+    "mainnetStatus": "not_supported"
+  },
+  "extensionMessageBoundaryCases": [
+    {
+      "name": "valid_user_gesture_open_request",
+      "channel": "kasway:kpr1",
+      "type": "KPR1_OPEN_REQUEST",
+      "origin": "https://checkout.kasway.test",
+      "userGesture": true,
+      "expectedResult": "accepted"
+    },
+    {
+      "name": "untrusted_origin_rejected",
+      "channel": "kasway:kpr1",
+      "type": "KPR1_OPEN_REQUEST",
+      "origin": "https://evil.example",
+      "userGesture": true,
+      "expectedFailureReason": "untrusted_origin"
+    },
+    {
+      "name": "raw_sign_request_rejected",
+      "channel": "kasway:kpr1",
+      "type": "RAW_SIGN_TRANSACTION",
+      "origin": "https://checkout.kasway.test",
+      "userGesture": true,
+      "expectedFailureReason": "unsupported_message_type"
+    },
+    {
+      "name": "missing_user_gesture_rejected",
+      "channel": "kasway:kpr1",
+      "type": "KPR1_OPEN_REQUEST",
+      "origin": "https://checkout.kasway.test",
+      "userGesture": false,
+      "expectedFailureReason": "missing_user_gesture"
+    },
+    {
+      "name": "replayed_approval_nonce_rejected",
+      "type": "APPROVE_KPR1_PAYMENT",
+      "sessionId": "approval_session_001",
+      "displayNonce": "already_used_nonce",
+      "expectedFailureReason": "replayed_approval"
+    }
+  ],
+  "extensionPermissionExpectations": {
+    "manifestVersion": 3,
+    "permissions": ["storage"],
+    "hostPermissions": [
+      "https://checkout.kasway.test/*",
+      "https://api.kasway.test/*",
+      "http://localhost:3333/*"
+    ],
+    "mustNotInclude": ["<all_urls>", "tabs", "debugger", "nativeMessaging", "clipboardRead"],
+    "providerApiStatus": "not_supported"
+  },
+  "extensionStorageExpectations": {
+    "namespacePrefix": "tn10:extension-wallet:v1:",
+    "encryption": "PBKDF2-HMAC-SHA-256 + AES-GCM",
+    "lockDefaults": ["locked_on_startup", "locked_on_service_worker_restart", "lock_on_timeout"],
+    "plaintextForbiddenFields": ["seedPhrase", "mnemonic", "privateKey", "xprv", "secretKey"],
+    "decryptedMaterialScope": "background_memory_only_while_unlocked"
+  },
+  "extensionDetectionCases": [
+    {
+      "name": "clicked_kaspa_payment_v1_anchor",
+      "input": "validIntent.qrUri",
+      "origin": "https://checkout.kasway.test",
+      "userGesture": true,
+      "expectedResult": "detected"
+    },
+    {
+      "name": "plain_kaspa_address_ignored",
+      "input": "kaspa:kaspatest:qmerchantconformance000000000000000000000000000",
+      "origin": "https://checkout.kasway.test",
+      "userGesture": true,
+      "expectedResult": "ignored"
+    },
+    {
+      "name": "mainnet_request_rejected",
+      "input": "qrParserNegativeCases.mainnet_rejected_for_mvp.uri",
+      "origin": "https://checkout.kasway.test",
+      "userGesture": true,
+      "expectedFailureReason": "unsupported_network"
+    },
+    {
+      "name": "wrong_origin_post_message_rejected",
+      "input": "validIntent.qrUri",
+      "origin": "https://evil.example",
+      "userGesture": true,
+      "expectedFailureReason": "untrusted_origin"
+    }
+  ],
+  "extensionBuildExpectations": {
+    "wxtVersion": "0.19.x",
+    "manifestTarget": "chrome-mv3",
+    "zipRequired": true,
+    "realKaspaWasmEnabled": false,
+    "manualSmokeRequiredBeforeRelease": true,
+    "validatedCommands": [
+      "pnpm typecheck",
+      "pnpm test",
+      "pnpm test:conformance",
+      "pnpm build",
+      "pnpm zip"
+    ]
+  }
+}

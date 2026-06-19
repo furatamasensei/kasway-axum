@@ -75,6 +75,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/tocatta/beta/contracts", get(handlers::internal_tocatta_beta::contract))
         // --- Internal KPR-1 ops (DB evidence) ---
         .route("/internal/payment-ops/kpr1/intents/:intentId/evidence", get(handlers::internal_kpr1_ops::evidence))
+        .route("/internal/payment-ops/kpr1/conformance", get(handlers::internal_kpr1_ops::conformance))
         // --- Media (merchant) ---
         .route("/api/media", post(handlers::medias::store))
         .route("/api/media/:id", delete(handlers::medias::destroy))
