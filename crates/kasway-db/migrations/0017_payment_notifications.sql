@@ -1,0 +1,28 @@
+-- payment_notification_preferences + payment_notifications (1779000000007).
+CREATE TABLE payment_notification_preferences (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  category TEXT NOT NULL,
+  channels TEXT NOT NULL DEFAULT '[]',
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT,
+  updated_at TEXT,
+  UNIQUE (user_id, category)
+);
+
+CREATE TABLE payment_notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  category TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  title_key TEXT NOT NULL,
+  body_key TEXT NOT NULL,
+  resource_type TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  read_at TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT,
+  updated_at TEXT,
+  UNIQUE (user_id, category, resource_type, resource_id)
+);
+CREATE INDEX payment_notifications_user_created_index ON payment_notifications(user_id, created_at);

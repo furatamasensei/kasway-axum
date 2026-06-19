@@ -1,0 +1,143 @@
+-- Stores + entitlements + invoices + items + KPR-1 intents.
+-- Columns reflect the Lucid MODELS (source of truth for serialization), with
+-- the later ALTER-added columns folded in. Amounts (bigint sompi) stored as
+-- INTEGER and serialized as strings to match Lucid's bigint serialize.
+
+-- stores (1781000000000)
+CREATE TABLE stores (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  public_id TEXT NOT NULL UNIQUE,
+  name TEXT NOT NULL,
+  slug TEXT,
+  status TEXT NOT NULL DEFAULT 'active',
+  is_included INTEGER NOT NULL DEFAULT 0,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  metadata TEXT,
+  disabled_at TEXT,
+  archived_at TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+CREATE UNIQUE INDEX stores_user_id_default_unique ON stores(user_id) WHERE is_default = 1;
+CREATE UNIQUE INDEX stores_user_id_included_unique ON stores(user_id) WHERE is_included = 1;
+CREATE UNIQUE INDEX stores_user_id_slug_unique ON stores(user_id, slug) WHERE slug IS NOT NULL;
+
+-- store_entitlements (1781000000000)
+CREATE TABLE store_entitlements (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  store_id INTEGER NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'active',
+  source TEXT NOT NULL,
+  billing_interval TEXT,
+  price_cents INTEGER,
+  currency TEXT,
+  provider TEXT,
+  provider_customer_id TEXT,
+  provider_subscription_id TEXT,
+  provider_reference TEXT,
+  current_period_start TEXT,
+  current_period_end TEXT,
+  grace_ends_at TEXT,
+  metadata TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+
+-- invoices (1765730000000 + later ALTERs folded in)
+CREATE TABLE invoices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  store_id INTEGER REFERENCES stores(id) ON DELETE SET NULL,
+  public_id TEXT NOT NULL UNIQUE,
+  external_id TEXT,
+  subscription_id INTEGER,
+  subscription_cycle_id INTEGER,
+  payment_link_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'open',
+  payment_address TEXT,
+  payment_network TEXT,
+  payment_asset TEXT,
+  payment_reference TEXT,
+  subtotal_amount INTEGER NOT NULL DEFAULT 0,
+  total_amount INTEGER NOT NULL DEFAULT 0,
+  fee_delegation TEXT,
+  payment_mode TEXT,
+  service_fee_amount INTEGER NOT NULL DEFAULT 0,
+  currency TEXT NOT NULL DEFAULT 'KAS',
+  pricing_country_code TEXT,
+  metadata TEXT,
+  expires_at TEXT,
+  paid_at TEXT,
+  cancelled_at TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+CREATE UNIQUE INDEX invoices_user_id_external_id_unique
+  ON invoices(user_id, external_id) WHERE external_id IS NOT NULL;
+CREATE INDEX invoices_user_store_index ON invoices(user_id, store_id);
+
+-- invoice_items (1765730000001 + pricing columns from model)
+CREATE TABLE invoice_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  inventory_id INTEGER,
+  name TEXT NOT NULL,
+  quantity INTEGER NOT NULL,
+  unit_amount INTEGER NOT NULL,
+  total_amount INTEGER NOT NULL,
+  pricing_country_code TEXT,
+  pricing_currency TEXT,
+  pricing_source TEXT,
+  metadata TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+CREATE INDEX invoice_items_invoice_id_index ON invoice_items(invoice_id);
+
+-- kpr1_payment_intents (1779000000020 + tax fields 1780000000000)
+CREATE TABLE kpr1_payment_intents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  intent_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'created',
+  network TEXT NOT NULL,
+  asset_id TEXT NOT NULL,
+  amount_sompi INTEGER NOT NULL,
+  platform_fee_bps INTEGER NOT NULL,
+  platform_fee_amount INTEGER NOT NULL,
+  tax_bps INTEGER,
+  tax_amount INTEGER,
+  tax_address TEXT,
+  merchant_address TEXT NOT NULL,
+  platform_fee_address TEXT NOT NULL,
+  template_id TEXT NOT NULL,
+  template_version TEXT NOT NULL,
+  script_hash TEXT NOT NULL,
+  canonical_hash TEXT NOT NULL,
+  payment_request_uri TEXT NOT NULL,
+  payment_intent_url TEXT NOT NULL,
+  signature_algorithm TEXT NOT NULL,
+  signature_key_id TEXT NOT NULL,
+  signature_value TEXT NOT NULL,
+  tx_id TEXT,
+  verification_status TEXT,
+  failure_reason TEXT,
+  required_outputs TEXT NOT NULL DEFAULT '[]',
+  canonical_intent TEXT NOT NULL DEFAULT '{}',
+  metadata TEXT,
+  expires_at TEXT NOT NULL,
+  fetched_at TEXT,
+  submitted_at TEXT,
+  observed_at TEXT,
+  verified_at TEXT,
+  settled_at TEXT,
+  created_at TEXT,
+  updated_at TEXT,
+  UNIQUE (invoice_id),
+  UNIQUE (intent_id),
+  UNIQUE (canonical_hash)
+);
+CREATE INDEX kpr1_intents_user_index ON kpr1_payment_intents(user_id);

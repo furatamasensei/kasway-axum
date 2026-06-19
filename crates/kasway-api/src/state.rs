@@ -1,0 +1,122 @@
+//! Shared application state injected into every handler.
+
+use kasway_db::Db;
+use std::sync::Arc;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Db,
+    pub config: Arc<AppConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AppConfig {
+    /// Token required by `internalApiToken()` routes. When `None`, those routes
+    /// reply 503 — matching `internal_api_token_middleware.ts`.
+    pub internal_api_token: Option<String>,
+    /// Cloudflare Turnstile secret. When unset and not production, captcha
+    /// validation is bypassed (see `captcha_service.ts`).
+    pub turnstile_secret: Option<String>,
+    pub node_env: String,
+    pub kpr1: Kpr1Config,
+}
+
+/// KPR-1 intent minter config (env: KASWAY_PLATFORM_FEE_*, KPR1_*).
+#[derive(Clone, Debug)]
+pub struct Kpr1Config {
+    pub enabled: bool,
+    pub platform_fee_bps: i64,
+    pub platform_fee_flat_sompi: i64,
+    pub platform_fee_address: String,
+    pub signing_key_id: String,
+    /// 32-byte ed25519 seed (hex). Fixed default keeps signatures deterministic.
+    pub signing_seed: [u8; 32],
+    /// Global default payment mode: "address" (legacy multi-output) or "covenant".
+    pub payment_mode: String,
+    pub default_network: String,
+    pub default_asset: String,
+    pub app_url: String,
+    pub app_name: String,
+}
+
+impl Default for Kpr1Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            platform_fee_bps: 100,
+            platform_fee_flat_sompi: 0,
+            platform_fee_address: "kaspatest:platformfeeaddr00000".to_string(),
+            signing_key_id: "kpr1-key-1".to_string(),
+            signing_seed: [7u8; 32],
+            payment_mode: "address".to_string(),
+            default_network: "tn10".to_string(),
+            default_asset: "KAS".to_string(),
+            app_url: "https://app.kasway.test".to_string(),
+            app_name: "Kasway Merchant".to_string(),
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn from_env() -> Self {
+        let mut kpr1 = Kpr1Config::default();
+        if let Ok(v) = std::env::var("KASWAY_PLATFORM_FEE_BPS") {
+            if let Ok(n) = v.parse() {
+                kpr1.platform_fee_bps = n;
+            }
+        }
+        if let Ok(v) = std::env::var("KASWAY_PLATFORM_FEE_FLAT_SOMPI") {
+            if let Ok(n) = v.parse() {
+                kpr1.platform_fee_flat_sompi = n;
+            }
+        }
+        if let Ok(v) = std::env::var("KASWAY_PLATFORM_FEE_ADDRESS") {
+            if !v.is_empty() {
+                kpr1.platform_fee_address = v;
+            }
+        }
+        if let Ok(v) = std::env::var("KPR1_COVENANT_PAYMENT_MODE") {
+            if !v.is_empty() {
+                kpr1.payment_mode = v;
+            }
+        }
+        if let Ok(v) = std::env::var("APP_URL") {
+            if !v.is_empty() {
+                kpr1.app_url = v;
+            }
+        }
+        if let Ok(v) = std::env::var("APP_NAME") {
+            if !v.is_empty() {
+                kpr1.app_name = v;
+            }
+        }
+        Self {
+            internal_api_token: std::env::var("INTERNAL_API_TOKEN").ok().filter(|s| !s.is_empty()),
+            turnstile_secret: std::env::var("TURNSTILE_SECRET").ok().filter(|s| !s.is_empty()),
+            node_env: std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
+            kpr1,
+        }
+    }
+
+    /// Default config for tests (captcha bypass, KPR-1 enabled with defaults).
+    pub fn test_default() -> Self {
+        Self {
+            internal_api_token: None,
+            turnstile_secret: None,
+            node_env: "test".to_string(),
+            kpr1: Kpr1Config::default(),
+        }
+    }
+
+    /// Replicates `CaptchaService.validateTurnstile` for the bypass case.
+    /// Returns true when captcha is satisfied. Real Turnstile verification
+    /// (network) is deferred; if a secret is configured we conservatively fail
+    /// closed unless a token is present (full HTTP verify ported later).
+    pub fn captcha_ok(&self, token: Option<&str>) -> bool {
+        if self.turnstile_secret.is_none() && self.node_env != "production" {
+            return true;
+        }
+        // secret configured: cannot verify without the network call yet.
+        token.is_some() && self.turnstile_secret.is_some()
+    }
+}

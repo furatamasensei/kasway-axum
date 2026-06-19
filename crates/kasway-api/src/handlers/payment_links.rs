@@ -1,0 +1,448 @@
+//! `/api/payment-links` — PaymentLinksController + PaymentLinkService.
+//! Reusable link templates; each checkout spawns a fresh invoice.
+
+use crate::auth::AuthMerchant;
+use crate::error::{AppError, AppResult, ValidationFailure};
+use crate::handlers::invoices;
+use crate::state::AppState;
+use crate::store_context::resolve_request_store;
+use crate::util::{now_iso, paginator_meta};
+use axum::extract::{Path, Query, State};
+use axum::Json;
+use rand::RngCore;
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+const FEE_DELEGATIONS: &[&str] = &["merchant_subsidized", "customer_pays"];
+const PAYMENT_MODES: &[&str] = &["address", "covenant"];
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct LinkRow {
+    id: i64,
+    user_id: i64,
+    store_id: Option<i64>,
+    public_id: String,
+    status: String,
+    title: String,
+    amount: i64,
+    currency: String,
+    payment_network: String,
+    payment_asset: String,
+    fee_delegation: String,
+    payment_mode: Option<String>,
+    pricing_country_code: Option<String>,
+    metadata: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+}
+
+const LINK_COLS: &str = "id, user_id, store_id, public_id, status, title, amount, currency, \
+    payment_network, payment_asset, fee_delegation, payment_mode, pricing_country_code, \
+    metadata, created_at, updated_at";
+
+#[derive(Deserialize, Default)]
+pub struct LinkQuery {
+    page: Option<i64>,
+    #[serde(rename = "perPage")]
+    per_page: Option<i64>,
+    #[serde(rename = "storeId")]
+    store_id: Option<i64>,
+}
+
+fn serialize_link(link: &LinkRow, payments_count: Option<i64>) -> Value {
+    let metadata = match &link.metadata {
+        None => Value::Null,
+        Some(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+    };
+    let mut obj = json!({
+        "id": link.id,
+        "userId": link.user_id,
+        "storeId": link.store_id,
+        "publicId": link.public_id,
+        "status": link.status,
+        "title": link.title,
+        "amount": link.amount.to_string(),
+        "currency": link.currency,
+        "paymentNetwork": link.payment_network,
+        "paymentAsset": link.payment_asset,
+        "feeDelegation": link.fee_delegation,
+        "paymentMode": link.payment_mode,
+        "pricingCountryCode": link.pricing_country_code,
+        "metadata": metadata,
+        "createdAt": link.created_at,
+        "updatedAt": link.updated_at,
+    });
+    // withCount('invoices') -> paymentsCount (omitted when not loaded).
+    if let (Value::Object(map), Some(count)) = (&mut obj, payments_count) {
+        map.insert("paymentsCount".into(), json!(count));
+    }
+    obj
+}
+
+async fn invoices_count(state: &AppState, link_id: i64) -> AppResult<i64> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE payment_link_id = ?")
+        .bind(link_id)
+        .fetch_one(&state.db.pool)
+        .await?)
+}
+
+async fn get_for_merchant(
+    state: &AppState,
+    user_id: i64,
+    store_id: i64,
+    id: i64,
+) -> AppResult<LinkRow> {
+    sqlx::query_as::<_, LinkRow>(&format!(
+        "SELECT {LINK_COLS} FROM payment_links WHERE user_id = ? AND store_id = ? AND id = ?"
+    ))
+    .bind(user_id)
+    .bind(store_id)
+    .bind(id)
+    .fetch_optional(&state.db.pool)
+    .await?
+    .ok_or_else(|| AppError::commerce(404, "Payment link not found"))
+}
+
+/// `GET /api/payment-links`
+pub async fn index(
+    auth: AuthMerchant,
+    State(state): State<AppState>,
+    Query(q): Query<LinkQuery>,
+) -> AppResult<Json<Value>> {
+    let store_id = resolve_request_store(&state, auth.user_id, q.store_id).await?;
+    let page = q.page.unwrap_or(1).max(1);
+    let per_page = q.per_page.unwrap_or(10).max(1);
+    let offset = (page - 1) * per_page;
+
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM payment_links WHERE user_id = ? AND store_id = ?",
+    )
+    .bind(auth.user_id)
+    .bind(store_id)
+    .fetch_one(&state.db.pool)
+    .await?;
+
+    let links = sqlx::query_as::<_, LinkRow>(&format!(
+        "SELECT {LINK_COLS} FROM payment_links WHERE user_id = ? AND store_id = ? \
+         ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    ))
+    .bind(auth.user_id)
+    .bind(store_id)
+    .bind(per_page)
+    .bind(offset)
+    .fetch_all(&state.db.pool)
+    .await?;
+
+    let mut data = Vec::with_capacity(links.len());
+    for link in &links {
+        let count = invoices_count(&state, link.id).await?;
+        data.push(serialize_link(link, Some(count)));
+    }
+
+    Ok(Json(json!({
+        "meta": paginator_meta(total, per_page, page),
+        "data": data,
+    })))
+}
+
+/// `POST /api/payment-links`
+pub async fn store(
+    auth: AuthMerchant,
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> AppResult<Json<Value>> {
+    let input = validate_create(&body)?;
+    let store_id = resolve_request_store(&state, auth.user_id, input.store_id).await?;
+
+    let amount: i128 = input.amount.parse().unwrap_or(0);
+    if amount <= 0 {
+        return Err(AppError::commerce(422, "Payment link amount must be greater than zero"));
+    }
+
+    let network = input
+        .payment_network
+        .unwrap_or_else(|| state.config.kpr1.default_network.clone());
+    let asset = input
+        .payment_asset
+        .unwrap_or_else(|| state.config.kpr1.default_asset.clone());
+    let fee_delegation = input.fee_delegation.unwrap_or_else(|| "merchant_subsidized".to_string());
+    let now = now_iso();
+    let public_id = format!("plink_{}", random_suffix());
+    let metadata_str = input.metadata.as_ref().map(|m| m.to_string());
+
+    let result = sqlx::query(
+        "INSERT INTO payment_links \
+         (user_id, store_id, public_id, status, title, amount, currency, payment_network, \
+          payment_asset, fee_delegation, payment_mode, pricing_country_code, metadata, created_at, updated_at) \
+         VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(auth.user_id)
+    .bind(store_id)
+    .bind(&public_id)
+    .bind(&input.title)
+    .bind(amount as i64)
+    .bind(&asset)
+    .bind(&network)
+    .bind(&asset)
+    .bind(&fee_delegation)
+    .bind(&input.payment_mode)
+    .bind(&input.customer_country_code)
+    .bind(&metadata_str)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db.pool)
+    .await?;
+    let id = result.last_insert_rowid();
+
+    let link = get_for_merchant(&state, auth.user_id, store_id, id).await?;
+    let count = invoices_count(&state, id).await?;
+    Ok(Json(serialize_link(&link, Some(count))))
+}
+
+/// `GET /api/payment-links/:id`
+pub async fn show(
+    auth: AuthMerchant,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<LinkQuery>,
+) -> AppResult<Json<Value>> {
+    let store_id = resolve_request_store(&state, auth.user_id, q.store_id).await?;
+    let link = get_for_merchant(&state, auth.user_id, store_id, id).await?;
+    let count = invoices_count(&state, id).await?;
+    Ok(Json(serialize_link(&link, Some(count))))
+}
+
+/// `POST /api/payment-links/:id/disable`
+pub async fn disable(
+    auth: AuthMerchant,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<LinkQuery>,
+) -> AppResult<Json<Value>> {
+    set_status(&state, auth.user_id, id, "disabled", q.store_id).await
+}
+
+/// `POST /api/payment-links/:id/enable`
+pub async fn enable(
+    auth: AuthMerchant,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<LinkQuery>,
+) -> AppResult<Json<Value>> {
+    set_status(&state, auth.user_id, id, "active", q.store_id).await
+}
+
+async fn set_status(
+    state: &AppState,
+    user_id: i64,
+    id: i64,
+    status: &str,
+    store_id_q: Option<i64>,
+) -> AppResult<Json<Value>> {
+    let store_id = resolve_request_store(state, user_id, store_id_q).await?;
+    let link = get_for_merchant(state, user_id, store_id, id).await?;
+    sqlx::query("UPDATE payment_links SET status = ?, updated_at = ? WHERE id = ?")
+        .bind(status)
+        .bind(now_iso())
+        .bind(link.id)
+        .execute(&state.db.pool)
+        .await?;
+    let link = get_for_merchant(state, user_id, store_id, id).await?;
+    let count = invoices_count(state, id).await?;
+    Ok(Json(serialize_link(&link, Some(count))))
+}
+
+// --- checkout-links (public) helpers ---
+
+pub(crate) async fn get_active_by_public_id(
+    state: &AppState,
+    public_id: &str,
+) -> AppResult<LinkRow> {
+    let link = sqlx::query_as::<_, LinkRow>(&format!(
+        "SELECT {LINK_COLS} FROM payment_links WHERE public_id = ?"
+    ))
+    .bind(public_id)
+    .fetch_optional(&state.db.pool)
+    .await?
+    .ok_or_else(|| AppError::commerce(404, "Payment link not found"))?;
+
+    if link.status != "active" {
+        return Err(AppError::commerce(410, "This payment link is no longer active"));
+    }
+    Ok(link)
+}
+
+/// Public link landing summary (CheckoutLinksController.show).
+pub(crate) async fn public_summary(state: &AppState, public_id: &str) -> AppResult<Value> {
+    let link = get_active_by_public_id(state, public_id).await?;
+
+    let merchant: Option<(Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT full_name, avatar_url FROM users WHERE id = ?")
+            .bind(link.user_id)
+            .fetch_optional(&state.db.pool)
+            .await?;
+    let store_name: Option<String> = match link.store_id {
+        Some(sid) => sqlx::query_scalar("SELECT name FROM stores WHERE id = ?")
+            .bind(sid)
+            .fetch_optional(&state.db.pool)
+            .await?,
+        None => None,
+    };
+
+    let metadata = match &link.metadata {
+        None => Value::Null,
+        Some(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+    };
+
+    Ok(json!({
+        "publicId": link.public_id,
+        "status": link.status,
+        "title": link.title,
+        "amount": link.amount.to_string(),
+        "currency": link.currency,
+        "paymentNetwork": link.payment_network,
+        "paymentAsset": link.payment_asset,
+        "metadata": metadata,
+        "merchant": merchant.map(|(name, avatar)| json!({
+            "name": name,
+            "avatarUrl": avatar,
+            "verified": true,
+        })),
+        "store": store_name.map(|name| json!({ "name": name })),
+    }))
+}
+
+/// Spawn a fresh invoice from a link (CheckoutLinksController.createInvoice).
+/// Returns (invoice_id, store_id) of the spawned invoice.
+pub(crate) async fn spawn_invoice_for_checkout(
+    state: &AppState,
+    public_id: &str,
+) -> AppResult<(i64, i64)> {
+    let link = get_active_by_public_id(state, public_id).await?;
+
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+        .bind(link.user_id)
+        .fetch_optional(&state.db.pool)
+        .await?;
+    if exists.is_none() {
+        return Err(AppError::commerce(404, "Payment link merchant not found"));
+    }
+
+    // Merge link.metadata with the payment-link channel markers.
+    let mut metadata = match &link.metadata {
+        Some(s) => serde_json::from_str::<Value>(s).unwrap_or(json!({})),
+        None => json!({}),
+    };
+    if let Value::Object(map) = &mut metadata {
+        map.insert("title".into(), json!(link.title));
+        map.insert("source".into(), json!("payment_link"));
+        map.insert("channel".into(), json!("payment_link"));
+        map.insert("paymentLinkPublicId".into(), json!(link.public_id));
+    }
+
+    let mut body = json!({
+        "items": [{ "name": link.title, "quantity": 1, "unitAmount": link.amount.to_string() }],
+        "feeDelegation": link.fee_delegation,
+        "paymentNetwork": link.payment_network,
+        "paymentAsset": link.payment_asset,
+        "metadata": metadata,
+    });
+    if let Value::Object(map) = &mut body {
+        if let Some(mode) = &link.payment_mode {
+            map.insert("paymentMode".into(), json!(mode));
+        }
+        if let Some(cc) = &link.pricing_country_code {
+            map.insert("customerCountryCode".into(), json!(cc));
+        }
+        if let Some(sid) = link.store_id {
+            map.insert("storeId".into(), json!(sid));
+        }
+    }
+
+    invoices::create_for_merchant(state, link.user_id, &body, Some(link.id), None, None).await
+}
+
+// --- validation (createPaymentLinkValidator) ---
+
+struct CreateLinkInput {
+    title: String,
+    amount: String,
+    metadata: Option<Value>,
+    payment_network: Option<String>,
+    payment_asset: Option<String>,
+    fee_delegation: Option<String>,
+    payment_mode: Option<String>,
+    store_id: Option<i64>,
+    customer_country_code: Option<String>,
+}
+
+fn vpush(errors: &mut Vec<ValidationFailure>, field: &str, rule: &str, message: &str) {
+    errors.push(ValidationFailure {
+        message: message.to_string(),
+        rule: rule.to_string(),
+        field: field.to_string(),
+    });
+}
+
+fn is_atomic_amount(s: &str) -> bool {
+    s == "0" || (!s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn validate_create(body: &Value) -> AppResult<CreateLinkInput> {
+    let mut errors = Vec::new();
+
+    let title = match body.get("title").and_then(|v| v.as_str()) {
+        Some(t) if !t.trim().is_empty() && t.trim().chars().count() <= 255 => Some(t.trim().to_string()),
+        _ => {
+            vpush(&mut errors, "title", "required", "The title field is required");
+            None
+        }
+    };
+    let amount = match body.get("amount") {
+        Some(Value::String(s)) if is_atomic_amount(s.trim()) => Some(s.trim().to_string()),
+        _ => {
+            vpush(&mut errors, "amount", "regex", "The amount field format is invalid");
+            None
+        }
+    };
+    let fee_delegation = match body.get("feeDelegation") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if FEE_DELEGATIONS.contains(&s.as_str()) => Some(s.clone()),
+        Some(_) => {
+            vpush(&mut errors, "feeDelegation", "enum", "The selected feeDelegation is invalid");
+            None
+        }
+    };
+    let payment_mode = match body.get("paymentMode") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) if PAYMENT_MODES.contains(&s.as_str()) => Some(s.clone()),
+        Some(_) => {
+            vpush(&mut errors, "paymentMode", "enum", "The selected paymentMode is invalid");
+            None
+        }
+    };
+
+    if !errors.is_empty() {
+        return Err(AppError::Validation(errors));
+    }
+
+    let opt_string = |key: &str| body.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    Ok(CreateLinkInput {
+        title: title.unwrap(),
+        amount: amount.unwrap(),
+        metadata: body.get("metadata").filter(|v| !v.is_null()).cloned(),
+        payment_network: opt_string("paymentNetwork"),
+        payment_asset: opt_string("paymentAsset"),
+        fee_delegation,
+        payment_mode,
+        store_id: body.get("storeId").and_then(|v| v.as_i64()),
+        customer_country_code: opt_string("customerCountryCode").map(|s| s.to_uppercase()),
+    })
+}
+
+fn random_suffix() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}

@@ -1,0 +1,18 @@
+-- payment_close_periods (subset of 1779000000018; statement_id FK omitted since
+-- statement generation is deferred — column kept nullable for parity).
+CREATE TABLE payment_close_periods (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  period_start TEXT NOT NULL,
+  period_end TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'closed',
+  statement_id INTEGER,
+  totals_checksum TEXT NOT NULL,
+  closed_by_user_id INTEGER,
+  closed_at TEXT,
+  reopened_at TEXT,
+  metadata TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT,
+  updated_at TEXT
+);
+CREATE INDEX payment_close_periods_user_index ON payment_close_periods(user_id);
