@@ -2,7 +2,7 @@
 
 This document maps every HTTP endpoint defined in `start/routes.ts` of the AdonisJS API, with full paths reconstructed from all enclosing group prefixes, controller handlers, route-level middleware (beyond the tier middleware), and porting status. Use it as the authoritative checklist for the Rust/Axum port so no endpoint is missed.
 
-Coverage: 223 / 249 ported
+Coverage: 230 / 249 ported
 
 ## Framework-provided (transmit SSE)
 
@@ -73,9 +73,9 @@ Coverage: 223 / 249 ported
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 46 | GET | /openapi.json | (inline closure → openApiSpec JSON, cache-control 300s) | — | ⬜ |
-| 47 | GET | /docs | (inline closure → renderDocsPage HTML) | — | ⬜ |
-| 48 | GET | /auth/google/callback | auth_controller.ts@callbackGoogle | — | ⬜ |
+| 46 | GET | /openapi.json | (inline closure → openApiSpec JSON, cache-control 300s) | tier1_public_test (embedded spec) | ✅ |
+| 47 | GET | /docs | (inline closure → renderDocsPage HTML) | tier1_public_test (embedded HTML) | ✅ |
+| 48 | GET | /auth/google/callback | auth_controller.ts@callbackGoogle | oauth_google_test (OAuth2 code flow, mock) | ✅ |
 
 ## Public — /api payments networks (middleware.paymentApiVersioning)
 
@@ -98,7 +98,7 @@ Coverage: 223 / 249 ported
 | 58 | POST | /api/checkout/invoices/:publicId/kpr1-payments | checkout_invoices_controller.ts@submitKpr1Payment | — | ⬜ 🔒 chain relay/settlement |
 | 59 | GET | /api/checkout/links/:publicId | checkout_links_controller.ts@show | — | ✅ |
 | 60 | POST | /api/checkout/links/:publicId/invoices | checkout_links_controller.ts@createInvoice | — | ✅ |
-| 61 | POST | /api/bug-reports | bug_reports_controller.ts@store | middleware.bugReportRateLimit | ⬜ |
+| 61 | POST | /api/bug-reports | bug_reports_controller.ts@store | tier1_public_test (captcha via captcha_ok) | ✅ |
 | 62 | GET | /api/explorer/kpr1/intents/:intentId | kpr1_explorer_controller.ts@showIntent | explorer_kpr1_test | ✅ |
 | 63 | GET | /api/explorer/kpr1/intents/:intentId/wallet-verification | kpr1_explorer_controller.ts@walletVerification | explorer_kpr1_test | ✅ |
 | 64 | GET | /api/explorer/kpr1/payment-requests/:canonicalHash | kpr1_explorer_controller.ts@showPaymentRequest | explorer_kpr1_test | ✅ |
@@ -109,7 +109,7 @@ Coverage: 223 / 249 ported
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 67 | GET | /api/auth/google/redirect | auth_controller.ts@redirectGoogle | — | ⬜ |
+| 67 | GET | /api/auth/google/redirect | auth_controller.ts@redirectGoogle | oauth_google_test | ✅ |
 | 68 | GET | /api/auth/profile | auth_controller.ts@profile | middleware.auth | ✅ |
 | 69 | POST | /api/auth/logout | auth_controller.ts@logout | middleware.auth | ✅ |
 | 70 | POST | /api/auth/login | auth_controller.ts@login | — | ✅ |
@@ -240,8 +240,8 @@ Coverage: 223 / 249 ported
 | 190 | GET | /api/payments/ops/adjustments/:id | payment_adjustments_controller.ts@show | — | ✅ |
 | 191 | GET | /api/payments/ops/observations | payment_operations_controller.ts@observations | — | ✅ |
 | 192 | GET | /api/payments/ops/credits | payment_operations_controller.ts@credits | — | ✅ |
-| 193 | POST | /api/media | medias_controller.ts@store | — | ⬜ |
-| 194 | DELETE | /api/media/:id | medias_controller.ts@destroy | — | ⬜ |
+| 193 | POST | /api/media | medias_controller.ts@store | media_test (fs disk; compression no-op) | ✅ |
+| 194 | DELETE | /api/media/:id | medias_controller.ts@destroy | media_test | ✅ |
 | 195 | GET | /api/teams | teams_controller.ts@index (resource apiOnly) | — | ✅ |
 | 196 | POST | /api/teams | teams_controller.ts@store (resource apiOnly) | — | ✅ |
 | 197 | GET | /api/teams/:id | teams_controller.ts@show (resource apiOnly) | — | ✅ |

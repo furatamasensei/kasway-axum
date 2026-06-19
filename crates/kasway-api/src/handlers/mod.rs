@@ -1,8 +1,10 @@
 pub mod api_keys;
 pub mod auth;
+pub mod bug_reports;
 pub mod checkout;
 pub mod commerce;
 pub mod currencies;
+pub mod docs;
 pub mod explorer_kpr1;
 pub mod health;
 pub mod internal_kpr1_ops;
@@ -16,6 +18,7 @@ pub mod internal_tocatta_production;
 pub mod internal_settlement_records;
 pub mod internal_settlement_sandbox;
 pub mod invoices;
+pub mod medias;
 pub mod metrics;
 pub mod payment_adjustments;
 pub mod payment_analytics;

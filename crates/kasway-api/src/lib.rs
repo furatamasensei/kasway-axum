@@ -14,7 +14,7 @@ pub mod state;
 pub mod store_context;
 pub mod util;
 
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use state::AppState;
 
@@ -75,6 +75,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/tocatta/beta/contracts", get(handlers::internal_tocatta_beta::contract))
         // --- Internal KPR-1 ops (DB evidence) ---
         .route("/internal/payment-ops/kpr1/intents/:intentId/evidence", get(handlers::internal_kpr1_ops::evidence))
+        // --- Media (merchant) ---
+        .route("/api/media", post(handlers::medias::store))
+        .route("/api/media/:id", delete(handlers::medias::destroy))
+        // --- Public bug reports ---
+        .route("/api/bug-reports", post(handlers::bug_reports::store))
+        // --- Public docs (static) ---
+        .route("/openapi.json", get(handlers::docs::openapi))
+        .route("/docs", get(handlers::docs::docs))
         // --- Public KPR-1 explorer ---
         .route("/api/explorer/kpr1/intents/:intentId", get(handlers::explorer_kpr1::show_intent))
         .route("/api/explorer/kpr1/intents/:intentId/wallet-verification", get(handlers::explorer_kpr1::wallet_verification))
@@ -85,6 +93,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/register", post(handlers::auth::register))
         .route("/api/auth/profile", get(handlers::auth::profile))
+        .route("/api/auth/google/redirect", get(handlers::auth::redirect_google))
+        .route("/auth/google/callback", get(handlers::auth::callback_google))
         .route("/api/auth/logout", post(handlers::auth::logout))
         // --- Merchant API (auth) ---
         .route("/api/currencies", get(handlers::currencies::index))

@@ -1,5 +1,7 @@
-//! `/api/auth/*` — AuthController (login, register, profile, logout).
-//! Google OAuth (redirect/callback) is deferred (external dependency).
+//! `/api/auth/*` — AuthController (login, register, profile, logout) + Google
+//! OAuth (redirect/callback) via the standard OAuth2 code flow. Google endpoint
+//! URLs are config-overridable (state::GoogleConfig) so the token/userinfo
+//! exchange is testable against a local mock.
 
 use crate::auth::AuthMerchant;
 use crate::auth_token;
@@ -7,11 +9,14 @@ use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::password::{hash_password, verify_password};
 use crate::state::AppState;
 use crate::util::now_iso;
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Query, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Serialize;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use url::Url;
 
 #[derive(Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
@@ -240,4 +245,124 @@ fn is_email(value: &str) -> bool {
         && !domain.starts_with('.')
         && !domain.ends_with('.')
         && !value.contains(char::is_whitespace)
+}
+
+// ---- Google OAuth (redirect / callback) ------------------------------------
+
+/// `GET /api/auth/google/redirect` — returns the Google authorize URL (stateless).
+pub async fn redirect_google(State(state): State<AppState>) -> AppResult<String> {
+    let g = &state.config.google;
+    let redirect_uri = format!("{}/auth/google/callback", g.app_url);
+    let url = Url::parse_with_params(
+        &g.authorize_url,
+        &[
+            ("response_type", "code"),
+            ("client_id", g.client_id.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("scope", "openid email profile"),
+        ],
+    )
+    .map_err(|_| AppError::commerce(500, "Invalid Google authorize URL"))?;
+    Ok(url.to_string())
+}
+
+#[derive(Deserialize)]
+pub struct GoogleCallbackQuery {
+    code: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GoogleToken {
+    access_token: String,
+}
+
+#[derive(Deserialize)]
+struct GoogleUserInfo {
+    email: Option<String>,
+    name: Option<String>,
+    picture: Option<String>,
+}
+
+/// `GET /auth/google/callback` — exchanges the code, upserts the user, mints a
+/// merchant token, and redirects to the frontend callback.
+pub async fn callback_google(
+    State(state): State<AppState>,
+    Query(q): Query<GoogleCallbackQuery>,
+) -> AppResult<Response> {
+    if q.error.as_deref() == Some("access_denied") {
+        return Ok("You have cancelled the login process".into_response());
+    }
+    if let Some(err) = q.error.filter(|e| !e.is_empty()) {
+        return Ok(err.into_response());
+    }
+    let Some(code) = q.code.filter(|c| !c.is_empty()) else {
+        return Ok("We are unable to verify the request. Please try again".into_response());
+    };
+
+    let g = &state.config.google;
+    let redirect_uri = format!("{}/auth/google/callback", g.app_url);
+    let client = reqwest::Client::new();
+
+    let token: GoogleToken = client
+        .post(&g.token_url)
+        .form(&[
+            ("code", code.as_str()),
+            ("client_id", g.client_id.as_str()),
+            ("client_secret", g.client_secret.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("grant_type", "authorization_code"),
+        ])
+        .send()
+        .await
+        .map_err(|_| AppError::commerce(502, "Google token exchange failed"))?
+        .json()
+        .await
+        .map_err(|_| AppError::commerce(502, "Google token exchange failed"))?;
+
+    let info: GoogleUserInfo = client
+        .get(&g.userinfo_url)
+        .bearer_auth(&token.access_token)
+        .send()
+        .await
+        .map_err(|_| AppError::commerce(502, "Google user info failed"))?
+        .json()
+        .await
+        .map_err(|_| AppError::commerce(502, "Google user info failed"))?;
+
+    let email = info.email.filter(|e| !e.is_empty()).ok_or_else(|| AppError::commerce(502, "Google account has no email"))?;
+
+    // firstOrCreate by email
+    let existing: Option<(i64, bool)> = sqlx::query_as("SELECT id, onboarded FROM users WHERE email = ?")
+        .bind(&email)
+        .fetch_optional(&state.db.pool)
+        .await?;
+    let (user_id, onboarded) = match existing {
+        Some((id, ob)) => (id, ob),
+        None => {
+            let random_pw: String = (0..16).map(|_| rand::thread_rng().gen_range(b'a'..=b'z') as char).collect();
+            let now = now_iso();
+            let id = sqlx::query(
+                "INSERT INTO users (full_name, email, password, avatar_url, onboarded, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, 0, ?, ?)",
+            )
+            .bind(info.name)
+            .bind(&email)
+            .bind(hash_password(&random_pw))
+            .bind(info.picture)
+            .bind(&now)
+            .bind(&now)
+            .execute(&state.db.pool)
+            .await?
+            .last_insert_rowid();
+            (id, false)
+        }
+    };
+
+    let token_value = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, user_id).await?;
+    let location = format!(
+        "{}/auth/callback?token={}&onboarded={}",
+        g.frontend_url, token_value, onboarded
+    );
+    Ok((StatusCode::FOUND, [(header::LOCATION, location)]).into_response())
 }
