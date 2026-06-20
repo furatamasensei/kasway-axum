@@ -2,7 +2,7 @@
 
 This document maps every HTTP endpoint defined in `start/routes.ts` of the AdonisJS API, with full paths reconstructed from all enclosing group prefixes, controller handlers, route-level middleware (beyond the tier middleware), and porting status. Use it as the authoritative checklist for the Rust/Axum port so no endpoint is missed.
 
-Coverage: 234 / 249 ported
+Coverage: 241 / 249 ported
 
 ## Framework-provided (transmit SSE)
 
@@ -33,13 +33,13 @@ Coverage: 234 / 249 ported
 | 8 | GET | /internal/payment-ops/status | payment_launch_controller.ts@internalStatus | launch_status_test (queue=SLO, storage=fs, tn10 disabled) | ✅ |
 | 9 | GET | /internal/payment-ops/security/launch-gate | internal_security_launch_gate_controller.ts@show | internal_static_test (findings.json absent → static default) | ✅ |
 | 10 | GET | /internal/payment-ops/tn10/status | internal_tn10_node_controller.ts@show | internal_slo_obs_test (disabled report; live RPC external) | ✅ |
-| 11 | GET | /internal/payment-ops/tocatta/silverscript/status | internal_silverscript_controller.ts@show | — | ⬜ |
+| 11 | GET | /internal/payment-ops/tocatta/silverscript/status | internal_silverscript_controller.ts@show | tier3_covenant_test (disabled report) | ✅ |
 | 12 | GET | /internal/payment-ops/tocatta/silverscript/templates | internal_silverscript_templates_controller.ts@index | internal_static_test (static catalog, sha256 sources) | ✅ |
-| 13 | POST | /internal/payment-ops/tocatta/silverscript/templates/:id/compile | internal_silverscript_templates_controller.ts@compile | — | ⬜ |
-| 14 | POST | /internal/payment-ops/tocatta/covenants/transactions/dry-run | internal_covenant_transaction_assembler_controller.ts@dryRun | — | ⬜ |
-| 15 | GET | /internal/payment-ops/tocatta/covenants/tn10/status | internal_tn10_covenant_execution_controller.ts@status | — | ⬜ |
-| 16 | POST | /internal/payment-ops/tocatta/covenants/tn10/split-executions | internal_tn10_covenant_execution_controller.ts@executeSplit | — | ⬜ |
-| 17 | POST | /internal/payment-ops/tocatta/covenants/tn10/hold-release-executions | internal_tn10_covenant_execution_controller.ts@executeHoldRelease | — | ⬜ |
+| 13 | POST | /internal/payment-ops/tocatta/silverscript/templates/:id/compile | internal_silverscript_templates_controller.ts@compile | tier3_covenant_test (validation + compiler unavailable; WASM happy-path external) | ✅ |
+| 14 | POST | /internal/payment-ops/tocatta/covenants/transactions/dry-run | internal_covenant_transaction_assembler_controller.ts@dryRun | tier3_covenant_test (validation + SDK-not-configured; WASM assembly external) | ✅ |
+| 15 | GET | /internal/payment-ops/tocatta/covenants/tn10/status | internal_tn10_covenant_execution_controller.ts@status | tier3_covenant_test (disabled) | ✅ |
+| 16 | POST | /internal/payment-ops/tocatta/covenants/tn10/split-executions | internal_tn10_covenant_execution_controller.ts@executeSplit | tier3_covenant_test (not ready; live TN10 exec external) | ✅ |
+| 17 | POST | /internal/payment-ops/tocatta/covenants/tn10/hold-release-executions | internal_tn10_covenant_execution_controller.ts@executeHoldRelease | tier3_covenant_test (not ready; live TN10 exec external) | ✅ |
 | 18 | GET | /internal/payment-ops/tocatta/covenants/templates | internal_programmable_settlement_records_controller.ts@templates | settlement_records_test | ✅ |
 | 19 | POST | /internal/payment-ops/tocatta/covenants/templates | internal_programmable_settlement_records_controller.ts@storeTemplate | settlement_records_test (audit no-op; +422 required-field) | ✅ |
 | 20 | GET | /internal/payment-ops/tocatta/covenants/templates/:id/status | internal_programmable_settlement_records_controller.ts@status | settlement_records_test (policy gate replicated) | ✅ |
@@ -62,7 +62,7 @@ Coverage: 234 / 249 ported
 | 37 | GET | /internal/payment-ops/tocatta/production/reconciliation | internal_tocatta_production_controller.ts@reconciliation | internal_static_test | ✅ |
 | 38 | GET | /internal/payment-ops/tocatta/production/incidents | internal_tocatta_production_controller.ts@incidents | internal_static_test | ✅ |
 | 39 | GET | /internal/payment-ops/tocatta/production/communications | internal_tocatta_production_controller.ts@communications | internal_static_test | ✅ |
-| 40 | GET | /internal/payment-ops/kpr1/status | internal_kpr1_payment_ops_controller.ts@status | — | ⬜ |
+| 40 | GET | /internal/payment-ops/kpr1/status | internal_kpr1_payment_ops_controller.ts@status | tier3_covenant_test (DB intents + conformance + silverscript) | ✅ |
 | 41 | GET | /internal/payment-ops/kpr1/conformance | internal_kpr1_payment_ops_controller.ts@conformance | internal_misc_test (fixture+ed25519 verifier, all checks pass) | ✅ |
 | 42 | GET | /internal/payment-ops/kpr1/intents/:intentId/evidence | internal_kpr1_payment_ops_controller.ts@evidence | internal_misc_test | ✅ |
 | 43 | GET | /internal/payment-ops/merchants | internal_payment_ops_observability_controller.ts@merchants | internal_slo_obs_test | ✅ |

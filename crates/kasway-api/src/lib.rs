@@ -64,6 +64,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/slo/incidents", get(handlers::internal_slo::incidents))
         // --- Internal static contracts ---
         .route("/internal/payment-ops/tocatta/silverscript/templates", get(handlers::internal_silverscript::index))
+        .route("/internal/payment-ops/tocatta/silverscript/status", get(handlers::internal_silverscript::status))
+        .route("/internal/payment-ops/tocatta/silverscript/templates/:id/compile", post(handlers::internal_silverscript::compile))
+        .route("/internal/payment-ops/tocatta/covenants/transactions/dry-run", post(handlers::internal_covenant::dry_run))
+        .route("/internal/payment-ops/tocatta/covenants/tn10/status", get(handlers::internal_covenant::tn10_status))
+        .route("/internal/payment-ops/tocatta/covenants/tn10/split-executions", post(handlers::internal_covenant::execute_split))
+        .route("/internal/payment-ops/tocatta/covenants/tn10/hold-release-executions", post(handlers::internal_covenant::execute_hold_release))
         .route("/internal/payment-ops/security/launch-gate", get(handlers::internal_security_gate::show))
         .route("/internal/payment-ops/tocatta/production/status", get(handlers::internal_tocatta_production::status))
         .route("/internal/payment-ops/tocatta/production/cutover-runbook", get(handlers::internal_tocatta_production::cutover_runbook_handler))
@@ -77,6 +83,7 @@ pub fn build_router(state: AppState) -> Router {
         // --- Internal KPR-1 ops (DB evidence) ---
         .route("/internal/payment-ops/kpr1/intents/:intentId/evidence", get(handlers::internal_kpr1_ops::evidence))
         .route("/internal/payment-ops/kpr1/conformance", get(handlers::internal_kpr1_ops::conformance))
+        .route("/internal/payment-ops/kpr1/status", get(handlers::internal_kpr1_ops::status))
         // --- Media (merchant) ---
         .route("/api/media", post(handlers::medias::store))
         .route("/api/media/:id", delete(handlers::medias::destroy))

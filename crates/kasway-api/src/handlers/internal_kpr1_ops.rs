@@ -141,6 +141,11 @@ fn verify_reason(f_intent: &Value, example: &Value) -> Option<String> {
 
 /// `GET /internal/payment-ops/kpr1/conformance`
 pub async fn conformance(_token: InternalToken) -> AppResult<Json<Value>> {
+    Ok(Json(conformance_report()?))
+}
+
+/// Build the conformance report Value (shared with kpr1 status).
+pub(crate) fn conformance_report() -> AppResult<Value> {
     let f: Value = serde_json::from_str(CONFORMANCE_FIXTURE)
         .map_err(|_| AppError::commerce(500, "Invalid conformance fixture"))?;
     let vi = &f["validIntent"];
@@ -291,10 +296,65 @@ pub async fn conformance(_token: InternalToken) -> AppResult<Json<Value>> {
     })()));
 
     let ready = checks.iter().all(|c| c["status"] == json!("pass"));
-    Ok(Json(json!({
+    Ok(json!({
         "ready": ready,
         "fixtureVersion": f["fixtureVersion"],
         "generatedAt": now_iso(),
         "checks": checks,
+    }))
+}
+
+/// `GET /internal/payment-ops/kpr1/status` — Kpr1PaymentRailService.status().
+/// KPR-1 is enabled with config present (config pass), conformance passes, but
+/// SilverScript compatibility is disabled (fail) → overall not ready.
+pub async fn status(_token: InternalToken, State(state): State<AppState>) -> AppResult<Json<Value>> {
+    let cfg = &state.config.kpr1;
+    let open_intents: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kpr1_payment_intents WHERE status IN ('created','fetched','submitted','observed','verified')",
+    ).fetch_one(&state.db.pool).await?;
+    let failed_intents: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kpr1_payment_intents WHERE status = 'failed'",
+    ).fetch_one(&state.db.pool).await?;
+    let conformance = conformance_report()?;
+    let conformance_ready = conformance["ready"].as_bool().unwrap_or(false);
+    let failed_conformance: Vec<Value> = conformance["checks"].as_array().map(|a| {
+        a.iter().filter(|c| c["status"] != "pass").map(|c| c["key"].clone()).collect()
+    }).unwrap_or_default();
+
+    let checks = json!([
+        { "key": "kpr1.enabled", "status": "pass", "message": "KPR-1 is mandatory for invoice payments" },
+        { "key": "kpr1.config", "status": "pass", "message": "KPR-1 required config is present" },
+        {
+            "key": "kpr1.conformance",
+            "status": if conformance_ready { "pass" } else { "fail" },
+            "message": if conformance_ready { "KPR-1 conformance fixture passes canonical/hash/signature/output checks" } else { "KPR-1 conformance fixture failed" },
+            "metadata": { "fixtureVersion": conformance["fixtureVersion"], "failedChecks": failed_conformance },
+        },
+        {
+            "key": "silverscript.status",
+            "status": "fail",
+            "message": "SilverScript/Toccata compatibility must be proven before production covenant launch",
+            "metadata": { "status": "disabled", "compatibilityOutcome": "blocked", "targetNetwork": "tn10" },
+        },
+    ]);
+    let ready = checks.as_array().unwrap().iter().all(|c| c["status"] == "pass");
+
+    Ok(Json(json!({
+        "enabled": cfg.enabled,
+        "ready": ready,
+        "generatedAt": now_iso(),
+        "checks": checks,
+        "signingSurface": {
+            "kaswaySignsCustomerTransactions": false,
+            "message": "KPR-1 checkout uses wallet-local signing and Kasway verifies required outputs.",
+        },
+        "intentMetrics": { "openIntents": open_intents, "failedIntents": failed_intents },
+        "conformance": conformance,
+        "config": {
+            "platformFeeBps": cfg.platform_fee_bps,
+            "hasPlatformFeeAddress": !cfg.platform_fee_address.is_empty(),
+            "signingKeyId": cfg.signing_key_id,
+            "hasSigningPrivateKey": true,
+        },
     })))
 }
