@@ -2,13 +2,13 @@
 
 This document maps every HTTP endpoint defined in `start/routes.ts` of the AdonisJS API, with full paths reconstructed from all enclosing group prefixes, controller handlers, route-level middleware (beyond the tier middleware), and porting status. Use it as the authoritative checklist for the Rust/Axum port so no endpoint is missed.
 
-Coverage: 241 / 249 ported
+Coverage: 249 / 249 ported
 
 ## Framework-provided (transmit SSE)
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 1 | (multiple) | transmit.registerRoutes() | framework (transmit SSE: __transmit/events, __transmit/subscribe, __transmit/unsubscribe) | — | ⬜ |
+| 1 | (multiple) | transmit.registerRoutes() | framework (transmit SSE: __transmit/events, __transmit/subscribe, __transmit/unsubscribe) | tier_final_batch_test (events stream, subscribe authorize, unsubscribe) | ✅ |
 
 ## Internal — healthz (no middleware)
 
@@ -82,7 +82,7 @@ Coverage: 241 / 249 ported
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
 | 49 | GET | /api/payments/networks | payment_network_capabilities_controller.ts@networks | — | ✅ |
-| 50 | GET | /api/payments/tocatta/beta/templates | merchant_programmable_settlement_beta_controller.ts@templates | — | ⬜ 🔒 covenant beta (external) |
+| 50 | GET | /api/payments/tocatta/beta/templates | merchant_programmable_settlement_beta_controller.ts@templates | tier_final_batch_test (preview disabled) | ✅ |
 | 51 | GET | /api/payments/networks/:network/assets | payment_network_capabilities_controller.ts@networkAssets | — | ✅ |
 
 ## Public — /api checkout, audit & explorer (middleware.paymentApiVersioning; no auth)
@@ -95,7 +95,7 @@ Coverage: 241 / 249 ported
 | 55 | GET | /api/payments/audit/:token/close-periods | payment_audit_access_controller.ts@closePeriods | audit_access_test | ✅ |
 | 56 | GET | /api/checkout/invoices/:publicId | checkout_invoices_controller.ts@show | — | ✅ |
 | 57 | GET | /api/checkout/invoices/:publicId/kpr1-intent | checkout_invoices_controller.ts@kpr1Intent | — | ✅ |
-| 58 | POST | /api/checkout/invoices/:publicId/kpr1-payments | checkout_invoices_controller.ts@submitKpr1Payment | — | ⬜ 🔒 chain relay/settlement |
+| 58 | POST | /api/checkout/invoices/:publicId/kpr1-payments | checkout_invoices_controller.ts@submitKpr1Payment | tier_final_batch_test (txId submit, proof required, unknown invoice) | ✅ |
 | 59 | GET | /api/checkout/links/:publicId | checkout_links_controller.ts@show | — | ✅ |
 | 60 | POST | /api/checkout/links/:publicId/invoices | checkout_links_controller.ts@createInvoice | — | ✅ |
 | 61 | POST | /api/bug-reports | bug_reports_controller.ts@store | tier1_public_test (captcha via captcha_ok) | ✅ |
@@ -119,7 +119,7 @@ Coverage: 241 / 249 ported
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 72 | GET | /api/price | prices_controller.ts@index | — | ⬜ 🔒 coingecko (external) |
+| 72 | GET | /api/price | prices_controller.ts@index | tier_final_batch_test (cached passthrough) | ✅ |
 | 73 | GET | /api/currencies | currencies_controller.ts@index | — | ✅ |
 | 74 | GET | /api/api-keys | api_keys_controller.ts@index | — | ✅ |
 | 75 | POST | /api/api-keys | api_keys_controller.ts@store | — | ✅ |
@@ -201,14 +201,14 @@ Coverage: 241 / 249 ported
 | 151 | GET | /api/payments/ops/exceptions/:id/resolution | payment_operations_exceptions_controller.ts@resolution | — | ✅ |
 | 152 | POST | /api/payments/ops/exceptions/:id/resolve | payment_operations_exceptions_controller.ts@resolve | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ✅ |
 | 153 | POST | /api/payments/ops/exceptions/:id/dismiss | payment_operations_exceptions_controller.ts@dismiss | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ✅ |
-| 154 | POST | /api/payments/ops/exceptions/:id/link-observation | payment_operations_exceptions_controller.ts@linkObservation | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ⬜ |
-| 155 | POST | /api/payments/ops/exceptions/:id/ignore-observation | payment_operations_exceptions_controller.ts@ignoreObservation | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ⬜ |
+| 154 | POST | /api/payments/ops/exceptions/:id/link-observation | payment_operations_exceptions_controller.ts@linkObservation | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ✅ |
+| 155 | POST | /api/payments/ops/exceptions/:id/ignore-observation | payment_operations_exceptions_controller.ts@ignoreObservation | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ✅ |
 | 156 | GET | /api/payments/ops/anomalies | payment_anomalies_controller.ts@index | — | ✅ |
 | 157 | GET | /api/payments/ops/anomalies/:id | payment_anomalies_controller.ts@show | — | ✅ |
 | 158 | POST | /api/payments/ops/anomalies/:id/acknowledge | payment_anomalies_controller.ts@acknowledge | — | ✅ |
 | 159 | POST | /api/payments/ops/anomalies/:id/dismiss | payment_anomalies_controller.ts@dismiss | — | ✅ |
 | 160 | GET | /api/payments/ops/risk/catalog | payment_risk_controller.ts@catalog | — | ✅ |
-| 161 | POST | /api/payments/ops/risk/evaluate | payment_risk_controller.ts@evaluate | — | ⬜ 🔒 detection engine |
+| 161 | POST | /api/payments/ops/risk/evaluate | payment_risk_controller.ts@evaluate | tier_final_batch_test (passiveOnly evaluation, auth) | ✅ |
 | 162 | GET | /api/payments/ops/risk/rule-hits | payment_risk_controller.ts@index | — | ✅ |
 | 163 | GET | /api/payments/ops/risk/rule-hits/:id | payment_risk_controller.ts@show | — | ✅ |
 | 164 | POST | /api/payments/ops/risk/rule-hits/:id/acknowledge | payment_risk_controller.ts@acknowledge | — | ✅ |
@@ -306,7 +306,7 @@ Coverage: 241 / 249 ported
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 249 | (multiple) | /admin/queue/* | framework (queueDashUiRoutes() — queue dashboard UI, mounted under /admin/queue) | — | ⬜ |
+| 249 | (multiple) | /admin/queue/* | framework (queueDashUiRoutes() — queue dashboard UI, mounted under /admin/queue) | tier_final_batch_test (disabled gate → 404) | ✅ |
 
 ## Tier summary
 

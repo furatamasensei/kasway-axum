@@ -35,6 +35,7 @@ scrypt.workspace = true
 ed25519-dalek.workspace = true
 url.workspace = true
 reqwest.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

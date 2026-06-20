@@ -1,14 +1,15 @@
 //! `/api/payments/ops/risk/*` — PaymentRiskController + PaymentRiskRuleService.
 //! catalog/rule-hits(index/show)/review(acknowledge/dismiss/note)/report.
-//! `evaluate` (the passive detection engine) is deferred — background scan over
-//! invoices/wallet submissions/fingerprints.
+//! `evaluate` is the passive detection engine: a DB scan over invoices / failed
+//! wallet submissions / payout-address changes / repeated client fingerprints.
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
-use crate::util::{now_iso, paginator_meta};
+use crate::util::{now_iso, paginator_meta, sha256_hex};
 use axum::extract::{Path, Query, State};
 use axum::Json;
+use chrono::{Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -235,4 +236,182 @@ pub async fn report(auth: AuthMerchant, State(state): State<AppState>) -> AppRes
             "merchant_communication_not_approved",
         ],
     })))
+}
+
+// ---- evaluate (#161 passive detection engine) ------------------------------
+
+const HIGH_VALUE_INVOICE_THRESHOLD: i64 = 10_000_000_000;
+const FAILED_WALLET_SUBMISSION_THRESHOLD: i64 = 2;
+const CLIENT_FINGERPRINT_THRESHOLD: usize = 3;
+const PAYOUT_CHANGE_WINDOW_HOURS: i64 = 24;
+const RULE_VERSION: &str = "v1";
+
+fn iso(dt: chrono::DateTime<Utc>) -> String {
+    dt.format("%Y-%m-%dT%H:%M:%S%.3f+00:00").to_string()
+}
+fn parse_dt(s: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s).ok().map(|d| d.with_timezone(&Utc))
+}
+fn mask_address(v: &str) -> String {
+    if v.chars().count() <= 16 {
+        format!("{}...", v.chars().take(6).collect::<String>())
+    } else {
+        let chars: Vec<char> = v.chars().collect();
+        let last6: String = chars[chars.len() - 6..].iter().collect();
+        format!("{}...{}", chars[..10].iter().collect::<String>(), last6)
+    }
+}
+
+struct PendingHit {
+    rule_key: &'static str,
+    severity: String,
+    resource_type: &'static str,
+    resource_id: String,
+    reason: &'static str,
+    input_snapshot: Value,
+    thresholds: Value,
+    window_start: String,
+    window_end: String,
+}
+
+async fn record_hit(state: &AppState, h: &PendingHit, now_iso_str: &str) -> AppResult<HitRow> {
+    let dedupe = sha256_hex(format!(
+        "{EVALUATOR_VERSION}:{}:{}:{}:{}:{}:{}",
+        // userId is embedded by caller via input_snapshot? No — match Adonis: include userId
+        h.input_snapshot["__userId"].as_i64().unwrap_or(0),
+        h.rule_key, h.resource_type, h.resource_id, h.window_start, h.window_end
+    ).as_bytes());
+    if let Some(existing) = sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE dedupe_key = ?"))
+        .bind(&dedupe).fetch_optional(&state.db.pool).await?
+    {
+        return Ok(existing);
+    }
+    let user_id = h.input_snapshot["__userId"].as_i64().unwrap_or(0);
+    let mut snapshot = h.input_snapshot.clone();
+    if let Value::Object(o) = &mut snapshot { o.remove("__userId"); }
+    let id = sqlx::query(
+        "INSERT INTO payment_risk_rule_hits (user_id, rule_key, rule_version, severity, status, outcome, \
+         resource_type, resource_id, reason, input_snapshot, thresholds, dedupe_key, evaluator_version, \
+         detected_at, window_start, window_end, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, 'open', 'observed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user_id).bind(h.rule_key).bind(RULE_VERSION).bind(&h.severity).bind(h.resource_type)
+    .bind(&h.resource_id).bind(h.reason).bind(snapshot.to_string()).bind(h.thresholds.to_string())
+    .bind(&dedupe).bind(EVALUATOR_VERSION).bind(now_iso_str).bind(&h.window_start).bind(&h.window_end)
+    .bind(now_iso_str).bind(now_iso_str)
+    .execute(&state.db.pool).await?.last_insert_rowid();
+    sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE id = ?"))
+        .bind(id).fetch_one(&state.db.pool).await.map_err(Into::into)
+}
+
+/// `POST /api/payments/ops/risk/evaluate`
+pub async fn evaluate(auth: AuthMerchant, State(state): State<AppState>) -> AppResult<Json<Value>> {
+    let uid = auth.user_id;
+    let now = Utc::now();
+    let now_str = iso(now);
+    let week_start = iso(now - Duration::days(7));
+    let day_start = iso(now - Duration::hours(24));
+    let week_end = now_str.clone();
+    let day_end = now_str.clone();
+    let mut pending: Vec<PendingHit> = Vec::new();
+
+    // 1. high-value invoices (with a KPR-1 intent) in the past week
+    let hi = sqlx::query_as::<_, (i64, String, String, i64, Option<String>)>(
+        "SELECT i.id, i.public_id, i.status, i.total_amount, i.payment_network FROM invoices i \
+         JOIN kpr1_payment_intents k ON k.invoice_id = i.id \
+         WHERE i.user_id = ? AND i.created_at BETWEEN ? AND ? AND i.total_amount >= ?",
+    ).bind(uid).bind(&week_start).bind(&week_end).bind(HIGH_VALUE_INVOICE_THRESHOLD)
+    .fetch_all(&state.db.pool).await?;
+    for (id, public_id, status, total, network) in hi {
+        pending.push(PendingHit {
+            rule_key: "kpr1_high_value_invoice", severity: "review".into(), resource_type: "invoice",
+            resource_id: id.to_string(), reason: "invoice_amount_exceeds_passive_review_threshold",
+            input_snapshot: json!({ "__userId": uid, "invoiceId": id, "publicId": public_id, "status": status, "totalAmount": total.to_string(), "paymentNetwork": network }),
+            thresholds: json!({ "amountSompi": HIGH_VALUE_INVOICE_THRESHOLD.to_string() }),
+            window_start: week_start.clone(), window_end: week_end.clone(),
+        });
+    }
+
+    // 2. repeated failed wallet submissions per KPR-1 invoice (week)
+    let failed = sqlx::query_as::<_, (i64, String, i64)>(
+        "SELECT i.id, i.public_id, COUNT(*) AS c FROM payments p JOIN invoices i ON i.id = p.invoice_id \
+         WHERE i.user_id = ? AND p.status = 'failed' AND i.payment_address LIKE 'kpr1:%' \
+         AND p.updated_at BETWEEN ? AND ? GROUP BY i.id, i.public_id HAVING COUNT(*) >= ?",
+    ).bind(uid).bind(&week_start).bind(&week_end).bind(FAILED_WALLET_SUBMISSION_THRESHOLD)
+    .fetch_all(&state.db.pool).await?;
+    for (id, public_id, count) in failed {
+        pending.push(PendingHit {
+            rule_key: "kpr1_repeated_failed_wallet_submission",
+            severity: if count >= 5 { "high".into() } else { "review".into() },
+            resource_type: "invoice", resource_id: id.to_string(),
+            reason: "failed_kpr1_wallet_submissions_for_same_invoice",
+            input_snapshot: json!({ "__userId": uid, "invoiceId": id, "publicId": public_id, "failedSubmissionCount": count }),
+            thresholds: json!({ "failedSubmissionCount": FAILED_WALLET_SUBMISSION_THRESHOLD }),
+            window_start: week_start.clone(), window_end: week_end.clone(),
+        });
+    }
+
+    // 3. payout address recent change
+    let setup = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT kaspa_main_address, updated_at FROM setups WHERE user_id = ?",
+    ).bind(uid).fetch_optional(&state.db.pool).await?;
+    if let Some((Some(addr), setup_updated)) = setup {
+        let current = addr.trim().to_string();
+        if !current.is_empty() {
+            if let Some(setup_upd) = setup_updated.as_deref().and_then(parse_dt) {
+                let intents = sqlx::query_as::<_, (i64, i64, String, String, Option<String>)>(
+                    "SELECT id, invoice_id, status, merchant_address, created_at FROM kpr1_payment_intents \
+                     WHERE user_id = ? AND status IN ('submitted','observed','verified','settled') AND created_at BETWEEN ? AND ?",
+                ).bind(uid).bind(&week_start).bind(&week_end).fetch_all(&state.db.pool).await?;
+                for (id, invoice_id, status, merchant_addr, created) in intents {
+                    let Some(created_dt) = created.as_deref().and_then(parse_dt) else { continue };
+                    let changed_after = setup_upd > created_dt;
+                    let recent = (setup_upd - created_dt).num_hours() <= PAYOUT_CHANGE_WINDOW_HOURS;
+                    if changed_after && recent && current.to_lowercase() != merchant_addr.to_lowercase() {
+                        pending.push(PendingHit {
+                            rule_key: "kpr1_payout_address_recent_change", severity: "high".into(),
+                            resource_type: "kpr1_payment_intent", resource_id: id.to_string(),
+                            reason: "merchant_payout_address_changed_after_intent_creation",
+                            input_snapshot: json!({ "__userId": uid, "intentId": id, "invoiceId": invoice_id, "intentStatus": status,
+                                "originalMerchantAddress": mask_address(&merchant_addr), "currentMerchantAddress": mask_address(&current),
+                                "setupUpdatedAt": setup_updated, "intentCreatedAt": created }),
+                            thresholds: json!({ "changedWithinHours": PAYOUT_CHANGE_WINDOW_HOURS }),
+                            window_start: week_start.clone(), window_end: week_end.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. repeated client fingerprints (day)
+    let fp_intents = sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT id, metadata FROM kpr1_payment_intents WHERE user_id = ? AND updated_at BETWEEN ? AND ?",
+    ).bind(uid).bind(&day_start).bind(&day_end).fetch_all(&state.db.pool).await?;
+    let mut by_fp: std::collections::BTreeMap<String, Vec<i64>> = std::collections::BTreeMap::new();
+    for (id, metadata) in fp_intents {
+        let meta: Value = metadata.as_deref().and_then(|m| serde_json::from_str(m).ok()).unwrap_or(json!({}));
+        let fp = meta["walletSubmission"]["clientFingerprint"].as_str().map(|s| s.trim()).filter(|s| !s.is_empty());
+        if let Some(fp) = fp {
+            by_fp.entry(sha256_hex(fp.as_bytes())).or_default().push(id);
+        }
+    }
+    for (fp_hash, ids) in by_fp {
+        if ids.len() < CLIENT_FINGERPRINT_THRESHOLD { continue; }
+        pending.push(PendingHit {
+            rule_key: "kpr1_repeated_client_fingerprint", severity: "info".into(),
+            resource_type: "kpr1_client_fingerprint", resource_id: fp_hash.clone(),
+            reason: "same_client_fingerprint_seen_across_multiple_kpr1_submissions",
+            input_snapshot: json!({ "__userId": uid, "fingerprintHash": fp_hash, "submissionCount": ids.len(), "intentIds": ids.iter().take(10).collect::<Vec<_>>() }),
+            thresholds: json!({ "submissionCount": CLIENT_FINGERPRINT_THRESHOLD }),
+            window_start: day_start.clone(), window_end: day_end.clone(),
+        });
+    }
+
+    let mut records = Vec::new();
+    for h in &pending {
+        let row = record_hit(&state, h, &now_str).await?;
+        records.push(serialize_hit(&state, &row).await?);
+    }
+    Ok(Json(json!({ "passiveOnly": true, "data": records })))
 }

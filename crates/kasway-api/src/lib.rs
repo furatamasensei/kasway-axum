@@ -14,7 +14,7 @@ pub mod state;
 pub mod store_context;
 pub mod util;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::Router;
 use state::AppState;
 
@@ -92,6 +92,16 @@ pub fn build_router(state: AppState) -> Router {
         // --- Public docs (static) ---
         .route("/openapi.json", get(handlers::docs::openapi))
         .route("/docs", get(handlers::docs::docs))
+        // --- Public misc (beta templates, price) ---
+        .route("/api/payments/tocatta/beta/templates", get(handlers::public_misc::beta_templates))
+        .route("/api/price", get(handlers::public_misc::price))
+        // --- Transmit (SSE) ---
+        .route("/__transmit/events", get(handlers::transmit::events))
+        .route("/__transmit/subscribe", post(handlers::transmit::subscribe))
+        .route("/__transmit/unsubscribe", post(handlers::transmit::unsubscribe))
+        // --- Admin queue dashboard (disabled gate) ---
+        .route("/admin/queue", any(handlers::admin_queue::gate))
+        .route("/admin/queue/*rest", any(handlers::admin_queue::gate))
         // --- Public KPR-1 explorer ---
         .route("/api/explorer/kpr1/intents/:intentId", get(handlers::explorer_kpr1::show_intent))
         .route("/api/explorer/kpr1/intents/:intentId/wallet-verification", get(handlers::explorer_kpr1::wallet_verification))
@@ -145,8 +155,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/payments/ops/exceptions/:id/resolution", get(handlers::payment_exceptions::resolution))
         .route("/api/payments/ops/exceptions/:id/resolve", post(handlers::payment_exceptions::resolve))
         .route("/api/payments/ops/exceptions/:id/dismiss", post(handlers::payment_exceptions::dismiss))
+        .route("/api/payments/ops/exceptions/:id/link-observation", post(handlers::payment_exceptions::link_observation))
+        .route("/api/payments/ops/exceptions/:id/ignore-observation", post(handlers::payment_exceptions::ignore_observation))
         // --- Payment-ops risk (auth) ---
         .route("/api/payments/ops/risk/catalog", get(handlers::payment_risk::catalog))
+        .route("/api/payments/ops/risk/evaluate", post(handlers::payment_risk::evaluate))
         .route("/api/payments/ops/risk/rule-hits", get(handlers::payment_risk::index))
         .route("/api/payments/ops/risk/rule-hits/:id", get(handlers::payment_risk::show))
         .route("/api/payments/ops/risk/rule-hits/:id/acknowledge", post(handlers::payment_risk::acknowledge))
@@ -308,6 +321,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/checkout/invoices/:publicId/kpr1-intent",
             get(handlers::checkout::kpr1_intent),
         )
+        .route("/api/checkout/invoices/:publicId/kpr1-payments", post(handlers::checkout::submit_kpr1_payment))
         .route("/api/checkout/links/:publicId", get(handlers::checkout::link_show))
         .route(
             "/api/checkout/links/:publicId/invoices",

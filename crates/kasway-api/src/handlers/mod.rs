@@ -1,3 +1,4 @@
+pub mod admin_queue;
 pub mod api_keys;
 pub mod auth;
 pub mod bug_reports;
@@ -40,7 +41,9 @@ pub mod payment_sandbox;
 pub mod payment_support_operations;
 pub mod payment_retention;
 pub mod payments_networks;
+pub mod public_misc;
 pub mod regional_pricing;
+pub mod transmit;
 pub mod payment_links;
 pub mod setups;
 pub mod stores;

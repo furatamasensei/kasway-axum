@@ -223,3 +223,167 @@ pub async fn resolve(auth: AuthMerchant, State(state): State<AppState>, Path(key
 pub async fn dismiss(auth: AuthMerchant, State(state): State<AppState>, Path(key): Path<String>, Json(body): Json<Value>) -> AppResult<(StatusCode, Json<Value>)> {
     Ok((StatusCode::CREATED, create_resolution(&state, auth.user_id, &key, "dismiss", "dismissed", &body).await?))
 }
+
+// ---- link / ignore observation (#154 / #155) -------------------------------
+
+fn observation_id_from_key(key: &str) -> Option<i64> {
+    let marker = ":observation:";
+    let idx = key.find(marker)?;
+    let rest = &key[idx + marker.len()..];
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+#[derive(sqlx::FromRow)]
+struct ObsRow {
+    id: i64,
+    invoice_id: Option<i64>,
+    status: String,
+    network: Option<String>,
+    asset_id: Option<String>,
+    payment_address: Option<String>,
+    metadata: Option<String>,
+}
+
+const OBS_COLS: &str = "id, invoice_id, status, network, asset_id, payment_address, metadata";
+
+fn obs_kpr1_meta(o: &ObsRow) -> Value {
+    let m: Value = o.metadata.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(json!({}));
+    match m.get("kpr1") { Some(k) if k.is_object() => k.clone(), _ => m }
+}
+
+async fn observation_for_merchant(state: &AppState, user_id: i64, id: i64) -> AppResult<ObsRow> {
+    let obs = sqlx::query_as::<_, ObsRow>(&format!("SELECT {OBS_COLS} FROM payment_observations WHERE id = ?"))
+        .bind(id).fetch_optional(&state.db.pool).await?
+        .ok_or_else(|| AppError::commerce(404, "Payment observation not found"))?;
+    // belongs-to-merchant: via invoice_id, kpr1 intentId, or payment route match
+    let mut belongs = false;
+    if let Some(inv_id) = obs.invoice_id {
+        let found: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE id = ? AND user_id = ?")
+            .bind(inv_id).bind(user_id).fetch_optional(&state.db.pool).await?;
+        belongs = found.is_some();
+    }
+    if !belongs {
+        if let Some(intent_id) = obs_kpr1_meta(&obs)["intentId"].as_str() {
+            let found: Option<i64> = sqlx::query_scalar("SELECT id FROM kpr1_payment_intents WHERE intent_id = ? AND user_id = ?")
+                .bind(intent_id).bind(user_id).fetch_optional(&state.db.pool).await?;
+            belongs = found.is_some();
+        }
+    }
+    if !belongs {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM invoices WHERE user_id = ? AND payment_address = ? AND payment_network = ? AND payment_asset = ?",
+        ).bind(user_id).bind(&obs.payment_address).bind(&obs.network).bind(&obs.asset_id).fetch_optional(&state.db.pool).await?;
+        belongs = found.is_some();
+    }
+    if !belongs {
+        return Err(AppError::commerce(404, "Payment observation not found"));
+    }
+    Ok(obs)
+}
+
+async fn assert_exception_belongs(state: &AppState, user_id: i64, key: &str) -> AppResult<()> {
+    let excs = derive_user_exceptions(state, user_id, None, None, None).await?;
+    if excs.iter().any(|e| e["id"].as_str() == Some(key)) {
+        Ok(())
+    } else {
+        Err(AppError::commerce(404, "Payment exception not found"))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn insert_resolution(state: &AppState, user_id: i64, key: &str, action: &str, status: &str, note: Option<&str>, metadata: &Value, invoice_id: Option<i64>, observation_id: Option<i64>) -> AppResult<Value> {
+    let exc_type = key.split(':').next().unwrap_or("unknown");
+    let now = now_iso();
+    let r = sqlx::query(
+        "INSERT INTO payment_exception_resolutions (user_id, exception_type, exception_key, invoice_id, payment_observation_id, action, status, note, metadata, resolved_by_user_id, resolved_at, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(user_id).bind(exc_type).bind(key).bind(invoice_id).bind(observation_id).bind(action).bind(status)
+    .bind(note).bind(metadata.to_string()).bind(user_id).bind(&now).bind(&now).bind(&now)
+    .execute(&state.db.pool).await?;
+    let row = sqlx::query_as::<_, ResolutionRow>(&format!("SELECT {RES_COLS} FROM payment_exception_resolutions WHERE id = ?"))
+        .bind(r.last_insert_rowid()).fetch_one(&state.db.pool).await?;
+    Ok(serialize_resolution(&row))
+}
+
+/// `POST /api/payments/ops/exceptions/:id/ignore-observation`
+pub async fn ignore_observation(auth: AuthMerchant, State(state): State<AppState>, Path(key): Path<String>, Json(body): Json<Value>) -> AppResult<(StatusCode, Json<Value>)> {
+    let obs_id = observation_id_from_key(&key)
+        .ok_or_else(|| AppError::commerce(422, "Exception does not reference an observation"))?;
+    let obs = observation_for_merchant(&state, auth.user_id, obs_id).await?;
+    if !matches!(obs.status.as_str(), "pending" | "ignored") {
+        return Err(AppError::commerce(422, "Only pending or ignored observations can be ignored"));
+    }
+    let mut meta: Value = obs.metadata.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(json!({}));
+    if let Value::Object(m) = &mut meta {
+        m.insert("ignoredByResolution".into(), json!(true));
+        m.insert("ignoredAt".into(), json!(now_iso()));
+    }
+    sqlx::query("UPDATE payment_observations SET status = 'ignored', metadata = ?, updated_at = ? WHERE id = ?")
+        .bind(meta.to_string()).bind(now_iso()).bind(obs.id).execute(&state.db.pool).await?;
+    let note = body.get("note").and_then(|v| v.as_str());
+    let metadata = body.get("metadata").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
+    let res = insert_resolution(&state, auth.user_id, &key, "ignore_observation", "resolved", note, &metadata, None, Some(obs.id)).await?;
+    Ok((StatusCode::CREATED, Json(res)))
+}
+
+/// `POST /api/payments/ops/exceptions/:id/link-observation`
+pub async fn link_observation(auth: AuthMerchant, State(state): State<AppState>, Path(key): Path<String>, Json(body): Json<Value>) -> AppResult<(StatusCode, Json<Value>)> {
+    let invoice_id = body.get("invoiceId").and_then(|v| v.as_i64())
+        .ok_or_else(|| AppError::validation_field("invoiceId", "required", "The invoiceId field must be defined"))?;
+    let obs_id = body.get("paymentObservationId").and_then(|v| v.as_i64())
+        .ok_or_else(|| AppError::validation_field("paymentObservationId", "required", "The paymentObservationId field must be defined"))?;
+
+    assert_exception_belongs(&state, auth.user_id, &key).await?;
+
+    let invoice = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>)>(
+        "SELECT id, payment_address, payment_network, payment_asset FROM invoices WHERE user_id = ? AND id = ?",
+    ).bind(auth.user_id).bind(invoice_id).fetch_optional(&state.db.pool).await?
+        .ok_or_else(|| AppError::commerce(404, "Invoice not found"))?;
+    let (inv_id, inv_addr, inv_net, inv_asset) = invoice;
+    let obs = observation_for_merchant(&state, auth.user_id, obs_id).await?;
+
+    if let Some(linked) = obs.invoice_id { if linked != inv_id {
+        return Err(AppError::commerce(422, "Observation is already linked to another invoice"));
+    }}
+    if obs.network != inv_net || obs.asset_id != inv_asset {
+        return Err(AppError::commerce(422, "Observation does not match the invoice payment route"));
+    }
+    if !inv_addr.starts_with("kpr1:") {
+        return Err(AppError::commerce(422, "Only KPR-1 covenant invoices can be linked to observations"));
+    }
+    if let Some(oaddr) = &obs.payment_address {
+        if oaddr.starts_with("kpr1:") && *oaddr != inv_addr {
+            return Err(AppError::commerce(422, "Observation does not match the invoice payment route"));
+        }
+    }
+    let intent = sqlx::query_as::<_, (String, String)>(
+        "SELECT intent_id, script_hash FROM kpr1_payment_intents WHERE invoice_id = ? AND user_id = ?",
+    ).bind(inv_id).bind(auth.user_id).fetch_optional(&state.db.pool).await?
+        .ok_or_else(|| AppError::commerce(422, "KPR-1 payment intent is required before linking observations"))?;
+    let (intent_id, script_hash) = intent;
+    let km = obs_kpr1_meta(&obs);
+    if let Some(oid) = km["intentId"].as_str() { if oid != intent_id {
+        return Err(AppError::commerce(422, "Observation does not match the invoice payment route"));
+    }}
+    if let Some(osh) = km["scriptHash"].as_str() { if osh != script_hash {
+        return Err(AppError::commerce(422, "Observation does not match the invoice payment route"));
+    }}
+
+    let mut meta: Value = obs.metadata.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(json!({}));
+    if let Value::Object(m) = &mut meta {
+        m.insert("linkedByResolution".into(), json!(true));
+        m.insert("linkedAt".into(), json!(now_iso()));
+    }
+    let now = now_iso();
+    // matchedAt = existing ?? now
+    sqlx::query("UPDATE payment_observations SET invoice_id = ?, status = 'matched', matched_at = COALESCE(matched_at, ?), metadata = ?, updated_at = ? WHERE id = ?")
+        .bind(inv_id).bind(&now).bind(meta.to_string()).bind(&now).bind(obs.id).execute(&state.db.pool).await?;
+    // settleObservationById — settlement is derive-on-read in the port (no-op here)
+
+    let note = body.get("note").and_then(|v| v.as_str());
+    let metadata = body.get("metadata").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
+    let res = insert_resolution(&state, auth.user_id, &key, "link_observation", "resolved", note, &metadata, Some(inv_id), Some(obs.id)).await?;
+    Ok((StatusCode::CREATED, Json(res)))
+}

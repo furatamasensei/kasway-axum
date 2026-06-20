@@ -20,6 +20,8 @@ pub struct AppConfig {
     pub node_env: String,
     pub kpr1: Kpr1Config,
     pub google: GoogleConfig,
+    /// CoinGecko simple-price base URL (overridable for tests). PricesController.
+    pub price_api_url: String,
 }
 
 /// Google OAuth (auth_controller redirectGoogle/callbackGoogle via @adonisjs/ally).
@@ -129,6 +131,7 @@ impl AppConfig {
             node_env: std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
             kpr1,
             google,
+            price_api_url: std::env::var("PRICE_API_URL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "https://api.coingecko.com/api/v3/simple/price".to_string()),
         }
     }
 
@@ -140,6 +143,7 @@ impl AppConfig {
             node_env: "test".to_string(),
             kpr1: Kpr1Config::default(),
             google: GoogleConfig::default(),
+            price_api_url: "https://api.coingecko.com/api/v3/simple/price".to_string(),
         }
     }
 
