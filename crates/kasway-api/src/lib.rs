@@ -14,12 +14,32 @@ pub mod state;
 pub mod store_context;
 pub mod util;
 
+use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
+use axum::http::{HeaderValue, Method};
 use axum::routing::{any, delete, get, post};
 use axum::Router;
 use state::AppState;
+use tower_http::cors::CorsLayer;
 
 /// Build the application router. Shared by the binary and the integration tests.
 pub fn build_router(state: AppState) -> Router {
+    // CORS: the frontend at https://kasway.xyz must reach the API at
+    // https://api-staging.kasway.xyz. Credentials are allowed (cookies/auth
+    // headers), which per the CORS spec forbids wildcard origin/headers, so the
+    // origin and headers are listed explicitly.
+    let cors = CorsLayer::new()
+        .allow_origin("https://kasway.xyz".parse::<HeaderValue>().unwrap())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::PATCH,
+            Method::OPTIONS,
+        ])
+        .allow_headers([CONTENT_TYPE, AUTHORIZATION])
+        .allow_credentials(true);
+
     Router::new()
         // --- Unauthenticated ---
         .route("/internal/healthz", get(handlers::health::healthz))
@@ -404,5 +424,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/webhook-events", get(handlers::webhooks::events_index))
         .route("/api/webhook-events/:id", get(handlers::webhooks::events_show))
         .route("/api/webhook-events/:id/replay", post(handlers::webhooks::events_replay))
+        .layer(cors)
         .with_state(state)
 }
