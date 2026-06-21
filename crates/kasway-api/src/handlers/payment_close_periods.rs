@@ -63,7 +63,7 @@ fn serialize_period(p: &PeriodRow) -> Value {
 }
 
 async fn load(state: &AppState, user_id: i64, id: i64) -> AppResult<PeriodRow> {
-    sqlx::query_as::<_, PeriodRow>(&format!("SELECT {COLS} FROM payment_close_periods WHERE user_id = ? AND id = ?"))
+    sqlx::query_as::<_, PeriodRow>(&format!("SELECT {COLS} FROM payment_close_periods WHERE user_id = $1 AND id = $2"))
         .bind(user_id).bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Payment close period not found"))
 }
@@ -72,8 +72,8 @@ async fn load(state: &AppState, user_id: i64, id: i64) -> AppResult<PeriodRow> {
 pub async fn index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_close_periods WHERE user_id = ?").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, PeriodRow>(&format!("SELECT {COLS} FROM payment_close_periods WHERE user_id = ? ORDER BY period_start DESC LIMIT ? OFFSET ?"))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_close_periods WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let rows = sqlx::query_as::<_, PeriodRow>(&format!("SELECT {COLS} FROM payment_close_periods WHERE user_id = $1 ORDER BY period_start DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_period).collect::<Vec<_>>() })))
 }
@@ -108,8 +108,8 @@ pub async fn store(auth: AuthMerchant, State(state): State<AppState>, Json(body)
 
     // ensureNoClosedOverlap
     let overlap: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM payment_close_periods WHERE user_id = ? AND status = 'closed' \
-         AND period_start <= ? AND period_end >= ? LIMIT 1",
+        "SELECT id FROM payment_close_periods WHERE user_id = $1 AND status = 'closed' \
+         AND period_start <= $2 AND period_end >= $3 LIMIT 1",
     )
     .bind(auth.user_id).bind(&end_date).bind(&start_date)
     .fetch_optional(&state.db.pool).await?;
@@ -121,8 +121,8 @@ pub async fn store(auth: AuthMerchant, State(state): State<AppState>, Json(body)
 
     // Reuse an exact-period generated statement, else generate one.
     let existing: Option<(i64, String)> = sqlx::query_as(
-        "SELECT id, checksum FROM payment_statements WHERE user_id = ? AND period_start = ? \
-         AND period_end = ? AND status = 'generated' LIMIT 1",
+        "SELECT id, checksum FROM payment_statements WHERE user_id = $1 AND period_start = $2 \
+         AND period_end = $3 AND status = 'generated' LIMIT 1",
     )
     .bind(auth.user_id).bind(&start_date).bind(&end_date)
     .fetch_optional(&state.db.pool).await?;
@@ -139,11 +139,11 @@ pub async fn store(auth: AuthMerchant, State(state): State<AppState>, Json(body)
         "overrideHighSeverityExceptions": body.override_high_severity_exceptions.unwrap_or(false),
     });
     let now = now_iso();
-    let id = sqlx::query(
+    let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_close_periods \
          (user_id, period_start, period_end, status, statement_id, totals_checksum, closed_by_user_id, \
           closed_at, metadata, created_at, updated_at) \
-         VALUES (?, ?, ?, 'closed', ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, 'closed', $4, $5, $6, $7, $8, $9, $10) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(&start_date)
@@ -155,9 +155,8 @@ pub async fn store(auth: AuthMerchant, State(state): State<AppState>, Json(body)
     .bind(metadata.to_string())
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
-    .await?
-    .last_insert_rowid();
+    .fetch_one(&state.db.pool)
+    .await?;
 
     Ok((StatusCode::CREATED, Json(serialize_period(&load(&state, auth.user_id, id).await?))).into_response())
 }
@@ -178,7 +177,7 @@ pub async fn reopen(auth: AuthMerchant, State(state): State<AppState>, Path(id):
     let mut meta: Value = serde_json::from_str(&p.metadata).unwrap_or(json!({}));
     if let Value::Object(m) = &mut meta { m.insert("reopenNote".into(), json!(note)); }
     let now = now_iso();
-    sqlx::query("UPDATE payment_close_periods SET status = 'reopened', reopened_at = ?, metadata = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE payment_close_periods SET status = 'reopened', reopened_at = $1, metadata = $2, updated_at = $3 WHERE id = $4")
         .bind(&now).bind(meta.to_string()).bind(&now).bind(p.id).execute(&state.db.pool).await?;
     Ok(Json(serialize_period(&load(&state, auth.user_id, id).await?)))
 }

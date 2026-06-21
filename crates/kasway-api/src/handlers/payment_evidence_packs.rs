@@ -61,7 +61,7 @@ fn serialize_pack(p: &PackRow) -> Value {
 
 async fn load(state: &AppState, user_id: i64, id: &str) -> AppResult<Option<PackRow>> {
     Ok(sqlx::query_as::<_, PackRow>(
-        "SELECT * FROM payment_evidence_packs WHERE user_id = ? AND id = ?",
+        "SELECT * FROM payment_evidence_packs WHERE user_id = $1 AND id = $2",
     )
     .bind(user_id)
     .bind(id)
@@ -77,12 +77,12 @@ pub async fn index(
 ) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).clamp(1, 100);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_evidence_packs WHERE user_id = ?")
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_evidence_packs WHERE user_id = $1")
         .bind(auth.user_id)
         .fetch_one(&state.db.pool)
         .await?;
     let rows = sqlx::query_as::<_, PackRow>(
-        "SELECT * FROM payment_evidence_packs WHERE user_id = ? ORDER BY generated_at DESC, id DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM payment_evidence_packs WHERE user_id = $1 ORDER BY generated_at DESC, id DESC LIMIT $2 OFFSET $3",
     )
     .bind(auth.user_id)
     .bind(per_page)
@@ -103,7 +103,7 @@ pub async fn store(
         Ok(n) if n > 0 => n,
         _ => return Err(AppError::commerce(422, "Invalid invoice id")),
     };
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = ? AND id = ?")
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = $1 AND id = $2")
         .bind(auth.user_id)
         .bind(invoice_id)
         .fetch_optional(&state.db.pool)
@@ -112,10 +112,10 @@ pub async fn store(
         return Err(AppError::commerce(404, "Invoice not found"));
     }
     let now = now_iso();
-    let new_id = sqlx::query(
+    let new_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_evidence_packs \
          (user_id, invoice_id, status, checksum, generated_by_user_id, generated_at, created_at, updated_at) \
-         VALUES (?, ?, 'queued', '', ?, ?, ?, ?)",
+         VALUES ($1, $2, 'queued', '', $3, $4, $5, $6) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(invoice_id)
@@ -123,9 +123,8 @@ pub async fn store(
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
-    .await?
-    .last_insert_rowid();
+    .fetch_one(&state.db.pool)
+    .await?;
     let row = load(&state, auth.user_id, &new_id.to_string()).await?.expect("just inserted");
     Ok((StatusCode::ACCEPTED, Json(serialize_pack(&row))).into_response())
 }

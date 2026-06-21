@@ -53,7 +53,7 @@ fn snapshot(p: &PolicyRow) -> Value {
 }
 
 async fn load_policy(state: &AppState, user_id: i64) -> AppResult<Option<PolicyRow>> {
-    Ok(sqlx::query_as::<_, PolicyRow>(&format!("SELECT {POLICY_COLS} FROM payment_retention_policies WHERE user_id = ?"))
+    Ok(sqlx::query_as::<_, PolicyRow>(&format!("SELECT {POLICY_COLS} FROM payment_retention_policies WHERE user_id = $1"))
         .bind(user_id).fetch_optional(&state.db.pool).await?)
 }
 
@@ -111,7 +111,7 @@ pub async fn update_policy(
     sqlx::query(
         "INSERT INTO payment_retention_policies (user_id, exports_retention_days, evidence_packs_retention_days, \
          notifications_retention_days, webhook_response_body_retention_days, support_notes_retention_days, \
-         anomaly_signals_retention_days, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         anomaly_signals_retention_days, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
          ON CONFLICT(user_id) DO UPDATE SET exports_retention_days = excluded.exports_retention_days, \
          evidence_packs_retention_days = excluded.evidence_packs_retention_days, \
          notifications_retention_days = excluded.notifications_retention_days, \
@@ -160,7 +160,7 @@ pub async fn retention_runs(_auth: AuthMerchant, State(state): State<AppState>, 
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_retention_runs").fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, RunRow>(&format!("SELECT {RUN_COLS} FROM payment_retention_runs ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let rows = sqlx::query_as::<_, RunRow>(&format!("SELECT {RUN_COLS} FROM payment_retention_runs ORDER BY created_at DESC LIMIT $1 OFFSET $2"))
         .bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     let data: Vec<Value> = rows.iter().map(|r| json!({
         "id": r.id,

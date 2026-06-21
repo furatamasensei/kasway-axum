@@ -175,21 +175,21 @@ fn ser_execution(e: &ExecutionRow) -> Value {
 async fn load_approvals(state: &AppState, tid: i64) -> AppResult<Vec<ApprovalRow>> {
     Ok(sqlx::query_as::<_, ApprovalRow>(
         "SELECT id, template_record_id, domain, status, approved_by_user_id, approved_at, notes, metadata, created_at, updated_at \
-         FROM programmable_settlement_approvals WHERE template_record_id = ? ORDER BY id ASC",
+         FROM programmable_settlement_approvals WHERE template_record_id = $1 ORDER BY id ASC",
     ).bind(tid).fetch_all(&state.db.pool).await?)
 }
 async fn load_artifacts(state: &AppState, tid: i64) -> AppResult<Vec<ArtifactRow>> {
     Ok(sqlx::query_as::<_, ArtifactRow>(
         "SELECT id, template_record_id, artifact_id, source_hash, compiler_commit, compiler_output_hash, \
          script_hash, network_target, argument_schema, warnings, metadata, generated_at, created_at, updated_at \
-         FROM programmable_settlement_artifacts WHERE template_record_id = ? ORDER BY id ASC",
+         FROM programmable_settlement_artifacts WHERE template_record_id = $1 ORDER BY id ASC",
     ).bind(tid).fetch_all(&state.db.pool).await?)
 }
 async fn load_executions(state: &AppState, tid: i64) -> AppResult<Vec<ExecutionRow>> {
     Ok(sqlx::query_as::<_, ExecutionRow>(
         "SELECT id, template_record_id, artifact_record_id, status, network, dry_run_payload_hash, tx_id, \
          evidence_reference, sandbox_outcome, metadata, executed_at, created_at, updated_at \
-         FROM programmable_settlement_executions WHERE template_record_id = ? ORDER BY id ASC",
+         FROM programmable_settlement_executions WHERE template_record_id = $1 ORDER BY id ASC",
     ).bind(tid).fetch_all(&state.db.pool).await?)
 }
 
@@ -198,7 +198,7 @@ const T_COLS: &str = "id, template_id, template_version, status, source_hash, co
     disabled_at, disable_reason, metadata, created_at, updated_at";
 
 async fn load_template(state: &AppState, id: i64) -> AppResult<TemplateRow> {
-    sqlx::query_as::<_, TemplateRow>(&format!("SELECT {T_COLS} FROM programmable_settlement_templates WHERE id = ?"))
+    sqlx::query_as::<_, TemplateRow>(&format!("SELECT {T_COLS} FROM programmable_settlement_templates WHERE id = $1"))
         .bind(id)
         .fetch_optional(&state.db.pool)
         .await?
@@ -241,15 +241,15 @@ pub async fn store_template(_token: InternalToken, State(state): State<AppState>
     let created_by = body.get("createdByUserId").and_then(|v| v.as_i64());
     let metadata = body.get("metadata").cloned().unwrap_or(json!({}));
     let now = now_iso();
-    let id = sqlx::query(
+    let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO programmable_settlement_templates \
          (template_id, template_version, status, source_hash, compiler_commit, kill_switch_enabled, \
           created_by_user_id, metadata, created_at, updated_at) \
-         VALUES (?, ?, 'sandbox', ?, ?, 1, ?, ?, ?, ?)",
+         VALUES ($1, $2, 'sandbox', $3, $4, 1, $5, $6, $7, $8) RETURNING id",
     )
     .bind(&template_id).bind(&version).bind(&source_hash).bind(compiler_commit)
     .bind(created_by).bind(metadata.to_string()).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?.last_insert_rowid();
+    .fetch_one(&state.db.pool).await?;
     let t = load_template(&state, id).await?;
     Ok((StatusCode::OK, Json(ser_template(&t, None))).into_response())
 }
@@ -268,21 +268,21 @@ pub async fn store_artifact(_token: InternalToken, State(state): State<AppState>
     let warnings = body.get("warnings").cloned().unwrap_or(json!([]));
     let metadata = body.get("metadata").cloned().unwrap_or(json!({}));
     let now = now_iso();
-    let id = sqlx::query(
+    let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO programmable_settlement_artifacts \
          (template_record_id, artifact_id, source_hash, compiler_commit, compiler_output_hash, script_hash, \
           network_target, argument_schema, warnings, metadata, generated_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
     )
     .bind(template_record_id).bind(&artifact_id).bind(&source_hash).bind(&compiler_commit)
     .bind(&compiler_output_hash).bind(&script_hash).bind(&network_target)
     .bind(argument_schema.to_string()).bind(warnings.to_string()).bind(metadata.to_string())
     .bind(&now).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?.last_insert_rowid();
+    .fetch_one(&state.db.pool).await?;
     let a = sqlx::query_as::<_, ArtifactRow>(
         "SELECT id, template_record_id, artifact_id, source_hash, compiler_commit, compiler_output_hash, \
          script_hash, network_target, argument_schema, warnings, metadata, generated_at, created_at, updated_at \
-         FROM programmable_settlement_artifacts WHERE id = ?",
+         FROM programmable_settlement_artifacts WHERE id = $1",
     ).bind(id).fetch_one(&state.db.pool).await?;
     Ok((StatusCode::OK, Json(ser_artifact(&a))).into_response())
 }
@@ -300,20 +300,20 @@ pub async fn store_execution(_token: InternalToken, State(state): State<AppState
     let sandbox_outcome = body.get("sandboxOutcome").and_then(|v| v.as_str());
     let metadata = body.get("metadata").cloned().unwrap_or(json!({}));
     let now = now_iso();
-    let id = sqlx::query(
+    let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO programmable_settlement_executions \
          (template_record_id, artifact_record_id, status, network, dry_run_payload_hash, tx_id, \
           evidence_reference, sandbox_outcome, metadata, executed_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
     )
     .bind(template_record_id).bind(artifact_record_id).bind(&status).bind(&network)
     .bind(dry_run).bind(tx_id).bind(evidence_ref).bind(sandbox_outcome)
     .bind(metadata.to_string()).bind(&now).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?.last_insert_rowid();
+    .fetch_one(&state.db.pool).await?;
     let e = sqlx::query_as::<_, ExecutionRow>(
         "SELECT id, template_record_id, artifact_record_id, status, network, dry_run_payload_hash, tx_id, \
          evidence_reference, sandbox_outcome, metadata, executed_at, created_at, updated_at \
-         FROM programmable_settlement_executions WHERE id = ?",
+         FROM programmable_settlement_executions WHERE id = $1",
     ).bind(id).fetch_one(&state.db.pool).await?;
     Ok((StatusCode::OK, Json(ser_execution(&e))).into_response())
 }
@@ -330,28 +330,28 @@ pub async fn approve(_token: InternalToken, State(state): State<AppState>, Path(
     let now = now_iso();
 
     let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM programmable_settlement_approvals WHERE template_record_id = ? AND domain = ?",
+        "SELECT id FROM programmable_settlement_approvals WHERE template_record_id = $1 AND domain = $2",
     ).bind(id).bind(&domain).fetch_optional(&state.db.pool).await?;
 
     let approval_id = match existing {
         Some(eid) => {
             sqlx::query(
-                "UPDATE programmable_settlement_approvals SET status = 'approved', approved_by_user_id = ?, \
-                 approved_at = ?, notes = ?, metadata = ?, updated_at = ? WHERE id = ?",
+                "UPDATE programmable_settlement_approvals SET status = 'approved', approved_by_user_id = $1, \
+                 approved_at = $2, notes = $3, metadata = $4, updated_at = $5 WHERE id = $6",
             ).bind(approved_by).bind(&now).bind(notes).bind(metadata.to_string()).bind(&now).bind(eid)
             .execute(&state.db.pool).await?;
             eid
         }
-        None => sqlx::query(
+        None => sqlx::query_scalar::<_, i64>(
             "INSERT INTO programmable_settlement_approvals \
              (template_record_id, domain, status, approved_by_user_id, approved_at, notes, metadata, created_at, updated_at) \
-             VALUES (?, ?, 'approved', ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, 'approved', $3, $4, $5, $6, $7, $8) RETURNING id",
         ).bind(id).bind(&domain).bind(approved_by).bind(&now).bind(notes).bind(metadata.to_string()).bind(&now).bind(&now)
-        .execute(&state.db.pool).await?.last_insert_rowid(),
+        .fetch_one(&state.db.pool).await?,
     };
     let a = sqlx::query_as::<_, ApprovalRow>(
         "SELECT id, template_record_id, domain, status, approved_by_user_id, approved_at, notes, metadata, created_at, updated_at \
-         FROM programmable_settlement_approvals WHERE id = ?",
+         FROM programmable_settlement_approvals WHERE id = $1",
     ).bind(approval_id).fetch_one(&state.db.pool).await?;
     Ok(Json(ser_approval(&a)))
 }
@@ -363,8 +363,8 @@ pub async fn disable(_token: InternalToken, State(state): State<AppState>, Path(
     let disabled_by = body.get("disabledByUserId").and_then(|v| v.as_i64());
     let now = now_iso();
     sqlx::query(
-        "UPDATE programmable_settlement_templates SET status = 'disabled', disabled_by_user_id = ?, \
-         disabled_at = ?, disable_reason = ?, updated_at = ? WHERE id = ?",
+        "UPDATE programmable_settlement_templates SET status = 'disabled', disabled_by_user_id = $1, \
+         disabled_at = $2, disable_reason = $3, updated_at = $4 WHERE id = $5",
     ).bind(disabled_by).bind(&now).bind(&reason).bind(&now).bind(id)
     .execute(&state.db.pool).await?;
     let t = load_template(&state, id).await?;

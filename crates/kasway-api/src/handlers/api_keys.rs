@@ -89,7 +89,7 @@ async fn fetch_owned(
     user_id: i64,
 ) -> AppResult<ApiKeyRow> {
     let row = sqlx::query_as::<_, ApiKeyRow>(&format!(
-        "SELECT {SELECT_COLS} FROM api_keys WHERE id = ?"
+        "SELECT {SELECT_COLS} FROM api_keys WHERE id = $1"
     ))
     .bind(id)
     .fetch_optional(&state.db.pool)
@@ -119,14 +119,14 @@ pub async fn index(
     let per_page = params.per_page.unwrap_or(10).max(1);
     let offset = (page - 1) * per_page;
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = ?")
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
         .bind(auth.user_id)
         .fetch_one(&state.db.pool)
         .await?;
 
     let rows = sqlx::query_as::<_, ApiKeyRow>(&format!(
-        "SELECT {SELECT_COLS} FROM api_keys WHERE user_id = ? \
-         ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT {SELECT_COLS} FROM api_keys WHERE user_id = $1 \
+         ORDER BY created_at DESC LIMIT $2 OFFSET $3"
     ))
     .bind(auth.user_id)
     .bind(per_page)
@@ -154,10 +154,10 @@ pub async fn store(
     let now = now_iso();
     let scopes_json = serde_json::to_string(&scopes).unwrap();
 
-    let result = sqlx::query(
+    let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO api_keys \
          (user_id, name, prefix, key_hash, scopes, last_used_at, expires_at, revoked_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, $7, $8) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(&name)
@@ -167,10 +167,8 @@ pub async fn store(
     .bind(&expires_at)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-
-    let id = result.last_insert_rowid();
     let row = fetch_owned(&state, id, auth.user_id).await?;
     let mut value = serialize_row(&row);
     value["key"] = Value::String(key);
@@ -196,7 +194,7 @@ pub async fn revoke(
 ) -> AppResult<Json<Value>> {
     fetch_owned(&state, id, auth.user_id).await?;
     let now = now_iso();
-    sqlx::query("UPDATE api_keys SET revoked_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE api_keys SET revoked_at = $1, updated_at = $2 WHERE id = $3")
         .bind(&now)
         .bind(&now)
         .bind(id)
@@ -217,8 +215,8 @@ pub async fn rotate(
     let (prefix, key, key_hash) = generate_key_material();
     let now = now_iso();
     sqlx::query(
-        "UPDATE api_keys SET prefix = ?, key_hash = ?, last_used_at = NULL, revoked_at = NULL, \
-         updated_at = ? WHERE id = ?",
+        "UPDATE api_keys SET prefix = $1, key_hash = $2, last_used_at = NULL, revoked_at = NULL, \
+         updated_at = $3 WHERE id = $4",
     )
     .bind(&prefix)
     .bind(&key_hash)

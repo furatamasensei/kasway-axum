@@ -59,8 +59,8 @@ fn serialize_grant(g: &GrantRow) -> Value {
 pub async fn index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_audit_access_grants WHERE user_id = ?").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, GrantRow>(&format!("SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_audit_access_grants WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let rows = sqlx::query_as::<_, GrantRow>(&format!("SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_grant).collect::<Vec<_>>() })))
 }
@@ -108,12 +108,12 @@ pub async fn store(auth: AuthMerchant, State(state): State<AppState>, Json(body)
     rand::thread_rng().fill_bytes(&mut tb);
     let token = format!("pay_audit_{}", tb.iter().map(|b| format!("{:02x}", b)).collect::<String>());
     let now = now_iso();
-    let r = sqlx::query("INSERT INTO payment_audit_access_grants (user_id, email, token, scope, period_start, period_end, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    let r = sqlx::query_scalar::<_, i64>("INSERT INTO payment_audit_access_grants (user_id, email, token, scope, period_start, period_end, expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id")
         .bind(auth.user_id).bind(&email).bind(&token).bind(serde_json::to_string(&scope).unwrap())
         .bind(&period_start).bind(&period_end).bind(&expires_at).bind(&now).bind(&now)
-        .execute(&state.db.pool).await?;
+        .fetch_one(&state.db.pool).await?;
     // auditEvents.record -> deferred no-op
-    let grant = sqlx::query_as::<_, GrantRow>(&format!("SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE id = ?")).bind(r.last_insert_rowid()).fetch_one(&state.db.pool).await?;
+    let grant = sqlx::query_as::<_, GrantRow>(&format!("SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE id = $1")).bind(r).fetch_one(&state.db.pool).await?;
     Ok((StatusCode::CREATED, Json(serialize_grant(&grant))))
 }
 
@@ -122,7 +122,7 @@ pub async fn store(auth: AuthMerchant, State(state): State<AppState>, Json(body)
 /// Load + validate a grant for `scope`; mirrors authorizeToken (403 on any failure).
 async fn authorize_token(state: &AppState, token: &str, scope: &str) -> AppResult<GrantRow> {
     let grant: Option<GrantRow> = sqlx::query_as::<_, GrantRow>(&format!(
-        "SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE token = ?"
+        "SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE token = $1"
     ))
     .bind(token)
     .fetch_optional(&state.db.pool)
@@ -167,7 +167,7 @@ pub async fn statements(State(state): State<AppState>, Path(token): Path<String>
     let rows = sqlx::query_as::<_, StRow>(
         "SELECT id, user_id, period_start, period_end, status, totals, checksum, storage_disk, storage_path, \
          content_type, byte_size, generated_at, created_at, updated_at FROM payment_statements \
-         WHERE user_id = ? AND period_start >= ? AND period_end <= ? ORDER BY period_start DESC",
+         WHERE user_id = $1 AND period_start >= $2 AND period_end <= $3 ORDER BY period_start DESC",
     )
     .bind(grant.user_id).bind(&grant.period_start).bind(&grant.period_end)
     .fetch_all(&state.db.pool).await?;
@@ -194,7 +194,7 @@ pub async fn exports(State(state): State<AppState>, Path(token): Path<String>) -
     let rows = sqlx::query_as::<_, ExRow>(
         "SELECT id, user_id, kind, format, profile_id, filters, row_count, checksum, status, content_type, \
          byte_size, expires_at, generated_at, created_at, updated_at FROM payment_operation_exports \
-         WHERE user_id = ? AND generated_at >= ? AND generated_at <= ?",
+         WHERE user_id = $1 AND generated_at >= $2 AND generated_at <= $3",
     )
     .bind(grant.user_id).bind(&grant.period_start).bind(end_plus_one(&grant.period_end))
     .fetch_all(&state.db.pool).await?;
@@ -220,7 +220,7 @@ pub async fn evidence_packs(State(state): State<AppState>, Path(token): Path<Str
     let rows = sqlx::query_as::<_, EvRow>(
         "SELECT id, user_id, invoice_id, status, checksum, storage_disk, storage_path, byte_size, \
          generated_by_user_id, generated_at, expires_at, error, created_at, updated_at \
-         FROM payment_evidence_packs WHERE user_id = ? AND generated_at >= ? AND generated_at <= ?",
+         FROM payment_evidence_packs WHERE user_id = $1 AND generated_at >= $2 AND generated_at <= $3",
     )
     .bind(grant.user_id).bind(&grant.period_start).bind(end_plus_one(&grant.period_end))
     .fetch_all(&state.db.pool).await?;
@@ -246,7 +246,7 @@ pub async fn close_periods(State(state): State<AppState>, Path(token): Path<Stri
     let rows = sqlx::query_as::<_, CpRow>(
         "SELECT id, user_id, period_start, period_end, status, statement_id, totals_checksum, \
          closed_by_user_id, closed_at, reopened_at, metadata, created_at, updated_at \
-         FROM payment_close_periods WHERE user_id = ? AND period_start >= ? AND period_end <= ?",
+         FROM payment_close_periods WHERE user_id = $1 AND period_start >= $2 AND period_end <= $3",
     )
     .bind(grant.user_id).bind(&grant.period_start).bind(&grant.period_end)
     .fetch_all(&state.db.pool).await?;
@@ -261,10 +261,10 @@ pub async fn close_periods(State(state): State<AppState>, Path(token): Path<Stri
 }
 
 pub async fn revoke(auth: AuthMerchant, State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Value>> {
-    let grant: Option<GrantRow> = sqlx::query_as::<_, GrantRow>(&format!("SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE user_id = ? AND id = ?"))
+    let grant: Option<GrantRow> = sqlx::query_as::<_, GrantRow>(&format!("SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE user_id = $1 AND id = $2"))
         .bind(auth.user_id).bind(id).fetch_optional(&state.db.pool).await?;
     let grant = grant.ok_or_else(|| AppError::commerce(404, "Payment audit access grant not found"))?;
-    sqlx::query("UPDATE payment_audit_access_grants SET revoked_at = ?, updated_at = ? WHERE id = ?").bind(now_iso()).bind(now_iso()).bind(grant.id).execute(&state.db.pool).await?;
-    let grant = sqlx::query_as::<_, GrantRow>(&format!("SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE id = ?")).bind(grant.id).fetch_one(&state.db.pool).await?;
+    sqlx::query("UPDATE payment_audit_access_grants SET revoked_at = $1, updated_at = $2 WHERE id = $3").bind(now_iso()).bind(now_iso()).bind(grant.id).execute(&state.db.pool).await?;
+    let grant = sqlx::query_as::<_, GrantRow>(&format!("SELECT {GRANT_COLS} FROM payment_audit_access_grants WHERE id = $1")).bind(grant.id).fetch_one(&state.db.pool).await?;
     Ok(Json(serialize_grant(&grant)))
 }

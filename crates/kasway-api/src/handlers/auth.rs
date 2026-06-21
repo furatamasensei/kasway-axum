@@ -53,7 +53,7 @@ pub async fn login(
 
     // merchant (User) path
     if let Some((id, stored)) = sqlx::query_as::<_, (i64, String)>(
-        "SELECT id, password FROM users WHERE email = ?",
+        "SELECT id, password FROM users WHERE email = $1",
     )
     .bind(&email)
     .fetch_optional(&state.db.pool)
@@ -64,7 +64,7 @@ pub async fn login(
         }
         let token = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, id).await?;
         let onboarded: bool =
-            sqlx::query_scalar("SELECT onboarded FROM users WHERE id = ?")
+            sqlx::query_scalar("SELECT onboarded FROM users WHERE id = $1")
                 .bind(id)
                 .fetch_one(&state.db.pool)
                 .await?;
@@ -77,7 +77,7 @@ pub async fn login(
 
     // team-member (client) path
     let member = sqlx::query_as::<_, (i64, Option<String>, String)>(
-        "SELECT id, password, role FROM team_members WHERE email = ?",
+        "SELECT id, password, role FROM team_members WHERE email = $1",
     )
     .bind(&email)
     .fetch_optional(&state.db.pool)
@@ -120,8 +120,8 @@ pub async fn register(
     // unique email check only if the email passed format validation
     if let Some(email) = email.as_ref() {
         let taken: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM users WHERE email = ? COLLATE NOCASE \
-             UNION SELECT 1 FROM team_members WHERE email = ? COLLATE NOCASE LIMIT 1",
+            "SELECT 1 FROM users WHERE LOWER(email) = LOWER($1) \
+             UNION SELECT 1 FROM team_members WHERE LOWER(email) = LOWER($2) LIMIT 1",
         )
         .bind(email)
         .bind(email)
@@ -141,19 +141,18 @@ pub async fn register(
     }
 
     let now = now_iso();
-    let result = sqlx::query(
+    let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO users (full_name, email, password, onboarded, created_at, updated_at) \
-         VALUES (?, ?, ?, 0, ?, ?)",
+         VALUES ($1, $2, $3, 0, $4, $5) RETURNING id",
     )
     .bind(full_name.unwrap())
     .bind(email.unwrap())
     .bind(hash_password(&password.unwrap()))
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
 
-    let id = result.last_insert_rowid();
     let token = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, id).await?;
 
     Ok((
@@ -169,7 +168,7 @@ pub async fn profile(
 ) -> AppResult<Json<UserDto>> {
     let user = sqlx::query_as::<_, UserDto>(
         "SELECT id, full_name, email, avatar_url, onboarded, created_at, updated_at \
-         FROM users WHERE id = ?",
+         FROM users WHERE id = $1",
     )
     .bind(auth.user_id)
     .fetch_optional(&state.db.pool)
@@ -333,7 +332,7 @@ pub async fn callback_google(
     let email = info.email.filter(|e| !e.is_empty()).ok_or_else(|| AppError::commerce(502, "Google account has no email"))?;
 
     // firstOrCreate by email
-    let existing: Option<(i64, bool)> = sqlx::query_as("SELECT id, onboarded FROM users WHERE email = ?")
+    let existing: Option<(i64, bool)> = sqlx::query_as("SELECT id, onboarded FROM users WHERE email = $1")
         .bind(&email)
         .fetch_optional(&state.db.pool)
         .await?;
@@ -342,9 +341,9 @@ pub async fn callback_google(
         None => {
             let random_pw: String = (0..16).map(|_| rand::thread_rng().gen_range(b'a'..=b'z') as char).collect();
             let now = now_iso();
-            let id = sqlx::query(
+            let id = sqlx::query_scalar::<_, i64>(
                 "INSERT INTO users (full_name, email, password, avatar_url, onboarded, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, 0, ?, ?)",
+                 VALUES ($1, $2, $3, $4, 0, $5, $6) RETURNING id",
             )
             .bind(info.name)
             .bind(&email)
@@ -352,9 +351,8 @@ pub async fn callback_google(
             .bind(info.picture)
             .bind(&now)
             .bind(&now)
-            .execute(&state.db.pool)
-            .await?
-            .last_insert_rowid();
+            .fetch_one(&state.db.pool)
+            .await?;
             (id, false)
         }
     };

@@ -48,7 +48,7 @@ fn mask_value(v: &Value) -> Value {
 // ---- invoice serialization (support shape) ---------------------------------
 
 async fn merchant_email(state: &AppState, user_id: i64) -> AppResult<Option<String>> {
-    Ok(sqlx::query_scalar("SELECT email FROM users WHERE id = ?")
+    Ok(sqlx::query_scalar("SELECT email FROM users WHERE id = $1")
         .bind(user_id)
         .fetch_optional(&state.db.pool)
         .await?)
@@ -81,7 +81,7 @@ fn serialize_note(
 async fn fetch_notes(state: &AppState, invoice_id: i64) -> AppResult<Vec<Value>> {
     let rows = sqlx::query_as::<_, (i64, i64, i64, String, Option<String>, String, String, Option<String>, Option<String>)>(
         "SELECT id, user_id, invoice_id, actor_type, actor_id, note, metadata, created_at, updated_at \
-         FROM payment_support_notes WHERE invoice_id = ? ORDER BY created_at DESC LIMIT 50",
+         FROM payment_support_notes WHERE invoice_id = $1 ORDER BY created_at DESC LIMIT 50",
     )
     .bind(invoice_id)
     .fetch_all(&state.db.pool)
@@ -116,7 +116,7 @@ async fn serialize_support_invoice(
             obj.insert("supportNotesCount".into(), json!(notes.len()));
             obj.insert("supportNotes".into(), Value::Array(notes));
         } else {
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_support_notes WHERE invoice_id = ?")
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_support_notes WHERE invoice_id = $1")
                 .bind(inv.id())
                 .fetch_one(&state.db.pool)
                 .await?;
@@ -179,34 +179,43 @@ pub async fn search(
 
     let mut where_sql = String::from(" WHERE 1=1");
     let mut binds: Vec<Bind> = Vec::new();
+    let mut n = 1;
     if let Some(v) = q.invoice_id {
-        where_sql.push_str(" AND id = ?");
+        where_sql.push_str(&format!(" AND id = ${n}"));
+        n += 1;
         binds.push(Bind::Int(v));
     }
     if let Some(v) = q.public_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND public_id = ?");
+        where_sql.push_str(&format!(" AND public_id = ${n}"));
+        n += 1;
         binds.push(Bind::Str(v.to_string()));
     }
     if let Some(v) = q.external_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND external_id = ?");
+        where_sql.push_str(&format!(" AND external_id = ${n}"));
+        n += 1;
         binds.push(Bind::Str(v.to_string()));
     }
     if let Some(v) = q.payment_address.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND payment_address = ?");
+        where_sql.push_str(&format!(" AND payment_address = ${n}"));
+        n += 1;
         binds.push(Bind::Str(v.to_string()));
     }
     if let Some(v) = q.merchant_id {
-        where_sql.push_str(" AND user_id = ?");
+        where_sql.push_str(&format!(" AND user_id = ${n}"));
+        n += 1;
         binds.push(Bind::Int(v));
     }
     if let Some(v) = q.merchant_email.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND user_id IN (SELECT id FROM users WHERE LOWER(email) = ?)");
+        where_sql.push_str(&format!(" AND user_id IN (SELECT id FROM users WHERE LOWER(email) = ${n})"));
+        n += 1;
         binds.push(Bind::Str(v.to_lowercase()));
     }
     if let Some(v) = q.status.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        where_sql.push_str(" AND status = ?");
+        where_sql.push_str(&format!(" AND status = ${n}"));
+        n += 1;
         binds.push(Bind::Str(v.to_string()));
     }
+    let _ = n;
 
     let count_sql = format!("SELECT COUNT(*) FROM invoices{where_sql}");
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
@@ -270,7 +279,7 @@ async fn resolve_exception_merchant_ids(state: &AppState, q: &ExceptionsQuery) -
         return Ok(vec![id]);
     }
     if let Some(email) = q.merchant_email.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        let id: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE LOWER(email) = ?")
+        let id: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE LOWER(email) = $1")
             .bind(email.to_lowercase())
             .fetch_optional(&state.db.pool)
             .await?;
@@ -279,22 +288,28 @@ async fn resolve_exception_merchant_ids(state: &AppState, q: &ExceptionsQuery) -
     // distinct merchants whose invoices match the invoice-identifier filters
     let mut sql = String::from("SELECT DISTINCT user_id FROM invoices WHERE 1=1");
     let mut binds: Vec<Bind> = Vec::new();
+    let mut n = 1;
     if let Some(v) = q.invoice_id {
-        sql.push_str(" AND id = ?");
+        sql.push_str(&format!(" AND id = ${n}"));
+        n += 1;
         binds.push(Bind::Int(v));
     }
     if let Some(v) = q.public_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        sql.push_str(" AND public_id = ?");
+        sql.push_str(&format!(" AND public_id = ${n}"));
+        n += 1;
         binds.push(Bind::Str(v.to_string()));
     }
     if let Some(v) = q.external_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        sql.push_str(" AND external_id = ?");
+        sql.push_str(&format!(" AND external_id = ${n}"));
+        n += 1;
         binds.push(Bind::Str(v.to_string()));
     }
     if let Some(v) = q.payment_address.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        sql.push_str(" AND payment_address = ?");
+        sql.push_str(&format!(" AND payment_address = ${n}"));
+        n += 1;
         binds.push(Bind::Str(v.to_string()));
     }
+    let _ = n;
     let mut query = sqlx::query_scalar::<_, i64>(&sql);
     for b in &binds {
         query = match b {
@@ -403,7 +418,7 @@ async fn support_delivery_json(state: &AppState, id: i64) -> AppResult<Option<Va
     let d = sqlx::query_as::<_, (i64, i64, i64, String, i64, Option<i64>, Option<String>, Option<String>, bool, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
         "SELECT id, webhook_event_id, webhook_endpoint_id, status, attempt_count, response_status, \
          response_body, error, is_replay, last_attempted_at, next_attempt_at, delivered_at, created_at, updated_at \
-         FROM webhook_deliveries WHERE id = ?",
+         FROM webhook_deliveries WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.db.pool)
@@ -414,7 +429,7 @@ async fn support_delivery_json(state: &AppState, id: i64) -> AppResult<Option<Va
 
     let event = sqlx::query_as::<_, (i64, i64, String, String, String, String, Option<String>, Option<String>)>(
         "SELECT id, user_id, event_type, resource_type, resource_id, payload, created_at, updated_at \
-         FROM webhook_events WHERE id = ?",
+         FROM webhook_events WHERE id = $1",
     )
     .bind(event_id)
     .fetch_optional(&state.db.pool)
@@ -425,7 +440,7 @@ async fn support_delivery_json(state: &AppState, id: i64) -> AppResult<Option<Va
 
     let endpoint = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, bool, Option<String>, Option<String>, Option<String>, Option<String>)>(
         "SELECT id, user_id, store_id, url, events, is_active, paused_at, secret_rotated_at, created_at, updated_at \
-         FROM webhook_endpoints WHERE id = ?",
+         FROM webhook_endpoints WHERE id = $1",
     )
     .bind(endpoint_id)
     .fetch_optional(&state.db.pool)
@@ -490,7 +505,7 @@ pub async fn replay_webhook_delivery(
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
     let original = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT webhook_event_id, webhook_endpoint_id FROM webhook_deliveries WHERE id = ?",
+        "SELECT webhook_event_id, webhook_endpoint_id FROM webhook_deliveries WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&state.db.pool)
@@ -499,17 +514,16 @@ pub async fn replay_webhook_delivery(
     let (event_id, endpoint_id) = original;
 
     let now = now_iso();
-    let replay_id = sqlx::query(
+    let replay_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, is_replay, created_at, updated_at) \
-         VALUES (?, ?, 'pending', 0, 1, ?, ?)",
+         VALUES ($1, $2, 'pending', 0, 1, $3, $4) RETURNING id",
     )
     .bind(event_id)
     .bind(endpoint_id)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
-    .await?
-    .last_insert_rowid();
+    .fetch_one(&state.db.pool)
+    .await?;
 
     let value = support_delivery_json(&state, replay_id).await?.expect("just inserted");
     Ok((StatusCode::ACCEPTED, Json(value)).into_response())
@@ -547,16 +561,16 @@ pub async fn add_invoice_note(
         }]));
     }
     let inv = find_invoice(&state, &id).await?;
-    let user_id: i64 = sqlx::query_scalar("SELECT user_id FROM invoices WHERE id = ?")
+    let user_id: i64 = sqlx::query_scalar("SELECT user_id FROM invoices WHERE id = $1")
         .bind(inv.id())
         .fetch_one(&state.db.pool)
         .await?;
     let actor_id = support_actor_id(&headers);
     let metadata = mask_value(&body.metadata.unwrap_or(json!({})));
     let now = now_iso();
-    let new_id = sqlx::query(
+    let new_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_support_notes (user_id, invoice_id, actor_type, actor_id, note, metadata, created_at, updated_at) \
-         VALUES (?, ?, 'support', ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, 'support', $3, $4, $5, $6, $7) RETURNING id",
     )
     .bind(user_id)
     .bind(inv.id())
@@ -565,9 +579,8 @@ pub async fn add_invoice_note(
     .bind(metadata.to_string())
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
-    .await?
-    .last_insert_rowid();
+    .fetch_one(&state.db.pool)
+    .await?;
 
     let value = serialize_note(new_id, user_id, inv.id(), "support", actor_id.as_deref(), note, &metadata, &Some(now.clone()), &Some(now));
     Ok((StatusCode::CREATED, Json(value)).into_response())
@@ -580,15 +593,15 @@ pub async fn regenerate_evidence_pack(
     Path(id): Path<String>,
 ) -> AppResult<Response> {
     let inv = find_invoice(&state, &id).await?;
-    let user_id: i64 = sqlx::query_scalar("SELECT user_id FROM invoices WHERE id = ?")
+    let user_id: i64 = sqlx::query_scalar("SELECT user_id FROM invoices WHERE id = $1")
         .bind(inv.id())
         .fetch_one(&state.db.pool)
         .await?;
     let now = now_iso();
-    let new_id = sqlx::query(
+    let new_id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_evidence_packs \
          (user_id, invoice_id, status, checksum, generated_by_user_id, generated_at, created_at, updated_at) \
-         VALUES (?, ?, 'queued', '', ?, ?, ?, ?)",
+         VALUES ($1, $2, 'queued', '', $3, $4, $5, $6) RETURNING id",
     )
     .bind(user_id)
     .bind(inv.id())
@@ -596,9 +609,8 @@ pub async fn regenerate_evidence_pack(
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
-    .await?
-    .last_insert_rowid();
+    .fetch_one(&state.db.pool)
+    .await?;
 
     Ok((StatusCode::ACCEPTED, Json(json!({
         "id": new_id,

@@ -130,15 +130,15 @@ fn parse_json(s: &Option<String>) -> Value {
 // ---- DB loads --------------------------------------------------------------
 
 async fn intent_by(state: &AppState, col: &str, val: &str) -> AppResult<Option<IntentRow>> {
-    Ok(sqlx::query_as::<_, IntentRow>(&format!("SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE {col} = ? LIMIT 1"))
+    Ok(sqlx::query_as::<_, IntentRow>(&format!("SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE {col} = $1 LIMIT 1"))
         .bind(val).fetch_optional(&state.db.pool).await?)
 }
 
 async fn find_observation(state: &AppState, intent: &IntentRow, tx_id: Option<&str>) -> AppResult<Option<ObsRow>> {
     let tx = match tx_id.or(intent.tx_id.as_deref()) { Some(t) => t.to_string(), None => return Ok(None) };
     Ok(sqlx::query_as::<_, ObsRow>(&format!(
-        "SELECT {OBS_COLS} FROM payment_observations WHERE tx_id = ? AND network = ? AND asset_id = ? \
-         AND (invoice_id = ? OR invoice_id IS NULL) ORDER BY created_at DESC LIMIT 1"
+        "SELECT {OBS_COLS} FROM payment_observations WHERE tx_id = $1 AND network = $2 AND asset_id = $3 \
+         AND (invoice_id = $4 OR invoice_id IS NULL) ORDER BY created_at DESC LIMIT 1"
     ))
     .bind(&tx).bind(&intent.network).bind(&intent.asset_id).bind(intent.invoice_id)
     .fetch_optional(&state.db.pool).await?)
@@ -147,10 +147,10 @@ async fn find_observation(state: &AppState, intent: &IntentRow, tx_id: Option<&s
 async fn find_credit(state: &AppState, intent: &IntentRow, obs: &Option<ObsRow>) -> AppResult<Option<(i64, Option<String>)>> {
     let row = match obs {
         Some(o) => sqlx::query_as::<_, (i64, Option<String>)>(
-            "SELECT amount, credited_at FROM payment_credits WHERE invoice_id = ? OR payment_observation_id = ? ORDER BY credited_at DESC LIMIT 1",
+            "SELECT amount, credited_at FROM payment_credits WHERE invoice_id = $1 OR payment_observation_id = $2 ORDER BY credited_at DESC LIMIT 1",
         ).bind(intent.invoice_id).bind(o.id),
         None => sqlx::query_as::<_, (i64, Option<String>)>(
-            "SELECT amount, credited_at FROM payment_credits WHERE invoice_id = ? ORDER BY credited_at DESC LIMIT 1",
+            "SELECT amount, credited_at FROM payment_credits WHERE invoice_id = $1 ORDER BY credited_at DESC LIMIT 1",
         ).bind(intent.invoice_id),
     };
     Ok(row.fetch_optional(&state.db.pool).await?)
@@ -177,7 +177,7 @@ async fn serialize(
     include_canon: bool,
 ) -> AppResult<Value> {
     let invoice = sqlx::query_as::<_, (String, String, Option<String>)>(
-        "SELECT public_id, status, paid_at FROM invoices WHERE id = ?",
+        "SELECT public_id, status, paid_at FROM invoices WHERE id = $1",
     ).bind(intent.invoice_id).fetch_optional(&state.db.pool).await?;
     let (inv_public_id, inv_status, inv_paid_at) = match &invoice {
         Some((p, s, paid)) => (Some(p.clone()), Some(s.clone()), paid.clone()),
@@ -379,7 +379,7 @@ pub async fn show_payment_request(State(state): State<AppState>, Path(canonical_
 
 /// `GET /api/explorer/kpr1/invoices/:publicId`
 pub async fn show_invoice(State(state): State<AppState>, Path(public_id): Path<String>, Query(q): Query<ExplorerQuery>) -> AppResult<Response> {
-    let invoice_id: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE public_id = ?").bind(&public_id).fetch_optional(&state.db.pool).await?;
+    let invoice_id: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE public_id = $1").bind(&public_id).fetch_optional(&state.db.pool).await?;
     let intent = match invoice_id {
         Some(id) => intent_by(&state, "invoice_id", &id.to_string()).await?,
         None => None,
@@ -396,9 +396,12 @@ pub async fn show_invoice(State(state): State<AppState>, Path(public_id): Path<S
 /// `GET /api/explorer/kpr1/transactions/:txId`
 pub async fn show_transaction(State(state): State<AppState>, Path(tx_id): Path<String>, Query(q): Query<ExplorerQuery>) -> AppResult<Response> {
     // intents by tx_id (ambiguity check)
-    let mut sql = format!("SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE tx_id = ?");
-    if q.network.is_some() { sql.push_str(" AND network = ?"); }
-    if q.asset_id.is_some() { sql.push_str(" AND asset_id = ?"); }
+    let mut n = 1;
+    let mut sql = format!("SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE tx_id = ${n}");
+    n += 1;
+    if q.network.is_some() { sql.push_str(&format!(" AND network = ${n}")); n += 1; }
+    if q.asset_id.is_some() { sql.push_str(&format!(" AND asset_id = ${n}")); n += 1; }
+    let _ = n;
     sql.push_str(" ORDER BY created_at DESC, id DESC LIMIT 2");
     let mut iq = sqlx::query_as::<_, IntentRow>(&sql).bind(&tx_id);
     if let Some(n) = &q.network { iq = iq.bind(n.clone()); }
@@ -413,9 +416,12 @@ pub async fn show_transaction(State(state): State<AppState>, Path(tx_id): Path<S
     }
 
     // fall back to observations by tx_id → intentId from metadata
-    let mut osql = format!("SELECT {OBS_COLS} FROM payment_observations WHERE tx_id = ?");
-    if q.network.is_some() { osql.push_str(" AND network = ?"); }
-    if q.asset_id.is_some() { osql.push_str(" AND asset_id = ?"); }
+    let mut on = 1;
+    let mut osql = format!("SELECT {OBS_COLS} FROM payment_observations WHERE tx_id = ${on}");
+    on += 1;
+    if q.network.is_some() { osql.push_str(&format!(" AND network = ${on}")); on += 1; }
+    if q.asset_id.is_some() { osql.push_str(&format!(" AND asset_id = ${on}")); on += 1; }
+    let _ = on;
     osql.push_str(" ORDER BY created_at DESC, id DESC LIMIT 2");
     let mut oq = sqlx::query_as::<_, ObsRow>(&osql).bind(&tx_id);
     if let Some(n) = &q.network { oq = oq.bind(n.clone()); }

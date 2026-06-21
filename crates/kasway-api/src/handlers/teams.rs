@@ -96,7 +96,7 @@ fn serialize_team(team: &TeamRow, currency: Option<&Value>, members: Option<&[Te
 }
 
 async fn load_team(state: &AppState, id: i64) -> AppResult<TeamRow> {
-    sqlx::query_as::<_, TeamRow>(&format!("SELECT {TEAM_COLS} FROM teams WHERE id = ?"))
+    sqlx::query_as::<_, TeamRow>(&format!("SELECT {TEAM_COLS} FROM teams WHERE id = $1"))
         .bind(id)
         .fetch_optional(&state.db.pool)
         .await?
@@ -106,7 +106,7 @@ async fn load_team(state: &AppState, id: i64) -> AppResult<TeamRow> {
 /// members ordered manager-first then id asc.
 async fn load_members(state: &AppState, team_id: i64) -> AppResult<Vec<TeamMemberRow>> {
     Ok(sqlx::query_as::<_, TeamMemberRow>(&format!(
-        "SELECT {MEMBER_COLS} FROM team_members WHERE team_id = ? \
+        "SELECT {MEMBER_COLS} FROM team_members WHERE team_id = $1 \
          ORDER BY CASE WHEN role = 'manager' THEN 0 ELSE 1 END, id ASC"
     ))
     .bind(team_id)
@@ -130,13 +130,13 @@ pub async fn index(
     let limit = q.limit.unwrap_or(10).max(1);
     let offset = (page - 1) * limit;
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE user_id = ?")
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE user_id = $1")
         .bind(auth.user_id)
         .fetch_one(&state.db.pool)
         .await?;
 
     let teams = sqlx::query_as::<_, TeamRow>(&format!(
-        "SELECT {TEAM_COLS} FROM teams WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT {TEAM_COLS} FROM teams WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"
     ))
     .bind(auth.user_id)
     .bind(limit)
@@ -148,7 +148,7 @@ pub async fn index(
     for team in &teams {
         let currency = match team.currency_id {
             Some(cid) => sqlx::query_as::<_, crate::handlers::currencies::Currency>(
-                "SELECT id, type, code, name, symbol, country, locale, created_at, updated_at FROM currencies WHERE id = ?",
+                "SELECT id, type, code, name, symbol, country, locale, created_at, updated_at FROM currencies WHERE id = $1",
             )
             .bind(cid)
             .fetch_optional(&state.db.pool)
@@ -172,9 +172,9 @@ pub async fn store(
     let input = validate_store_team(&state, auth.user_id, &body).await?;
     let now = now_iso();
 
-    let result = sqlx::query(
+    let team_id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO teams (user_id, currency_id, name, is_active, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(input.currency_id)
@@ -182,14 +182,13 @@ pub async fn store(
     .bind(input.is_active as i64)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-    let team_id = result.last_insert_rowid();
 
     for m in &input.members {
         sqlx::query(
             "INSERT INTO team_members (user_id, team_id, name, email, role, status, is_online, invitation_sent_at, payment_permissions, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, 'invited', 0, ?, '[]', ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, 'invited', 0, $6, '[]', $7, $8)",
         )
         .bind(auth.user_id)
         .bind(team_id)
@@ -237,11 +236,11 @@ pub async fn update(
     let now = now_iso();
 
     if let Some(name) = &input.name {
-        sqlx::query("UPDATE teams SET name = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE teams SET name = $1, updated_at = $2 WHERE id = $3")
             .bind(name).bind(&now).bind(team.id).execute(&state.db.pool).await?;
     }
     if let Some(cid) = input.currency_id {
-        sqlx::query("UPDATE teams SET currency_id = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE teams SET currency_id = $1, updated_at = $2 WHERE id = $3")
             .bind(cid).bind(&now).bind(team.id).execute(&state.db.pool).await?;
     }
 
@@ -252,17 +251,17 @@ pub async fn update(
 
         for ex in &existing {
             if !input_emails.contains(&ex.email.as_str()) {
-                sqlx::query("DELETE FROM team_members WHERE id = ?").bind(ex.id).execute(&state.db.pool).await?;
+                sqlx::query("DELETE FROM team_members WHERE id = $1").bind(ex.id).execute(&state.db.pool).await?;
             }
         }
         for m in members {
             if let Some(ex) = existing.iter().find(|e| e.email == m.email) {
-                sqlx::query("UPDATE team_members SET name = ?, role = ?, updated_at = ? WHERE id = ?")
+                sqlx::query("UPDATE team_members SET name = $1, role = $2, updated_at = $3 WHERE id = $4")
                     .bind(&m.name).bind(&m.role).bind(&now).bind(ex.id).execute(&state.db.pool).await?;
             } else {
                 sqlx::query(
                     "INSERT INTO team_members (user_id, team_id, name, email, role, status, is_online, invitation_sent_at, payment_permissions, created_at, updated_at) \
-                     VALUES (?, ?, ?, ?, ?, 'invited', 0, ?, '[]', ?, ?)",
+                     VALUES ($1, $2, $3, $4, $5, 'invited', 0, $6, '[]', $7, $8)",
                 )
                 .bind(auth.user_id).bind(team.id).bind(&m.name).bind(&m.email).bind(&m.role)
                 .bind(&now).bind(&now).bind(&now).execute(&state.db.pool).await?;
@@ -286,7 +285,7 @@ pub async fn destroy(
         return Err(AppError::Forbidden);
     }
     // team_members cascade via FK
-    sqlx::query("DELETE FROM teams WHERE id = ?").bind(team.id).execute(&state.db.pool).await?;
+    sqlx::query("DELETE FROM teams WHERE id = $1").bind(team.id).execute(&state.db.pool).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -303,9 +302,9 @@ pub async fn add_member(
     }
     let m = validate_member(&state, &body, None).await?;
     let now = now_iso();
-    let result = sqlx::query(
+    let member_id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO team_members (user_id, team_id, name, email, role, status, is_online, invitation_sent_at, payment_permissions, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, 'invited', 0, ?, '[]', ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, 'invited', 0, $6, '[]', $7, $8) RETURNING id",
     )
     .bind(team.user_id)
     .bind(team.id)
@@ -315,12 +314,11 @@ pub async fn add_member(
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-    let member_id = result.last_insert_rowid();
 
     let member = sqlx::query_as::<_, TeamMemberRow>(&format!(
-        "SELECT {MEMBER_COLS} FROM team_members WHERE id = ?"
+        "SELECT {MEMBER_COLS} FROM team_members WHERE id = $1"
     ))
     .bind(member_id)
     .fetch_one(&state.db.pool)
@@ -358,7 +356,7 @@ fn vpush(errors: &mut Vec<ValidationFailure>, field: &str, rule: &str, message: 
 }
 
 async fn currency_exists(state: &AppState, id: i64) -> AppResult<bool> {
-    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM currencies WHERE id = ?")
+    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM currencies WHERE id = $1")
         .bind(id)
         .fetch_optional(&state.db.pool)
         .await?;
@@ -393,7 +391,7 @@ async fn validate_store_team(state: &AppState, user_id: i64, body: &Value) -> Ap
         _ => { vpush(&mut errors, "name", "minLength", "The name field must have at least 3 characters"); None }
     };
     if let Some(n) = &name {
-        let dup: Option<i64> = sqlx::query_scalar("SELECT id FROM teams WHERE user_id = ? AND name = ? COLLATE NOCASE")
+        let dup: Option<i64> = sqlx::query_scalar("SELECT id FROM teams WHERE user_id = $1 AND LOWER(name) = LOWER($2)")
             .bind(user_id).bind(n).fetch_optional(&state.db.pool).await?;
         if dup.is_some() {
             vpush(&mut errors, "name", "database.unique", "The name has already been taken");
@@ -438,7 +436,7 @@ async fn validate_update_team(state: &AppState, user_id: i64, team_id: i64, body
         _ => { vpush(&mut errors, "name", "minLength", "The name field must have at least 3 characters"); None }
     };
     if let Some(n) = &name {
-        let dup: Option<i64> = sqlx::query_scalar("SELECT id FROM teams WHERE user_id = ? AND name = ? AND id != ?")
+        let dup: Option<i64> = sqlx::query_scalar("SELECT id FROM teams WHERE user_id = $1 AND name = $2 AND id != $3")
             .bind(user_id).bind(n).bind(team_id).fetch_optional(&state.db.pool).await?;
         if dup.is_some() {
             vpush(&mut errors, "name", "database.unique", "The name has already been taken");
@@ -484,7 +482,7 @@ async fn validate_member(state: &AppState, body: &Value, _exclude: Option<i64>) 
         return Err(AppError::Validation(errors));
     }
     let m = m.unwrap();
-    let dup: Option<i64> = sqlx::query_scalar("SELECT id FROM team_members WHERE email = ? COLLATE NOCASE")
+    let dup: Option<i64> = sqlx::query_scalar("SELECT id FROM team_members WHERE LOWER(email) = LOWER($1)")
         .bind(&m.email).fetch_optional(&state.db.pool).await?;
     if dup.is_some() {
         return Err(AppError::Validation(vec![ValidationFailure {

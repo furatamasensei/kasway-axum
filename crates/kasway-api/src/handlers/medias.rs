@@ -107,17 +107,16 @@ pub async fn store(
     std::fs::write(&path, &bytes).map_err(|_| AppError::commerce(500, "Storage write failed"))?;
 
     let now = now_iso();
-    let id = sqlx::query(
+    let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO media (user_id, key, media_type, status, size, width, height, duration, created_at, updated_at) \
-         VALUES (?, ?, ?, 'uploaded', ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, 'uploaded', $4, $5, $6, $7, $8, $9) RETURNING id",
     )
     .bind(auth.user_id).bind(&key).bind(media_type).bind(size).bind(width).bind(height).bind(duration)
     .bind(&now).bind(&now)
-    .execute(&state.db.pool).await?
-    .last_insert_rowid();
+    .fetch_one(&state.db.pool).await?;
 
     let row = sqlx::query_as::<_, MediaRow>(
-        "SELECT id, user_id, key, media_type, status, size, width, height, duration, created_at, updated_at FROM media WHERE id = ?",
+        "SELECT id, user_id, key, media_type, status, size, width, height, duration, created_at, updated_at FROM media WHERE id = $1",
     ).bind(id).fetch_one(&state.db.pool).await?;
     Ok((StatusCode::CREATED, Json(serialize_media(&row))).into_response())
 }
@@ -128,12 +127,12 @@ pub async fn destroy(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Response> {
-    let key: Option<String> = sqlx::query_scalar("SELECT key FROM media WHERE user_id = ? AND id = ?")
+    let key: Option<String> = sqlx::query_scalar("SELECT key FROM media WHERE user_id = $1 AND id = $2")
         .bind(auth.user_id).bind(id).fetch_optional(&state.db.pool).await?;
     let Some(key) = key else {
         return Err(AppError::commerce(404, "Media not found"));
     };
-    sqlx::query("DELETE FROM media WHERE id = ?").bind(id).execute(&state.db.pool).await?;
+    sqlx::query("DELETE FROM media WHERE id = $1").bind(id).execute(&state.db.pool).await?;
     // best-effort storage delete (@beforeDelete hook)
     let _ = std::fs::remove_file(media_dir().join(&key));
     Ok(StatusCode::NO_CONTENT.into_response())

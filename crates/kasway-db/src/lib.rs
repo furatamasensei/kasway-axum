@@ -1,11 +1,11 @@
 //! Database layer for the Kasway Axum API.
 //!
-//! Wraps a SQLite connection pool (sqlx) and runs the embedded migrations.
+//! Wraps a PostgreSQL connection pool (sqlx) and runs the embedded migrations.
 //! Mirrors the schema produced by the AdonisJS/Lucid migrations in
-//! `kasway-v2-api/database/migrations`, adapted to SQLite.
+//! `kasway-v2-api/database/migrations`, adapted to PostgreSQL.
 
-use sqlx::sqlite::{SqlitePoolOptions, SqliteConnectOptions};
-use sqlx::SqlitePool;
+use sqlx::postgres::{PgPoolOptions, PgConnectOptions};
+use sqlx::PgPool;
 use std::str::FromStr;
 
 pub use sqlx;
@@ -13,7 +13,7 @@ pub use sqlx;
 /// Shared connection pool handle.
 #[derive(Clone, Debug)]
 pub struct Db {
-    pub pool: SqlitePool,
+    pub pool: PgPool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -25,16 +25,14 @@ pub enum DbError {
 }
 
 impl Db {
-    /// Connect to a SQLite database at `url` (e.g. `sqlite::memory:` or
-    /// `sqlite:///abs/path/kasway.db`), creating the file if needed, and run
-    /// all pending migrations.
+    /// Connect to a PostgreSQL database at `url` (e.g.
+    /// `postgres://user:pass@host:5432/kasway`) and run all pending
+    /// migrations.
     pub async fn connect(url: &str) -> Result<Self, DbError> {
-        let opts = SqliteConnectOptions::from_str(url)?
-            .create_if_missing(true)
-            .foreign_keys(true);
+        let opts = PgConnectOptions::from_str(url)?;
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
+        let pool = PgPoolOptions::new()
+            .max_connections(10)
             .connect_with(opts)
             .await?;
 
@@ -43,17 +41,17 @@ impl Db {
         Ok(db)
     }
 
-    /// Connect to a fresh in-memory database (one shared connection so the
-    /// schema survives across queries). Used by the integration test harness.
+    /// Connect using the same pool configuration as [`connect`]. Retained for
+    /// the integration test harness, which points `url` at a disposable
+    /// PostgreSQL database.
     pub async fn connect_memory() -> Result<Self, DbError> {
-        let opts = SqliteConnectOptions::from_str("sqlite::memory:")?.foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect_with(opts)
-            .await?;
-        let db = Self { pool };
-        db.migrate().await?;
-        Ok(db)
+        Self::connect_from_env().await
+    }
+
+    async fn connect_from_env() -> Result<Self, DbError> {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/kasway".to_string());
+        Self::connect(&url).await
     }
 
     pub async fn migrate(&self) -> Result<(), DbError> {

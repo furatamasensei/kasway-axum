@@ -66,7 +66,7 @@ fn serialize_signal(s: &SignalRow) -> Value {
 }
 
 async fn load_signal(state: &AppState, user_id: i64, id: i64) -> AppResult<SignalRow> {
-    sqlx::query_as::<_, SignalRow>(&format!("SELECT {SIGNAL_COLS} FROM payment_anomaly_signals WHERE user_id = ? AND id = ?"))
+    sqlx::query_as::<_, SignalRow>(&format!("SELECT {SIGNAL_COLS} FROM payment_anomaly_signals WHERE user_id = $1 AND id = $2"))
         .bind(user_id).bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Payment anomaly signal not found"))
 }
@@ -76,11 +76,13 @@ pub async fn index(auth: AuthMerchant, State(state): State<AppState>, Query(q): 
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
 
-    let mut filter = String::from("user_id = ?");
-    if q.signal_type.is_some() { filter.push_str(" AND signal_type = ?"); }
-    if q.status.is_some() { filter.push_str(" AND status = ?"); }
-    if q.severity.is_some() { filter.push_str(" AND severity = ?"); }
-    if q.resource_type.is_some() { filter.push_str(" AND resource_type = ?"); }
+    let mut n = 1;
+    let mut filter = format!("user_id = ${n}"); n += 1;
+    if q.signal_type.is_some() { filter.push_str(&format!(" AND signal_type = ${n}")); n += 1; }
+    if q.status.is_some() { filter.push_str(&format!(" AND status = ${n}")); n += 1; }
+    if q.severity.is_some() { filter.push_str(&format!(" AND severity = ${n}")); n += 1; }
+    if q.resource_type.is_some() { filter.push_str(&format!(" AND resource_type = ${n}")); n += 1; }
+    let _ = n;
 
     let count_sql = format!("SELECT COUNT(*) FROM payment_anomaly_signals WHERE {filter}");
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(auth.user_id);
@@ -119,7 +121,7 @@ async fn mark(auth_id: i64, state: &AppState, id: i64, action: &str, body: &Valu
         trail.push(entry);
         m.insert("auditTrail".into(), Value::Array(trail));
     }
-    sqlx::query("UPDATE payment_anomaly_signals SET status = ?, metadata = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE payment_anomaly_signals SET status = $1, metadata = $2, updated_at = $3 WHERE id = $4")
         .bind(status).bind(meta.to_string()).bind(now_iso()).bind(signal.id).execute(&state.db.pool).await?;
     Ok(Json(serialize_signal(&load_signal(state, auth_id, id).await?)))
 }

@@ -68,11 +68,13 @@ pub(crate) fn tn10_disabled_report() -> Value {
 // ---- merchant id resolution + emails ---------------------------------------
 
 async fn active_merchant_ids(state: &AppState, from: &str, to: &str, q: &ObsQuery) -> AppResult<Vec<i64>> {
-    let mut sql = String::from("SELECT DISTINCT user_id FROM invoices WHERE created_at BETWEEN ? AND ?");
+    let mut sql = String::from("SELECT DISTINCT user_id FROM invoices WHERE created_at BETWEEN $1 AND $2");
     let mut binds: Vec<String> = vec![from.into(), to.into()];
-    if let Some(m) = q.merchant_id { sql.push_str(" AND user_id = ?"); binds.push(m.to_string()); }
-    if let Some(n) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND payment_network = ?"); binds.push(n.into()); }
-    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND payment_asset = ?"); binds.push(a.into()); }
+    let mut n = 3;
+    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND user_id = ${n}")); n += 1; binds.push(m.to_string()); }
+    if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_network = ${n}")); n += 1; binds.push(net.into()); }
+    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_asset = ${n}")); n += 1; binds.push(a.into()); }
+    let _ = n;
     let mut query = sqlx::query_scalar::<_, i64>(&sql);
     for b in &binds { query = query.bind(b.clone()); }
     Ok(query.fetch_all(&state.db.pool).await?)
@@ -80,25 +82,30 @@ async fn active_merchant_ids(state: &AppState, from: &str, to: &str, q: &ObsQuer
 
 async fn merchant_emails(state: &AppState, ids: &[i64]) -> AppResult<HashMap<i64, String>> {
     if ids.is_empty() { return Ok(HashMap::new()); }
-    let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut n = 1;
+    let ph = ids.iter().map(|_| { let p = format!("${n}"); n += 1; p }).collect::<Vec<_>>().join(",");
     let sql = format!("SELECT id, email FROM users WHERE id IN ({ph})");
     let mut q = sqlx::query_as::<_, (i64, String)>(&sql);
     for id in ids { q = q.bind(*id); }
     Ok(q.fetch_all(&state.db.pool).await?.into_iter().collect())
 }
 
-fn in_clause(col: &str, ids: &[i64]) -> String {
-    format!("{col} IN ({})", ids.iter().map(|_| "?").collect::<Vec<_>>().join(","))
+/// Build `col IN ($start, $start+1, ...)` for `ids.len()` placeholders.
+fn in_clause(col: &str, ids: &[i64], start: i32) -> String {
+    let mut n = start;
+    format!("{col} IN ({})", ids.iter().map(|_| { let p = format!("${n}"); n += 1; p }).collect::<Vec<_>>().join(","))
 }
 
 // ---- aggregates (filter-scoped) --------------------------------------------
 
 async fn invoice_volume(state: &AppState, from: &str, to: &str, q: &ObsQuery) -> AppResult<Value> {
-    let mut sql = String::from("SELECT status, COUNT(*), CAST(COALESCE(SUM(total_amount),0) AS INTEGER) FROM invoices WHERE created_at BETWEEN ? AND ?");
+    let mut sql = String::from("SELECT status, COUNT(*), CAST(COALESCE(SUM(total_amount),0) AS BIGINT) FROM invoices WHERE created_at BETWEEN $1 AND $2");
     let mut binds: Vec<String> = vec![from.into(), to.into()];
-    if let Some(m) = q.merchant_id { sql.push_str(" AND user_id = ?"); binds.push(m.to_string()); }
-    if let Some(n) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND payment_network = ?"); binds.push(n.into()); }
-    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND payment_asset = ?"); binds.push(a.into()); }
+    let mut n = 3;
+    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND user_id = ${n}")); n += 1; binds.push(m.to_string()); }
+    if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_network = ${n}")); n += 1; binds.push(net.into()); }
+    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_asset = ${n}")); n += 1; binds.push(a.into()); }
+    let _ = n;
     sql.push_str(" GROUP BY status");
     let mut query = sqlx::query_as::<_, (String, i64, i64)>(&sql);
     for b in &binds { query = query.bind(b.clone()); }
@@ -114,13 +121,15 @@ async fn invoice_volume(state: &AppState, from: &str, to: &str, q: &ObsQuery) ->
 
 async fn observation_volume(state: &AppState, from: &str, to: &str, q: &ObsQuery) -> AppResult<Value> {
     let mut sql = String::from(
-        "SELECT po.status, COUNT(po.id), CAST(COALESCE(SUM(po.amount),0) AS INTEGER) FROM payment_observations po \
-         JOIN invoices i ON i.id = po.invoice_id WHERE po.created_at BETWEEN ? AND ?",
+        "SELECT po.status, COUNT(po.id), CAST(COALESCE(SUM(po.amount),0) AS BIGINT) FROM payment_observations po \
+         JOIN invoices i ON i.id = po.invoice_id WHERE po.created_at BETWEEN $1 AND $2",
     );
     let mut binds: Vec<String> = vec![from.into(), to.into()];
-    if let Some(m) = q.merchant_id { sql.push_str(" AND i.user_id = ?"); binds.push(m.to_string()); }
-    if let Some(n) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND po.network = ?"); binds.push(n.into()); }
-    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND po.asset_id = ?"); binds.push(a.into()); }
+    let mut n = 3;
+    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND i.user_id = ${n}")); n += 1; binds.push(m.to_string()); }
+    if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND po.network = ${n}")); n += 1; binds.push(net.into()); }
+    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND po.asset_id = ${n}")); n += 1; binds.push(a.into()); }
+    let _ = n;
     sql.push_str(" GROUP BY po.status");
     let mut query = sqlx::query_as::<_, (String, i64, i64)>(&sql);
     for b in &binds { query = query.bind(b.clone()); }
@@ -136,12 +145,14 @@ async fn observation_volume(state: &AppState, from: &str, to: &str, q: &ObsQuery
 
 async fn settlement_summary(state: &AppState, from: &str, to: &str, q: &ObsQuery) -> AppResult<Value> {
     let mut sql = String::from(
-        "SELECT p.status, COUNT(*) FROM payments p JOIN invoices i ON i.id = p.invoice_id WHERE p.created_at BETWEEN ? AND ?",
+        "SELECT p.status, COUNT(*) FROM payments p JOIN invoices i ON i.id = p.invoice_id WHERE p.created_at BETWEEN $1 AND $2",
     );
     let mut binds: Vec<String> = vec![from.into(), to.into()];
-    if let Some(m) = q.merchant_id { sql.push_str(" AND i.user_id = ?"); binds.push(m.to_string()); }
-    if let Some(n) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND i.payment_network = ?"); binds.push(n.into()); }
-    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND i.payment_asset = ?"); binds.push(a.into()); }
+    let mut n = 3;
+    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND i.user_id = ${n}")); n += 1; binds.push(m.to_string()); }
+    if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND i.payment_network = ${n}")); n += 1; binds.push(net.into()); }
+    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND i.payment_asset = ${n}")); n += 1; binds.push(a.into()); }
+    let _ = n;
     sql.push_str(" GROUP BY p.status");
     let mut query = sqlx::query_as::<_, (String, i64)>(&sql);
     for b in &binds { query = query.bind(b.clone()); }
@@ -158,8 +169,8 @@ async fn webhook_failure_summary(state: &AppState, from: &str, to: &str, ids: &[
     }
     let sql = format!(
         "SELECT d.status, COUNT(d.id) FROM webhook_deliveries d JOIN webhook_events e ON e.id = d.webhook_event_id \
-         WHERE d.created_at BETWEEN ? AND ? AND d.status != 'succeeded' AND {} GROUP BY d.status",
-        in_clause("e.user_id", ids)
+         WHERE d.created_at BETWEEN $1 AND $2 AND d.status != 'succeeded' AND {} GROUP BY d.status",
+        in_clause("e.user_id", ids, 3)
     );
     let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(from).bind(to);
     for id in ids { q = q.bind(*id); }
@@ -179,8 +190,8 @@ async fn job_status_summary(state: &AppState, from: &str, to: &str, ids: &[i64],
         return Ok(json!({ "total": 0, "byStatus": { "queued": 0, "running": 0, "failed": 0, "expired": 0 } }));
     }
     let sql = format!(
-        "SELECT status, COUNT(*) FROM {table} WHERE generated_at BETWEEN ? AND ? AND status != 'succeeded' AND {} GROUP BY status",
-        in_clause("user_id", ids)
+        "SELECT status, COUNT(*) FROM {table} WHERE generated_at BETWEEN $1 AND $2 AND status != 'succeeded' AND {} GROUP BY status",
+        in_clause("user_id", ids, 3)
     );
     let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(from).bind(to);
     for id in ids { q = q.bind(*id); }
@@ -199,8 +210,8 @@ async fn notification_summary(state: &AppState, from: &str, to: &str, ids: &[i64
         return Ok(json!({ "total": 0, "unread": 0, "bySeverity": { "info": 0, "warning": 0, "critical": 0 } }));
     }
     let sql = format!(
-        "SELECT severity, read_at, COUNT(*) FROM payment_notifications WHERE created_at BETWEEN ? AND ? AND {} GROUP BY severity, read_at",
-        in_clause("user_id", ids)
+        "SELECT severity, read_at, COUNT(*) FROM payment_notifications WHERE created_at BETWEEN $1 AND $2 AND {} GROUP BY severity, read_at",
+        in_clause("user_id", ids, 3)
     );
     let mut q = sqlx::query_as::<_, (String, Option<String>, i64)>(&sql).bind(from).bind(to);
     for id in ids { q = q.bind(*id); }
@@ -335,7 +346,7 @@ pub async fn merchant(_token: InternalToken, State(state): State<AppState>, Path
     if !ids.contains(&mid) {
         return Err(AppError::commerce(404, "merchant not found"));
     }
-    let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = ?").bind(mid).fetch_optional(&state.db.pool).await?;
+    let email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1").bind(mid).fetch_optional(&state.db.pool).await?;
     let email = email.ok_or_else(AppError::row_not_found)?;
     let totals = merchant_totals(&state, mid, &from, &to, &q).await?;
     Ok(Json(json!({ "range": { "from": from, "to": to }, "merchant": { "id": mid, "email": email }, "totals": totals })))
@@ -346,8 +357,8 @@ async fn collect_webhook_rows(state: &AppState, ids: &[i64], from: &str, to: &st
     let sql = format!(
         "SELECT d.id, d.status, d.attempt_count, d.error, d.created_at, d.webhook_event_id, e.user_id, e.event_type \
          FROM webhook_deliveries d JOIN webhook_events e ON e.id = d.webhook_event_id \
-         WHERE d.created_at BETWEEN ? AND ? AND d.status != 'succeeded' AND {}",
-        in_clause("e.user_id", ids)
+         WHERE d.created_at BETWEEN $1 AND $2 AND d.status != 'succeeded' AND {}",
+        in_clause("e.user_id", ids, 3)
     );
     let mut q = sqlx::query_as::<_, (i64, String, i64, Option<String>, Option<String>, i64, i64, Option<String>)>(&sql).bind(from).bind(to);
     for id in ids { q = q.bind(*id); }
@@ -372,8 +383,8 @@ async fn collect_job_rows(state: &AppState, ids: &[i64], from: &str, to: &str, k
     let extra_col = if kind == "export_job" { "kind, row_count" } else { "invoice_id" };
     let sql = format!(
         "SELECT id, user_id, status, error, generated_at, {extra_col} FROM {table} \
-         WHERE status != 'succeeded' AND generated_at BETWEEN ? AND ? AND {}",
-        in_clause("user_id", ids)
+         WHERE status != 'succeeded' AND generated_at BETWEEN $1 AND $2 AND {}",
+        in_clause("user_id", ids, 3)
     );
     let mut out = Vec::new();
     let emails = merchant_emails(state, ids).await?;

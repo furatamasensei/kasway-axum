@@ -118,15 +118,19 @@ fn required_conf_from_metadata(meta: &Value) -> Option<i64> {
 }
 
 async fn load_invoices(state: &AppState, user_id: i64, q: &AnalyticsQuery, w: &Window) -> AppResult<Vec<InvRow>> {
-    let mut sql = String::from(
+    let mut n = 1;
+    let mut sql = format!(
         "SELECT id, status, total_amount, created_at, paid_at, expires_at, payment_network, payment_asset, currency \
-         FROM invoices WHERE user_id = ? AND created_at BETWEEN ? AND ?",
+         FROM invoices WHERE user_id = ${} AND created_at BETWEEN ${} AND ${}",
+        n, n + 1, n + 2,
     );
+    n += 3;
     let mut binds: Vec<String> = vec![user_id.to_string(), iso(w.from), iso(w.to)];
-    if let Some(n) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND payment_network = ?"); binds.push(n.into()); }
-    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND payment_asset = ?"); binds.push(a.into()); }
-    if let Some(c) = q.currency.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND currency = ?"); binds.push(c.into()); }
-    if let Some(s) = q.status.as_deref().filter(|s| !s.is_empty()) { sql.push_str(" AND status = ?"); binds.push(s.into()); }
+    if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_network = ${n}")); n += 1; binds.push(net.into()); }
+    if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_asset = ${n}")); n += 1; binds.push(a.into()); }
+    if let Some(c) = q.currency.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND currency = ${n}")); n += 1; binds.push(c.into()); }
+    if let Some(s) = q.status.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND status = ${n}")); n += 1; binds.push(s.into()); }
+    let _ = n;
     sql.push_str(" ORDER BY created_at ASC");
     let mut query = sqlx::query_as::<_, InvRow>(&sql);
     for b in &binds { query = query.bind(b.clone()); }
@@ -141,7 +145,7 @@ async fn derive_invoices(state: &AppState, user_id: i64, q: &AnalyticsQuery, w: 
         // observation aggregate
         let obs = sqlx::query_as::<_, (String, i64, i64, Option<String>, Option<String>, Option<String>)>(
             "SELECT status, amount, confirmations, accepted_at, created_at, metadata FROM payment_observations \
-             WHERE invoice_id = ? ORDER BY id ASC",
+             WHERE invoice_id = $1 ORDER BY id ASC",
         ).bind(inv.id).fetch_all(&state.db.pool).await?;
         let mut first_obs: Option<String> = None;
         let mut first_final: Option<String> = None;
@@ -167,7 +171,7 @@ async fn derive_invoices(state: &AppState, user_id: i64, q: &AnalyticsQuery, w: 
         }
 
         // credit total
-        let credited: i64 = sqlx::query_scalar("SELECT CAST(COALESCE(SUM(amount),0) AS INTEGER) FROM payment_credits WHERE invoice_id = ?")
+        let credited: i64 = sqlx::query_scalar("SELECT CAST(COALESCE(SUM(amount),0) AS BIGINT) FROM payment_credits WHERE invoice_id = $1")
             .bind(inv.id).fetch_one(&state.db.pool).await?;
         let credited = credited as i128;
         let applied = if credited > 0 { credited } else { 0 };
@@ -230,8 +234,8 @@ async fn exception_rows(state: &AppState, user_id: i64, q: &AnalyticsQuery, w: &
     if q.currency.as_deref().map(|s| !s.is_empty()).unwrap_or(false) {
         let ids: Vec<i64> = all.iter().filter_map(|e| e["invoice"]["id"].as_i64()).collect();
         if !ids.is_empty() {
-            let ph = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!("SELECT id, currency FROM invoices WHERE user_id = ? AND id IN ({ph})");
+            let ph = ids.iter().enumerate().map(|(i, _)| format!("${}", i + 2)).collect::<Vec<_>>().join(",");
+            let sql = format!("SELECT id, currency FROM invoices WHERE user_id = $1 AND id IN ({ph})");
             let mut query = sqlx::query_as::<_, (i64, String)>(&sql).bind(user_id);
             for id in &ids { query = query.bind(*id); }
             for (id, c) in query.fetch_all(&state.db.pool).await? { currency_by_invoice.insert(id, c); }
@@ -261,7 +265,7 @@ async fn exception_rows(state: &AppState, user_id: i64, q: &AnalyticsQuery, w: &
 async fn webhook_summary(state: &AppState, user_id: i64, w: &Window) -> AppResult<Value> {
     let rows = sqlx::query_as::<_, (String, i64)>(
         "SELECT d.status, COUNT(*) FROM webhook_deliveries d LEFT JOIN webhook_events e ON e.id = d.webhook_event_id \
-         WHERE d.delivered_at BETWEEN ? AND ? AND e.user_id = ? GROUP BY d.status",
+         WHERE d.delivered_at BETWEEN $1 AND $2 AND e.user_id = $3 GROUP BY d.status",
     ).bind(iso(w.from)).bind(iso(w.to)).bind(user_id).fetch_all(&state.db.pool).await?;
     let (mut delivery, mut success, mut failure) = (0i64, 0i64, 0i64);
     for (status, count) in rows {
@@ -277,7 +281,7 @@ async fn webhook_summary(state: &AppState, user_id: i64, w: &Window) -> AppResul
 async fn webhook_breakdown(state: &AppState, user_id: i64, w: &Window) -> AppResult<Vec<(String, i64)>> {
     let rows = sqlx::query_as::<_, (String,)>(
         "SELECT d.status FROM webhook_deliveries d LEFT JOIN webhook_events e ON e.id = d.webhook_event_id \
-         WHERE d.delivered_at BETWEEN ? AND ? AND e.user_id = ?",
+         WHERE d.delivered_at BETWEEN $1 AND $2 AND e.user_id = $3",
     ).bind(iso(w.from)).bind(iso(w.to)).bind(user_id).fetch_all(&state.db.pool).await?;
     let mut grouped: BTreeMap<String, i64> = BTreeMap::new();
     for (status,) in rows {

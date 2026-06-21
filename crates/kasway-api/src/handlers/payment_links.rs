@@ -80,7 +80,7 @@ fn serialize_link(link: &LinkRow, payments_count: Option<i64>) -> Value {
 }
 
 async fn invoices_count(state: &AppState, link_id: i64) -> AppResult<i64> {
-    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE payment_link_id = ?")
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE payment_link_id = $1")
         .bind(link_id)
         .fetch_one(&state.db.pool)
         .await?)
@@ -93,7 +93,7 @@ async fn get_for_merchant(
     id: i64,
 ) -> AppResult<LinkRow> {
     sqlx::query_as::<_, LinkRow>(&format!(
-        "SELECT {LINK_COLS} FROM payment_links WHERE user_id = ? AND store_id = ? AND id = ?"
+        "SELECT {LINK_COLS} FROM payment_links WHERE user_id = $1 AND store_id = $2 AND id = $3"
     ))
     .bind(user_id)
     .bind(store_id)
@@ -115,7 +115,7 @@ pub async fn index(
     let offset = (page - 1) * per_page;
 
     let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM payment_links WHERE user_id = ? AND store_id = ?",
+        "SELECT COUNT(*) FROM payment_links WHERE user_id = $1 AND store_id = $2",
     )
     .bind(auth.user_id)
     .bind(store_id)
@@ -123,8 +123,8 @@ pub async fn index(
     .await?;
 
     let links = sqlx::query_as::<_, LinkRow>(&format!(
-        "SELECT {LINK_COLS} FROM payment_links WHERE user_id = ? AND store_id = ? \
-         ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT {LINK_COLS} FROM payment_links WHERE user_id = $1 AND store_id = $2 \
+         ORDER BY created_at DESC LIMIT $3 OFFSET $4"
     ))
     .bind(auth.user_id)
     .bind(store_id)
@@ -170,11 +170,11 @@ pub async fn store(
     let public_id = format!("plink_{}", random_suffix());
     let metadata_str = input.metadata.as_ref().map(|m| m.to_string());
 
-    let result = sqlx::query(
+    let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_links \
          (user_id, store_id, public_id, status, title, amount, currency, payment_network, \
           payment_asset, fee_delegation, payment_mode, pricing_country_code, metadata, created_at, updated_at) \
-         VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(store_id)
@@ -190,9 +190,8 @@ pub async fn store(
     .bind(&metadata_str)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-    let id = result.last_insert_rowid();
 
     let link = get_for_merchant(&state, auth.user_id, store_id, id).await?;
     let count = invoices_count(&state, id).await?;
@@ -241,7 +240,7 @@ async fn set_status(
 ) -> AppResult<Json<Value>> {
     let store_id = resolve_request_store(state, user_id, store_id_q).await?;
     let link = get_for_merchant(state, user_id, store_id, id).await?;
-    sqlx::query("UPDATE payment_links SET status = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE payment_links SET status = $1, updated_at = $2 WHERE id = $3")
         .bind(status)
         .bind(now_iso())
         .bind(link.id)
@@ -259,7 +258,7 @@ pub(crate) async fn get_active_by_public_id(
     public_id: &str,
 ) -> AppResult<LinkRow> {
     let link = sqlx::query_as::<_, LinkRow>(&format!(
-        "SELECT {LINK_COLS} FROM payment_links WHERE public_id = ?"
+        "SELECT {LINK_COLS} FROM payment_links WHERE public_id = $1"
     ))
     .bind(public_id)
     .fetch_optional(&state.db.pool)
@@ -277,12 +276,12 @@ pub(crate) async fn public_summary(state: &AppState, public_id: &str) -> AppResu
     let link = get_active_by_public_id(state, public_id).await?;
 
     let merchant: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT full_name, avatar_url FROM users WHERE id = ?")
+        sqlx::query_as("SELECT full_name, avatar_url FROM users WHERE id = $1")
             .bind(link.user_id)
             .fetch_optional(&state.db.pool)
             .await?;
     let store_name: Option<String> = match link.store_id {
-        Some(sid) => sqlx::query_scalar("SELECT name FROM stores WHERE id = ?")
+        Some(sid) => sqlx::query_scalar("SELECT name FROM stores WHERE id = $1")
             .bind(sid)
             .fetch_optional(&state.db.pool)
             .await?,
@@ -320,7 +319,7 @@ pub(crate) async fn spawn_invoice_for_checkout(
 ) -> AppResult<(i64, i64)> {
     let link = get_active_by_public_id(state, public_id).await?;
 
-    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
         .bind(link.user_id)
         .fetch_optional(&state.db.pool)
         .await?;

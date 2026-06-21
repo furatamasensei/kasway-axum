@@ -73,7 +73,7 @@ pub(crate) async fn derive_user_exceptions(
 ) -> AppResult<Vec<Value>> {
     let invoices_rows = sqlx::query_as::<_, InvRow>(
         "SELECT id, public_id, external_id, status, payment_network, payment_asset, payment_address, created_at, updated_at \
-         FROM invoices WHERE user_id = ? ORDER BY created_at DESC",
+         FROM invoices WHERE user_id = $1 ORDER BY created_at DESC",
     )
     .bind(user_id)
     .fetch_all(&state.db.pool)
@@ -93,8 +93,9 @@ pub(crate) async fn derive_user_exceptions(
     let keys: Vec<String> = rows.iter().map(|r| r["id"].as_str().unwrap().to_string()).collect();
     let mut closed = std::collections::HashSet::new();
     if !keys.is_empty() {
-        let placeholders = keys.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        let sql = format!("SELECT DISTINCT exception_key FROM payment_exception_resolutions WHERE user_id = ? AND status IN ('resolved','dismissed') AND exception_key IN ({placeholders})");
+        let mut n = 2;
+        let placeholders = keys.iter().map(|_| { let p = format!("${n}"); n += 1; p }).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT DISTINCT exception_key FROM payment_exception_resolutions WHERE user_id = $1 AND status IN ('resolved','dismissed') AND exception_key IN ({placeholders})");
         let mut qx = sqlx::query_scalar::<_, String>(&sql).bind(user_id);
         for k in &keys { qx = qx.bind(k.clone()); }
         for k in qx.fetch_all(&state.db.pool).await? { closed.insert(k); }
@@ -187,7 +188,7 @@ fn invoice_id_from_key(key: &str) -> Option<i64> {
 /// `GET /api/payments/ops/exceptions/:id/resolution`
 pub async fn resolution(auth: AuthMerchant, State(state): State<AppState>, Path(key): Path<String>) -> AppResult<Json<Value>> {
     let row: Option<ResolutionRow> = sqlx::query_as::<_, ResolutionRow>(&format!(
-        "SELECT {RES_COLS} FROM payment_exception_resolutions WHERE user_id = ? AND exception_key = ? ORDER BY created_at DESC, id DESC LIMIT 1"
+        "SELECT {RES_COLS} FROM payment_exception_resolutions WHERE user_id = $1 AND exception_key = $2 ORDER BY created_at DESC, id DESC LIMIT 1"
     ))
     .bind(auth.user_id).bind(&key).fetch_optional(&state.db.pool).await?;
     let row = row.ok_or_else(|| AppError::commerce(404, "Payment exception resolution not found"))?;
@@ -203,14 +204,14 @@ async fn create_resolution(state: &AppState, user_id: i64, key: &str, action: &s
     let exc_type = key.split(':').next().unwrap_or("unknown");
     let invoice_id = invoice_id_from_key(key);
     let now = now_iso();
-    let r = sqlx::query(
+    let r = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_exception_resolutions (user_id, exception_type, exception_key, invoice_id, action, status, note, metadata, resolved_by_user_id, resolved_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id",
     )
     .bind(user_id).bind(exc_type).bind(key).bind(invoice_id).bind(action).bind(status).bind(note).bind(metadata.to_string()).bind(user_id).bind(&now).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?;
+    .fetch_one(&state.db.pool).await?;
     // notifications.emit -> deferred no-op
-    let row = sqlx::query_as::<_, ResolutionRow>(&format!("SELECT {RES_COLS} FROM payment_exception_resolutions WHERE id = ?")).bind(r.last_insert_rowid()).fetch_one(&state.db.pool).await?;
+    let row = sqlx::query_as::<_, ResolutionRow>(&format!("SELECT {RES_COLS} FROM payment_exception_resolutions WHERE id = $1")).bind(r).fetch_one(&state.db.pool).await?;
     Ok(Json(serialize_resolution(&row)))
 }
 
@@ -253,26 +254,26 @@ fn obs_kpr1_meta(o: &ObsRow) -> Value {
 }
 
 async fn observation_for_merchant(state: &AppState, user_id: i64, id: i64) -> AppResult<ObsRow> {
-    let obs = sqlx::query_as::<_, ObsRow>(&format!("SELECT {OBS_COLS} FROM payment_observations WHERE id = ?"))
+    let obs = sqlx::query_as::<_, ObsRow>(&format!("SELECT {OBS_COLS} FROM payment_observations WHERE id = $1"))
         .bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Payment observation not found"))?;
     // belongs-to-merchant: via invoice_id, kpr1 intentId, or payment route match
     let mut belongs = false;
     if let Some(inv_id) = obs.invoice_id {
-        let found: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE id = ? AND user_id = ?")
+        let found: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE id = $1 AND user_id = $2")
             .bind(inv_id).bind(user_id).fetch_optional(&state.db.pool).await?;
         belongs = found.is_some();
     }
     if !belongs {
         if let Some(intent_id) = obs_kpr1_meta(&obs)["intentId"].as_str() {
-            let found: Option<i64> = sqlx::query_scalar("SELECT id FROM kpr1_payment_intents WHERE intent_id = ? AND user_id = ?")
+            let found: Option<i64> = sqlx::query_scalar("SELECT id FROM kpr1_payment_intents WHERE intent_id = $1 AND user_id = $2")
                 .bind(intent_id).bind(user_id).fetch_optional(&state.db.pool).await?;
             belongs = found.is_some();
         }
     }
     if !belongs {
         let found: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM invoices WHERE user_id = ? AND payment_address = ? AND payment_network = ? AND payment_asset = ?",
+            "SELECT id FROM invoices WHERE user_id = $1 AND payment_address = $2 AND payment_network = $3 AND payment_asset = $4",
         ).bind(user_id).bind(&obs.payment_address).bind(&obs.network).bind(&obs.asset_id).fetch_optional(&state.db.pool).await?;
         belongs = found.is_some();
     }
@@ -295,15 +296,15 @@ async fn assert_exception_belongs(state: &AppState, user_id: i64, key: &str) -> 
 async fn insert_resolution(state: &AppState, user_id: i64, key: &str, action: &str, status: &str, note: Option<&str>, metadata: &Value, invoice_id: Option<i64>, observation_id: Option<i64>) -> AppResult<Value> {
     let exc_type = key.split(':').next().unwrap_or("unknown");
     let now = now_iso();
-    let r = sqlx::query(
+    let r = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_exception_resolutions (user_id, exception_type, exception_key, invoice_id, payment_observation_id, action, status, note, metadata, resolved_by_user_id, resolved_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
     )
     .bind(user_id).bind(exc_type).bind(key).bind(invoice_id).bind(observation_id).bind(action).bind(status)
     .bind(note).bind(metadata.to_string()).bind(user_id).bind(&now).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?;
-    let row = sqlx::query_as::<_, ResolutionRow>(&format!("SELECT {RES_COLS} FROM payment_exception_resolutions WHERE id = ?"))
-        .bind(r.last_insert_rowid()).fetch_one(&state.db.pool).await?;
+    .fetch_one(&state.db.pool).await?;
+    let row = sqlx::query_as::<_, ResolutionRow>(&format!("SELECT {RES_COLS} FROM payment_exception_resolutions WHERE id = $1"))
+        .bind(r).fetch_one(&state.db.pool).await?;
     Ok(serialize_resolution(&row))
 }
 
@@ -320,7 +321,7 @@ pub async fn ignore_observation(auth: AuthMerchant, State(state): State<AppState
         m.insert("ignoredByResolution".into(), json!(true));
         m.insert("ignoredAt".into(), json!(now_iso()));
     }
-    sqlx::query("UPDATE payment_observations SET status = 'ignored', metadata = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE payment_observations SET status = 'ignored', metadata = $1, updated_at = $2 WHERE id = $3")
         .bind(meta.to_string()).bind(now_iso()).bind(obs.id).execute(&state.db.pool).await?;
     let note = body.get("note").and_then(|v| v.as_str());
     let metadata = body.get("metadata").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
@@ -338,7 +339,7 @@ pub async fn link_observation(auth: AuthMerchant, State(state): State<AppState>,
     assert_exception_belongs(&state, auth.user_id, &key).await?;
 
     let invoice = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>)>(
-        "SELECT id, payment_address, payment_network, payment_asset FROM invoices WHERE user_id = ? AND id = ?",
+        "SELECT id, payment_address, payment_network, payment_asset FROM invoices WHERE user_id = $1 AND id = $2",
     ).bind(auth.user_id).bind(invoice_id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Invoice not found"))?;
     let (inv_id, inv_addr, inv_net, inv_asset) = invoice;
@@ -359,7 +360,7 @@ pub async fn link_observation(auth: AuthMerchant, State(state): State<AppState>,
         }
     }
     let intent = sqlx::query_as::<_, (String, String)>(
-        "SELECT intent_id, script_hash FROM kpr1_payment_intents WHERE invoice_id = ? AND user_id = ?",
+        "SELECT intent_id, script_hash FROM kpr1_payment_intents WHERE invoice_id = $1 AND user_id = $2",
     ).bind(inv_id).bind(auth.user_id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(422, "KPR-1 payment intent is required before linking observations"))?;
     let (intent_id, script_hash) = intent;
@@ -378,7 +379,7 @@ pub async fn link_observation(auth: AuthMerchant, State(state): State<AppState>,
     }
     let now = now_iso();
     // matchedAt = existing ?? now
-    sqlx::query("UPDATE payment_observations SET invoice_id = ?, status = 'matched', matched_at = COALESCE(matched_at, ?), metadata = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE payment_observations SET invoice_id = $1, status = 'matched', matched_at = COALESCE(matched_at, $2), metadata = $3, updated_at = $4 WHERE id = $5")
         .bind(inv_id).bind(&now).bind(meta.to_string()).bind(&now).bind(obs.id).execute(&state.db.pool).await?;
     // settleObservationById — settlement is derive-on-read in the port (no-op here)
 

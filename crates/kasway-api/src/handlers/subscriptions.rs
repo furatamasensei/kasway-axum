@@ -88,14 +88,14 @@ fn serialize_plan(p: &PlanRow) -> Value {
 }
 
 async fn load_plan(state: &AppState, user_id: i64, public_id: &str) -> AppResult<PlanRow> {
-    sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE user_id = ? AND public_id = ?"))
+    sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE user_id = $1 AND public_id = $2"))
         .bind(user_id).bind(public_id)
         .fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Subscription plan not found"))
 }
 
 async fn plan_external_id_taken(state: &AppState, user_id: i64, ext: &str, except: Option<i64>) -> AppResult<bool> {
-    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_plans WHERE user_id = ? AND external_id = ? AND id != ?")
+    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_plans WHERE user_id = $1 AND external_id = $2 AND id != $3")
         .bind(user_id).bind(ext).bind(except.unwrap_or(0))
         .fetch_optional(&state.db.pool).await?;
     Ok(found.is_some())
@@ -104,8 +104,8 @@ async fn plan_external_id_taken(state: &AppState, user_id: i64, ext: &str, excep
 pub async fn plans_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(10).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_plans WHERE user_id = ?").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_plans WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let rows = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_plan).collect::<Vec<_>>() })))
 }
@@ -132,7 +132,7 @@ pub async fn plans_store(auth: AuthMerchant, State(state): State<AppState>, Json
 
     let r = sqlx::query(
         "INSERT INTO subscription_plans (user_id, public_id, external_id, status, name, description, amount, currency, payment_network, payment_asset, interval_unit, interval_count, invoice_expires_after_seconds, metadata, created_at, updated_at) \
-         VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(auth.user_id).bind(&public_id).bind(&external_id).bind(name.unwrap())
     .bind(opt_string(&body, "description")).bind(amount.unwrap().parse::<i64>().unwrap_or(0))
@@ -161,7 +161,7 @@ pub async fn plans_update(auth: AuthMerchant, State(state): State<AppState>, Pat
     let now = now_iso();
     macro_rules! set_str { ($k:expr, $col:expr) => {
         if let Some(v) = body.get($k).and_then(|v| v.as_str()) {
-            sqlx::query(&format!("UPDATE subscription_plans SET {} = ?, updated_at = ? WHERE id = ?", $col)).bind(v).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
+            sqlx::query(&format!("UPDATE subscription_plans SET {} = $1, updated_at = $2 WHERE id = $3", $col)).bind(v).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
         }
     }}
     set_str!("name", "name");
@@ -171,10 +171,10 @@ pub async fn plans_update(auth: AuthMerchant, State(state): State<AppState>, Pat
     set_str!("paymentAsset", "payment_asset");
     set_str!("intervalUnit", "interval_unit");
     if let Some(a) = body.get("amount").and_then(|v| v.as_str()) {
-        sqlx::query("UPDATE subscription_plans SET amount = ?, updated_at = ? WHERE id = ?").bind(a.parse::<i64>().unwrap_or(0)).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
+        sqlx::query("UPDATE subscription_plans SET amount = $1, updated_at = $2 WHERE id = $3").bind(a.parse::<i64>().unwrap_or(0)).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
     }
     if let Some(c) = body.get("intervalCount").and_then(|v| v.as_i64()) {
-        sqlx::query("UPDATE subscription_plans SET interval_count = ?, updated_at = ? WHERE id = ?").bind(c).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
+        sqlx::query("UPDATE subscription_plans SET interval_count = $1, updated_at = $2 WHERE id = $3").bind(c).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
     }
     Ok(Json(serialize_plan(&load_plan(&state, auth.user_id, &public_id).await?)))
 }
@@ -183,7 +183,7 @@ pub async fn plans_archive(auth: AuthMerchant, State(state): State<AppState>, Pa
     let plan = load_plan(&state, auth.user_id, &public_id).await?;
     if plan.status != "archived" {
         let now = now_iso();
-        sqlx::query("UPDATE subscription_plans SET status = 'archived', archived_at = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE subscription_plans SET status = 'archived', archived_at = $1, updated_at = $2 WHERE id = $3")
             .bind(&now).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
     }
     Ok(Json(serialize_plan(&load_plan(&state, auth.user_id, &public_id).await?)))
@@ -221,14 +221,14 @@ fn serialize_customer(c: &CustomerRow) -> Value {
 }
 
 async fn load_customer(state: &AppState, user_id: i64, public_id: &str) -> AppResult<CustomerRow> {
-    sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE user_id = ? AND public_id = ?"))
+    sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE user_id = $1 AND public_id = $2"))
         .bind(user_id).bind(public_id)
         .fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Subscription customer not found"))
 }
 
 async fn customer_external_id_taken(state: &AppState, user_id: i64, ext: &str, except: Option<i64>) -> AppResult<bool> {
-    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_customers WHERE user_id = ? AND external_id = ? AND id != ?")
+    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_customers WHERE user_id = $1 AND external_id = $2 AND id != $3")
         .bind(user_id).bind(ext).bind(except.unwrap_or(0))
         .fetch_optional(&state.db.pool).await?;
     Ok(found.is_some())
@@ -237,8 +237,8 @@ async fn customer_external_id_taken(state: &AppState, user_id: i64, ext: &str, e
 pub async fn customers_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(10).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_customers WHERE user_id = ?").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_customers WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let rows = sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_customer).collect::<Vec<_>>() })))
 }
@@ -253,7 +253,7 @@ pub async fn customers_store(auth: AuthMerchant, State(state): State<AppState>, 
     let now = now_iso();
     let public_id = format!("cus_{}", random_hex(16));
     sqlx::query(
-        "INSERT INTO subscription_customers (user_id, public_id, external_id, email, name, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO subscription_customers (user_id, public_id, external_id, email, name, metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(auth.user_id).bind(&public_id).bind(&external_id)
     .bind(opt_string(&body, "email")).bind(opt_string(&body, "name"))
@@ -272,7 +272,7 @@ pub async fn customers_update(auth: AuthMerchant, State(state): State<AppState>,
     let now = now_iso();
     macro_rules! set_str { ($k:expr, $col:expr) => {
         if let Some(v) = body.get($k).and_then(|v| v.as_str()) {
-            sqlx::query(&format!("UPDATE subscription_customers SET {} = ?, updated_at = ? WHERE id = ?", $col)).bind(v).bind(&now).bind(c.id).execute(&state.db.pool).await?;
+            sqlx::query(&format!("UPDATE subscription_customers SET {} = $1, updated_at = $2 WHERE id = $3", $col)).bind(v).bind(&now).bind(c.id).execute(&state.db.pool).await?;
         }
     }}
     set_str!("externalId", "external_id");
@@ -402,10 +402,10 @@ async fn serialize_cycle(state: &AppState, c: &CycleRow) -> AppResult<Value> {
 }
 
 async fn serialize_subscription(state: &AppState, s: &SubRow, with_cycles: bool) -> AppResult<Value> {
-    let plan = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE id = ?"))
+    let plan = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE id = $1"))
         .bind(s.subscription_plan_id).fetch_optional(&state.db.pool).await?;
     let customer = match s.subscription_customer_id {
-        Some(cid) => sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE id = ?"))
+        Some(cid) => sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE id = $1"))
             .bind(cid).fetch_optional(&state.db.pool).await?,
         None => None,
     };
@@ -432,7 +432,7 @@ async fn serialize_subscription(state: &AppState, s: &SubRow, with_cycles: bool)
     });
     if with_cycles {
         let cycles = sqlx::query_as::<_, CycleRow>(&format!(
-            "SELECT {CYCLE_COLS} FROM subscription_cycles WHERE subscription_id = ? ORDER BY period_start DESC LIMIT 20"
+            "SELECT {CYCLE_COLS} FROM subscription_cycles WHERE subscription_id = $1 ORDER BY period_start DESC LIMIT 20"
         )).bind(s.id).fetch_all(&state.db.pool).await?;
         let mut arr = Vec::new();
         for c in &cycles { arr.push(serialize_cycle(state, c).await?); }
@@ -442,7 +442,7 @@ async fn serialize_subscription(state: &AppState, s: &SubRow, with_cycles: bool)
 }
 
 async fn load_subscription(state: &AppState, user_id: i64, public_id: &str) -> AppResult<SubRow> {
-    sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE user_id = ? AND public_id = ?"))
+    sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE user_id = $1 AND public_id = $2"))
         .bind(user_id).bind(public_id)
         .fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Subscription not found"))
@@ -464,7 +464,7 @@ fn iso(dt: chrono::DateTime<chrono::Utc>) -> String {
 
 /// generateInvoiceForCycle.
 async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, is_retry: bool) -> AppResult<i64> {
-    let cycle = sqlx::query_as::<_, CycleRow>(&format!("SELECT {CYCLE_COLS} FROM subscription_cycles WHERE id = ?"))
+    let cycle = sqlx::query_as::<_, CycleRow>(&format!("SELECT {CYCLE_COLS} FROM subscription_cycles WHERE id = $1"))
         .bind(cycle_id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Subscription cycle not found"))?;
     if cycle.status == "paid" || cycle.status == "cancelled" {
@@ -476,7 +476,7 @@ async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, is_retry: b
     if is_retry && cycle.status != "past_due" {
         return Err(AppError::commerce(422, "Only past due subscription cycles can be retried"));
     }
-    let sub = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE id = ?"))
+    let sub = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE id = $1"))
         .bind(cycle.subscription_id).fetch_one(&state.db.pool).await?;
     let snap: Value = serde_json::from_str(&sub.plan_snapshot).unwrap_or(json!({}));
     let attempt = cycle.attempt_count + 1;
@@ -495,14 +495,14 @@ async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, is_retry: b
     let (invoice_id, _store) = invoices::create_for_merchant(state, sub.user_id, &body, None, Some(sub.id), Some(cycle.id)).await?;
 
     let now = now_iso();
-    sqlx::query("UPDATE subscription_cycles SET invoice_id = ?, status = 'invoiced', attempt_count = ?, invoiced_at = ?, past_due_at = NULL, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE subscription_cycles SET invoice_id = $1, status = 'invoiced', attempt_count = $2, invoiced_at = $3, past_due_at = NULL, updated_at = $4 WHERE id = $5")
         .bind(invoice_id).bind(attempt).bind(&now).bind(&now).bind(cycle.id).execute(&state.db.pool).await?;
     Ok(invoice_id)
 }
 
 /// generateDueInvoiceForSubscription.
 async fn generate_due_invoice(state: &AppState, sub_id: i64, now: chrono::DateTime<chrono::Utc>) -> AppResult<()> {
-    let sub = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE id = ?"))
+    let sub = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE id = $1"))
         .bind(sub_id).fetch_one(&state.db.pool).await?;
     let next = sub.next_billing_at.as_deref().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&chrono::Utc));
     let Some(next) = next else { return Ok(()); };
@@ -516,20 +516,20 @@ async fn generate_due_invoice(state: &AppState, sub_id: i64, now: chrono::DateTi
     let ps = iso(period_start);
     let pe = iso(period_end);
 
-    let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_cycles WHERE subscription_id = ? AND period_start = ?")
+    let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_cycles WHERE subscription_id = $1 AND period_start = $2")
         .bind(sub.id).bind(&ps).fetch_optional(&state.db.pool).await?;
     let cycle_id = match existing {
         Some(id) => id,
         None => {
             let now_s = now_iso();
             let public_id = format!("cycle_{}", random_hex(16));
-            let r = sqlx::query("INSERT INTO subscription_cycles (user_id, subscription_id, public_id, status, period_start, period_end, attempt_count, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?, 0, ?, ?)")
+            let r: i64 = sqlx::query_scalar::<_, i64>("INSERT INTO subscription_cycles (user_id, subscription_id, public_id, status, period_start, period_end, attempt_count, created_at, updated_at) VALUES ($1, $2, $3, 'pending', $4, $5, 0, $6, $7) RETURNING id")
                 .bind(sub.user_id).bind(sub.id).bind(&public_id).bind(&ps).bind(&pe).bind(&now_s).bind(&now_s)
-                .execute(&state.db.pool).await?;
-            r.last_insert_rowid()
+                .fetch_one(&state.db.pool).await?;
+            r
         }
     };
-    sqlx::query("UPDATE subscriptions SET current_period_start = ?, current_period_end = ?, next_billing_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE subscriptions SET current_period_start = $1, current_period_end = $2, next_billing_at = $3, updated_at = $4 WHERE id = $5")
         .bind(&ps).bind(&pe).bind(&pe).bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
     generate_invoice_for_cycle(state, cycle_id, false).await?;
     Ok(())
@@ -538,8 +538,8 @@ async fn generate_due_invoice(state: &AppState, sub_id: i64, now: chrono::DateTi
 pub async fn subs_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(10).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions WHERE user_id = ?").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let rows = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     let mut data = Vec::new();
     for s in &rows { data.push(serialize_subscription(&state, s, false).await?); }
@@ -560,7 +560,7 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
     };
     let external_id = opt_string(&body, "externalId");
     if let Some(ext) = &external_id {
-        let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM subscriptions WHERE user_id = ? AND external_id = ?").bind(auth.user_id).bind(ext).fetch_optional(&state.db.pool).await?;
+        let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM subscriptions WHERE user_id = $1 AND external_id = $2").bind(auth.user_id).bind(ext).fetch_optional(&state.db.pool).await?;
         if taken.is_some() { return Err(AppError::commerce(422, "External id has already been used")); }
     }
     let plan = load_plan(&state, auth.user_id, &plan_public).await?;
@@ -577,11 +577,11 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
     } else if let Some(ci) = cust_inline {
         let now = now_iso();
         let public_id = format!("cus_{}", random_hex(16));
-        let r = sqlx::query("INSERT INTO subscription_customers (user_id, public_id, external_id, email, name, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+        let r: i64 = sqlx::query_scalar::<_, i64>("INSERT INTO subscription_customers (user_id, public_id, external_id, email, name, metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id")
             .bind(auth.user_id).bind(&public_id).bind(opt_string(ci, "externalId")).bind(opt_string(ci, "email")).bind(opt_string(ci, "name"))
             .bind(ci.get("metadata").filter(|v| !v.is_null()).map(|m| m.to_string())).bind(&now).bind(&now)
-            .execute(&state.db.pool).await?;
-        r.last_insert_rowid()
+            .fetch_one(&state.db.pool).await?;
+        r
     } else {
         return Err(AppError::commerce(422, "A subscription customer is required"));
     };
@@ -601,11 +601,10 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
     });
     let now_s = now_iso();
     let public_id = format!("sub_{}", random_hex(16));
-    let r = sqlx::query("INSERT INTO subscriptions (user_id, subscription_plan_id, subscription_customer_id, public_id, external_id, status, payment_mode, plan_snapshot, next_billing_at, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)")
+    let sub_id: i64 = sqlx::query_scalar::<_, i64>("INSERT INTO subscriptions (user_id, subscription_plan_id, subscription_customer_id, public_id, external_id, status, payment_mode, plan_snapshot, next_billing_at, metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, $10, $11) RETURNING id")
         .bind(auth.user_id).bind(plan.id).bind(customer_id).bind(&public_id).bind(&external_id).bind(&payment_mode)
         .bind(snapshot.to_string()).bind(iso(starts_at)).bind(body.get("metadata").filter(|v| !v.is_null()).map(|m| m.to_string()))
-        .bind(&now_s).bind(&now_s).execute(&state.db.pool).await?;
-    let sub_id = r.last_insert_rowid();
+        .bind(&now_s).bind(&now_s).fetch_one(&state.db.pool).await?;
 
     if starts_at <= now {
         generate_due_invoice(&state, sub_id, now).await?;
@@ -623,7 +622,7 @@ pub async fn subs_show(auth: AuthMerchant, State(state): State<AppState>, Path(p
 async fn set_sub_status(state: &AppState, user_id: i64, public_id: &str, set: impl FnOnce(&SubRow) -> Result<(String, String), AppError>) -> AppResult<Json<Value>> {
     let sub = load_subscription(state, user_id, public_id).await?;
     let (sql_set, _) = set(&sub)?;
-    sqlx::query(&format!("UPDATE subscriptions SET {sql_set}, updated_at = ? WHERE id = ?"))
+    sqlx::query(&format!("UPDATE subscriptions SET {sql_set}, updated_at = $1 WHERE id = $2"))
         .bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
     let sub = load_subscription(state, user_id, public_id).await?;
     Ok(Json(serialize_subscription(state, &sub, true).await?))
@@ -647,7 +646,7 @@ pub async fn subs_resume(auth: AuthMerchant, State(state): State<AppState>, Path
 pub async fn subs_cancel(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
     let sub = load_subscription(&state, auth.user_id, &public_id).await?;
     if sub.status != "cancelled" {
-        sqlx::query("UPDATE subscriptions SET status = 'cancelled', cancelled_at = ?, next_billing_at = NULL, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE subscriptions SET status = 'cancelled', cancelled_at = $1, next_billing_at = NULL, updated_at = $2 WHERE id = $3")
             .bind(now_iso()).bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
     }
     let sub = load_subscription(&state, auth.user_id, &public_id).await?;
@@ -658,9 +657,9 @@ pub async fn subs_invoices(auth: AuthMerchant, State(state): State<AppState>, Pa
     let sub = load_subscription(&state, auth.user_id, &public_id).await?;
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(10).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE user_id = ? AND subscription_id = ?")
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE user_id = $1 AND subscription_id = $2")
         .bind(auth.user_id).bind(sub.id).fetch_one(&state.db.pool).await?;
-    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = ? AND subscription_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?")
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = $1 AND subscription_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4")
         .bind(auth.user_id).bind(sub.id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     let mut data = Vec::new();
     for id in ids {
@@ -673,7 +672,7 @@ pub async fn subs_invoices(auth: AuthMerchant, State(state): State<AppState>, Pa
 
 pub async fn subs_retry_invoice(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
     let sub = load_subscription(&state, auth.user_id, &public_id).await?;
-    let cycle_id: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_cycles WHERE subscription_id = ? AND status = 'past_due' ORDER BY period_start DESC LIMIT 1")
+    let cycle_id: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_cycles WHERE subscription_id = $1 AND status = 'past_due' ORDER BY period_start DESC LIMIT 1")
         .bind(sub.id).fetch_optional(&state.db.pool).await?;
     let Some(cycle_id) = cycle_id else {
         return Err(AppError::commerce(422, "Subscription does not have a past due cycle to retry"));

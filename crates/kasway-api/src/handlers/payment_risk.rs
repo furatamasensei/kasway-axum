@@ -67,7 +67,7 @@ const HIT_COLS: &str = "id, user_id, rule_key, rule_version, severity, status, o
 async fn review_events(state: &AppState, hit_id: i64) -> AppResult<Vec<Value>> {
     let rows = sqlx::query_as::<_, (i64, i64, i64, Option<i64>, String, String, String, Option<String>, Option<String>, String, Option<String>, Option<String>)>(
         "SELECT id, risk_rule_hit_id, user_id, reviewer_user_id, action, previous_status, next_status, reason, note, metadata, created_at, updated_at \
-         FROM payment_risk_review_events WHERE risk_rule_hit_id = ? ORDER BY created_at ASC",
+         FROM payment_risk_review_events WHERE risk_rule_hit_id = $1 ORDER BY created_at ASC",
     ).bind(hit_id).fetch_all(&state.db.pool).await?;
     Ok(rows.into_iter().map(|(id, hit, uid, rev, action, prev, next, reason, note, meta, c, u)| json!({
         "id": id, "riskRuleHitId": hit, "userId": uid, "reviewerUserId": rev, "action": action,
@@ -102,7 +102,7 @@ async fn serialize_hit(state: &AppState, h: &HitRow) -> AppResult<Value> {
 }
 
 async fn load_hit(state: &AppState, user_id: i64, id: i64) -> AppResult<HitRow> {
-    sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE user_id = ? AND id = ?"))
+    sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE user_id = $1 AND id = $2"))
         .bind(user_id).bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Payment risk rule hit not found"))
 }
@@ -116,11 +116,13 @@ pub async fn catalog(_auth: AuthMerchant) -> Json<Value> {
 pub async fn index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<RiskQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
-    let mut filter = String::from("user_id = ?");
-    if q.rule_key.is_some() { filter.push_str(" AND rule_key = ?"); }
-    if q.status.is_some() { filter.push_str(" AND status = ?"); }
-    if q.severity.is_some() { filter.push_str(" AND severity = ?"); }
-    if q.resource_type.is_some() { filter.push_str(" AND resource_type = ?"); }
+    let mut n = 1;
+    let mut filter = format!("user_id = ${n}"); n += 1;
+    if q.rule_key.is_some() { filter.push_str(&format!(" AND rule_key = ${n}")); n += 1; }
+    if q.status.is_some() { filter.push_str(&format!(" AND status = ${n}")); n += 1; }
+    if q.severity.is_some() { filter.push_str(&format!(" AND severity = ${n}")); n += 1; }
+    if q.resource_type.is_some() { filter.push_str(&format!(" AND resource_type = ${n}")); n += 1; }
+    let _ = n;
 
     let count_sql = format!("SELECT COUNT(*) FROM payment_risk_rule_hits WHERE {filter}");
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(auth.user_id);
@@ -159,10 +161,10 @@ async fn review(auth_id: i64, state: &AppState, id: i64, action: &str, body: &Va
     let note = body.get("note").and_then(|v| v.as_str());
     let metadata = body.get("metadata").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
     let now = now_iso();
-    sqlx::query("UPDATE payment_risk_rule_hits SET status = ?, updated_at = ? WHERE id = ?").bind(&next).bind(&now).bind(hit.id).execute(&state.db.pool).await?;
+    sqlx::query("UPDATE payment_risk_rule_hits SET status = $1, updated_at = $2 WHERE id = $3").bind(&next).bind(&now).bind(hit.id).execute(&state.db.pool).await?;
     sqlx::query(
         "INSERT INTO payment_risk_review_events (risk_rule_hit_id, user_id, reviewer_user_id, action, previous_status, next_status, reason, note, metadata, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(hit.id).bind(hit.user_id).bind(auth_id).bind(action).bind(&hit.status).bind(&next).bind(reason).bind(note).bind(metadata.to_string()).bind(&now).bind(&now)
     .execute(&state.db.pool).await?;
@@ -182,7 +184,7 @@ pub async fn note(auth: AuthMerchant, State(state): State<AppState>, Path(id): P
 
 /// `GET /api/payments/ops/risk/report`
 pub async fn report(auth: AuthMerchant, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let hits = sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE user_id = ? ORDER BY detected_at DESC"))
+    let hits = sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE user_id = $1 ORDER BY detected_at DESC"))
         .bind(auth.user_id).fetch_all(&state.db.pool).await?;
 
     let count_by = |f: &dyn Fn(&HitRow) -> String| -> Value {
@@ -281,7 +283,7 @@ async fn record_hit(state: &AppState, h: &PendingHit, now_iso_str: &str) -> AppR
         h.input_snapshot["__userId"].as_i64().unwrap_or(0),
         h.rule_key, h.resource_type, h.resource_id, h.window_start, h.window_end
     ).as_bytes());
-    if let Some(existing) = sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE dedupe_key = ?"))
+    if let Some(existing) = sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE dedupe_key = $1"))
         .bind(&dedupe).fetch_optional(&state.db.pool).await?
     {
         return Ok(existing);
@@ -289,18 +291,18 @@ async fn record_hit(state: &AppState, h: &PendingHit, now_iso_str: &str) -> AppR
     let user_id = h.input_snapshot["__userId"].as_i64().unwrap_or(0);
     let mut snapshot = h.input_snapshot.clone();
     if let Value::Object(o) = &mut snapshot { o.remove("__userId"); }
-    let id = sqlx::query(
+    let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_risk_rule_hits (user_id, rule_key, rule_version, severity, status, outcome, \
          resource_type, resource_id, reason, input_snapshot, thresholds, dedupe_key, evaluator_version, \
          detected_at, window_start, window_end, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'open', 'observed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, 'open', 'observed', $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id",
     )
     .bind(user_id).bind(h.rule_key).bind(RULE_VERSION).bind(&h.severity).bind(h.resource_type)
     .bind(&h.resource_id).bind(h.reason).bind(snapshot.to_string()).bind(h.thresholds.to_string())
     .bind(&dedupe).bind(EVALUATOR_VERSION).bind(now_iso_str).bind(&h.window_start).bind(&h.window_end)
     .bind(now_iso_str).bind(now_iso_str)
-    .execute(&state.db.pool).await?.last_insert_rowid();
-    sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE id = ?"))
+    .fetch_one(&state.db.pool).await?;
+    sqlx::query_as::<_, HitRow>(&format!("SELECT {HIT_COLS} FROM payment_risk_rule_hits WHERE id = $1"))
         .bind(id).fetch_one(&state.db.pool).await.map_err(Into::into)
 }
 
@@ -319,7 +321,7 @@ pub async fn evaluate(auth: AuthMerchant, State(state): State<AppState>) -> AppR
     let hi = sqlx::query_as::<_, (i64, String, String, i64, Option<String>)>(
         "SELECT i.id, i.public_id, i.status, i.total_amount, i.payment_network FROM invoices i \
          JOIN kpr1_payment_intents k ON k.invoice_id = i.id \
-         WHERE i.user_id = ? AND i.created_at BETWEEN ? AND ? AND i.total_amount >= ?",
+         WHERE i.user_id = $1 AND i.created_at BETWEEN $2 AND $3 AND i.total_amount >= $4",
     ).bind(uid).bind(&week_start).bind(&week_end).bind(HIGH_VALUE_INVOICE_THRESHOLD)
     .fetch_all(&state.db.pool).await?;
     for (id, public_id, status, total, network) in hi {
@@ -335,8 +337,8 @@ pub async fn evaluate(auth: AuthMerchant, State(state): State<AppState>) -> AppR
     // 2. repeated failed wallet submissions per KPR-1 invoice (week)
     let failed = sqlx::query_as::<_, (i64, String, i64)>(
         "SELECT i.id, i.public_id, COUNT(*) AS c FROM payments p JOIN invoices i ON i.id = p.invoice_id \
-         WHERE i.user_id = ? AND p.status = 'failed' AND i.payment_address LIKE 'kpr1:%' \
-         AND p.updated_at BETWEEN ? AND ? GROUP BY i.id, i.public_id HAVING COUNT(*) >= ?",
+         WHERE i.user_id = $1 AND p.status = 'failed' AND i.payment_address LIKE 'kpr1:%' \
+         AND p.updated_at BETWEEN $2 AND $3 GROUP BY i.id, i.public_id HAVING COUNT(*) >= $4",
     ).bind(uid).bind(&week_start).bind(&week_end).bind(FAILED_WALLET_SUBMISSION_THRESHOLD)
     .fetch_all(&state.db.pool).await?;
     for (id, public_id, count) in failed {
@@ -353,7 +355,7 @@ pub async fn evaluate(auth: AuthMerchant, State(state): State<AppState>) -> AppR
 
     // 3. payout address recent change
     let setup = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT kaspa_main_address, updated_at FROM setups WHERE user_id = ?",
+        "SELECT kaspa_main_address, updated_at FROM setups WHERE user_id = $1",
     ).bind(uid).fetch_optional(&state.db.pool).await?;
     if let Some((Some(addr), setup_updated)) = setup {
         let current = addr.trim().to_string();
@@ -361,7 +363,7 @@ pub async fn evaluate(auth: AuthMerchant, State(state): State<AppState>) -> AppR
             if let Some(setup_upd) = setup_updated.as_deref().and_then(parse_dt) {
                 let intents = sqlx::query_as::<_, (i64, i64, String, String, Option<String>)>(
                     "SELECT id, invoice_id, status, merchant_address, created_at FROM kpr1_payment_intents \
-                     WHERE user_id = ? AND status IN ('submitted','observed','verified','settled') AND created_at BETWEEN ? AND ?",
+                     WHERE user_id = $1 AND status IN ('submitted','observed','verified','settled') AND created_at BETWEEN $2 AND $3",
                 ).bind(uid).bind(&week_start).bind(&week_end).fetch_all(&state.db.pool).await?;
                 for (id, invoice_id, status, merchant_addr, created) in intents {
                     let Some(created_dt) = created.as_deref().and_then(parse_dt) else { continue };
@@ -386,7 +388,7 @@ pub async fn evaluate(auth: AuthMerchant, State(state): State<AppState>) -> AppR
 
     // 4. repeated client fingerprints (day)
     let fp_intents = sqlx::query_as::<_, (i64, Option<String>)>(
-        "SELECT id, metadata FROM kpr1_payment_intents WHERE user_id = ? AND updated_at BETWEEN ? AND ?",
+        "SELECT id, metadata FROM kpr1_payment_intents WHERE user_id = $1 AND updated_at BETWEEN $2 AND $3",
     ).bind(uid).bind(&day_start).bind(&day_end).fetch_all(&state.db.pool).await?;
     let mut by_fp: std::collections::BTreeMap<String, Vec<i64>> = std::collections::BTreeMap::new();
     for (id, metadata) in fp_intents {

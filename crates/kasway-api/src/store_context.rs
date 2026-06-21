@@ -14,7 +14,7 @@ pub async fn resolve_request_store(
     match store_id {
         Some(id) => {
             let found: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM stores WHERE user_id = ? AND id = ?")
+                sqlx::query_scalar("SELECT id FROM stores WHERE user_id = $1 AND id = $2")
                     .bind(user_id)
                     .bind(id)
                     .fetch_optional(&state.db.pool)
@@ -32,7 +32,7 @@ pub async fn resolve_owned_store(
     id: i64,
 ) -> AppResult<(i64, bool)> {
     let row: Option<(i64, i64)> =
-        sqlx::query_as("SELECT id, is_default FROM stores WHERE user_id = ? AND id = ?")
+        sqlx::query_as("SELECT id, is_default FROM stores WHERE user_id = $1 AND id = $2")
             .bind(user_id)
             .bind(id)
             .fetch_optional(&state.db.pool)
@@ -45,7 +45,7 @@ pub async fn resolve_owned_store(
 /// active/grace entitlement is required on an active store.
 pub async fn assert_can_create_new_payments(state: &AppState, store_id: i64) -> AppResult<()> {
     let row: Option<(i64, String)> =
-        sqlx::query_as("SELECT is_included, status FROM stores WHERE id = ?")
+        sqlx::query_as("SELECT is_included, status FROM stores WHERE id = $1")
             .bind(store_id)
             .fetch_optional(&state.db.pool)
             .await?;
@@ -56,7 +56,7 @@ pub async fn assert_can_create_new_payments(state: &AppState, store_id: i64) -> 
         return Ok(());
     }
     let entitlement: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM store_entitlements WHERE store_id = ? AND status IN ('active','grace') LIMIT 1",
+        "SELECT status FROM store_entitlements WHERE store_id = $1 AND status IN ('active','grace') LIMIT 1",
     )
     .bind(store_id)
     .fetch_optional(&state.db.pool)
@@ -71,7 +71,7 @@ pub async fn assert_can_create_new_payments(state: &AppState, store_id: i64) -> 
 /// `ensureDefaultStore(user)` -> default store id (created if absent).
 pub async fn ensure_default_store(state: &AppState, user_id: i64) -> AppResult<i64> {
     let existing: Vec<i64> =
-        sqlx::query_scalar("SELECT id FROM stores WHERE user_id = ? AND is_default = 1")
+        sqlx::query_scalar("SELECT id FROM stores WHERE user_id = $1 AND is_default = 1")
             .bind(user_id)
             .fetch_all(&state.db.pool)
             .await?;
@@ -85,24 +85,23 @@ pub async fn ensure_default_store(state: &AppState, user_id: i64) -> AppResult<i
 
     let now = now_iso();
     let public_id = format!("store_{user_id}_default");
-    let res = sqlx::query(
+    let store_id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO stores \
          (user_id, public_id, name, slug, status, is_included, is_default, metadata, created_at, updated_at) \
-         VALUES (?, ?, 'Default store', 'default', 'active', 1, 1, ?, ?, ?)",
+         VALUES ($1, $2, 'Default store', 'default', 'active', 1, 1, $3, $4, $5) RETURNING id",
     )
     .bind(user_id)
     .bind(&public_id)
     .bind(r#"{"backfilled":false,"lazyCreated":true}"#)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-    let store_id = res.last_insert_rowid();
 
     sqlx::query(
         "INSERT INTO store_entitlements \
          (user_id, store_id, status, source, price_cents, currency, metadata, created_at, updated_at) \
-         VALUES (?, ?, 'active', 'included', 0, 'USD', ?, ?, ?)",
+         VALUES ($1, $2, 'active', 'included', 0, 'USD', $3, $4, $5)",
     )
     .bind(user_id)
     .bind(store_id)

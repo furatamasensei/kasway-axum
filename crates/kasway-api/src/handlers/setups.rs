@@ -234,7 +234,7 @@ async fn find_setup(
     store_is_default: bool,
 ) -> AppResult<Option<SetupRow>> {
     let row = sqlx::query_as::<_, SetupRow>(&format!(
-        "SELECT {SETUP_COLS} FROM setups WHERE user_id = ? AND store_id = ?"
+        "SELECT {SETUP_COLS} FROM setups WHERE user_id = $1 AND store_id = $2"
     ))
     .bind(user_id)
     .bind(store_id)
@@ -248,13 +248,13 @@ async fn find_setup(
     }
     // adopt a legacy (store_id IS NULL) setup onto the default store
     let legacy = sqlx::query_as::<_, SetupRow>(&format!(
-        "SELECT {SETUP_COLS} FROM setups WHERE user_id = ? AND store_id IS NULL ORDER BY id ASC"
+        "SELECT {SETUP_COLS} FROM setups WHERE user_id = $1 AND store_id IS NULL ORDER BY id ASC"
     ))
     .bind(user_id)
     .fetch_optional(&state.db.pool)
     .await?;
     if let Some(mut row) = legacy {
-        sqlx::query("UPDATE setups SET store_id = ? WHERE id = ?")
+        sqlx::query("UPDATE setups SET store_id = $1 WHERE id = $2")
             .bind(store_id)
             .bind(row.id)
             .execute(&state.db.pool)
@@ -281,9 +281,9 @@ async fn upsert_kaspa_setup(
 
     if let Some(row) = existing {
         sqlx::query(
-            "UPDATE setups SET kaspa_main_address = ?, kaspa_tax_enabled = ?, kaspa_tax_address = ?, \
-             kaspa_tax_percentage = ?, kaspa_split_enabled = ?, kaspa_split_addresses = ?, \
-             redirect_url = ?, webhook_url = ?, updated_at = ? WHERE id = ?",
+            "UPDATE setups SET kaspa_main_address = $1, kaspa_tax_enabled = $2, kaspa_tax_address = $3, \
+             kaspa_tax_percentage = $4, kaspa_split_enabled = $5, kaspa_split_addresses = $6, \
+             redirect_url = $7, webhook_url = $8, updated_at = $9 WHERE id = $10",
         )
         .bind(&kaspa.main_address)
         .bind(kaspa.tax_enabled as i64)
@@ -302,7 +302,7 @@ async fn upsert_kaspa_setup(
             "INSERT INTO setups (user_id, store_id, tos_agreed, kaspa_main_address, kaspa_tax_enabled, \
              kaspa_tax_address, kaspa_tax_percentage, kaspa_split_enabled, kaspa_split_addresses, \
              redirect_url, webhook_url, created_at, updated_at) \
-             VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(user_id)
         .bind(store_id)
@@ -320,7 +320,7 @@ async fn upsert_kaspa_setup(
         .await?;
     }
 
-    sqlx::query("UPDATE users SET onboarded = 1 WHERE id = ?")
+    sqlx::query("UPDATE users SET onboarded = 1 WHERE id = $1")
         .bind(user_id)
         .execute(&state.db.pool)
         .await?;
@@ -484,8 +484,8 @@ async fn update_setup_for_store(
 
         let tax_pct = if tax_enabled { tax_percentage.map(fmt_pct) } else { None };
         sqlx::query(
-            "UPDATE setups SET kaspa_main_address = ?, kaspa_tax_enabled = ?, kaspa_tax_address = ?, \
-             kaspa_tax_percentage = ?, kaspa_split_enabled = ?, kaspa_split_addresses = ?, updated_at = ? WHERE id = ?",
+            "UPDATE setups SET kaspa_main_address = $1, kaspa_tax_enabled = $2, kaspa_tax_address = $3, \
+             kaspa_tax_percentage = $4, kaspa_split_enabled = $5, kaspa_split_addresses = $6, updated_at = $7 WHERE id = $8",
         )
         .bind(&main_address)
         .bind(tax_enabled as i64)
@@ -500,11 +500,11 @@ async fn update_setup_for_store(
     }
 
     if let Some(r) = body.get("redirectUrl").and_then(|v| v.as_str()) {
-        sqlx::query("UPDATE setups SET redirect_url = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE setups SET redirect_url = $1, updated_at = $2 WHERE id = $3")
             .bind(r).bind(&now).bind(setup.id).execute(&state.db.pool).await?;
     }
     if let Some(w) = body.get("webhookUrl").and_then(|v| v.as_str()) {
-        sqlx::query("UPDATE setups SET webhook_url = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE setups SET webhook_url = $1, updated_at = $2 WHERE id = $3")
             .bind(w).bind(&now).bind(setup.id).execute(&state.db.pool).await?;
     }
 
@@ -607,12 +607,12 @@ async fn upsert_full_setup(state: &AppState, t: &SetupRow, existing_id: Option<i
     let b = |o: Option<bool>| o.unwrap_or(false) as i64;
     if let Some(id) = existing_id {
         sqlx::query(
-            "UPDATE setups SET kaspa_main_address=?, kaspa_tax_enabled=?, kaspa_tax_address=?, \
-             kaspa_tax_percentage=?, kaspa_split_enabled=?, kaspa_split_addresses=?, \
-             igra_main_address=?, igra_tax_enabled=?, igra_tax_address=?, igra_tax_percentage=?, \
-             igra_split_enabled=?, igra_split_addresses=?, kasplex_main_address=?, kasplex_tax_enabled=?, \
-             kasplex_tax_address=?, kasplex_tax_percentage=?, kasplex_split_enabled=?, kasplex_split_addresses=?, \
-             redirect_url=?, webhook_url=?, updated_at=? WHERE id=?",
+            "UPDATE setups SET kaspa_main_address=$1, kaspa_tax_enabled=$2, kaspa_tax_address=$3, \
+             kaspa_tax_percentage=$4, kaspa_split_enabled=$5, kaspa_split_addresses=$6, \
+             igra_main_address=$7, igra_tax_enabled=$8, igra_tax_address=$9, igra_tax_percentage=$10, \
+             igra_split_enabled=$11, igra_split_addresses=$12, kasplex_main_address=$13, kasplex_tax_enabled=$14, \
+             kasplex_tax_address=$15, kasplex_tax_percentage=$16, kasplex_split_enabled=$17, kasplex_split_addresses=$18, \
+             redirect_url=$19, webhook_url=$20, updated_at=$21 WHERE id=$22",
         )
         .bind(&t.kaspa_main_address).bind(b(t.kaspa_tax_enabled)).bind(&t.kaspa_tax_address)
         .bind(&t.kaspa_tax_percentage).bind(b(t.kaspa_split_enabled)).bind(&t.kaspa_split_addresses)
@@ -628,7 +628,7 @@ async fn upsert_full_setup(state: &AppState, t: &SetupRow, existing_id: Option<i
              igra_main_address, igra_tax_enabled, igra_tax_address, igra_tax_percentage, igra_split_enabled, \
              igra_split_addresses, kasplex_main_address, kasplex_tax_enabled, kasplex_tax_address, \
              kasplex_tax_percentage, kasplex_split_enabled, kasplex_split_addresses, redirect_url, webhook_url, \
-             created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             created_at, updated_at) VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
         )
         .bind(t.user_id).bind(t.store_id)
         .bind(&t.kaspa_main_address).bind(b(t.kaspa_tax_enabled)).bind(&t.kaspa_tax_address)

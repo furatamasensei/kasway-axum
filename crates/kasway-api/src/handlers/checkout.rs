@@ -30,13 +30,13 @@ pub async fn submit_kpr1_payment(
     Json(body): Json<Value>,
 ) -> AppResult<Response> {
     let invoice = sqlx::query_as::<_, (i64, Option<i64>, String)>(
-        "SELECT id, store_id, status FROM invoices WHERE public_id = ?",
+        "SELECT id, store_id, status FROM invoices WHERE public_id = $1",
     ).bind(&public_id).fetch_optional(&state.db.pool).await?;
     let Some((inv_id, store_id, inv_status)) = invoice else {
         return Ok(kpr1_err("KPR1_INTENT_NOT_FOUND", "KPR-1 payment intent not found", None));
     };
     let intent = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, Option<String>)>(
-        "SELECT id, status, tx_id, expires_at, metadata FROM kpr1_payment_intents WHERE invoice_id = ?",
+        "SELECT id, status, tx_id, expires_at, metadata FROM kpr1_payment_intents WHERE invoice_id = $1",
     ).bind(inv_id).fetch_optional(&state.db.pool).await?;
     let Some((intent_id, status, current_tx, expires_at, metadata)) = intent else {
         return Ok(kpr1_err("KPR1_INTENT_NOT_FOUND", "KPR-1 payment intent not found", None));
@@ -52,7 +52,7 @@ pub async fn submit_kpr1_payment(
     }
     if let Some(exp) = expires_at.as_deref().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
         if exp.with_timezone(&chrono::Utc) <= chrono::Utc::now() {
-            sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = ?").bind(intent_id).execute(&state.db.pool).await?;
+            sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = $1").bind(intent_id).execute(&state.db.pool).await?;
             return Ok(kpr1_err("KPR1_INTENT_EXPIRED", "KPR-1 payment intent has expired", None));
         }
     }
@@ -85,7 +85,7 @@ pub async fn submit_kpr1_payment(
         m.insert("walletSubmission".into(), body.get("metadata").cloned().unwrap_or(json!({})));
     }
     let now = now_iso();
-    sqlx::query("UPDATE kpr1_payment_intents SET status = 'submitted', tx_id = ?, submitted_at = COALESCE(submitted_at, ?), metadata = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE kpr1_payment_intents SET status = 'submitted', tx_id = $1, submitted_at = COALESCE(submitted_at, $2), metadata = $3, updated_at = $4 WHERE id = $5")
         .bind(&tx_id).bind(&now).bind(meta.to_string()).bind(&now).bind(intent_id)
         .execute(&state.db.pool).await?;
 

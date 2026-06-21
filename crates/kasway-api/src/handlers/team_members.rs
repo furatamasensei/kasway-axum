@@ -26,7 +26,7 @@ const PAYMENT_OPERATION_PERMISSIONS: &[&str] = &[
 ];
 
 async fn load_member(state: &AppState, id: i64) -> AppResult<TeamMemberRow> {
-    sqlx::query_as::<_, TeamMemberRow>(&format!("SELECT {MEMBER_COLS} FROM team_members WHERE id = ?"))
+    sqlx::query_as::<_, TeamMemberRow>(&format!("SELECT {MEMBER_COLS} FROM team_members WHERE id = $1"))
         .bind(id)
         .fetch_optional(&state.db.pool)
         .await?
@@ -51,7 +51,7 @@ pub async fn destroy(
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
     let m = load_owned(&state, auth.user_id, id).await?;
-    sqlx::query("DELETE FROM team_members WHERE id = ?").bind(m.id).execute(&state.db.pool).await?;
+    sqlx::query("DELETE FROM team_members WHERE id = $1").bind(m.id).execute(&state.db.pool).await?;
     Ok(Json(json!({ "success": true })))
 }
 
@@ -105,7 +105,7 @@ pub async fn update_payment_permissions(
     let normalized: Vec<String> = perms.into_iter().filter(|p| seen.insert(p.clone())).collect();
     let json_str = serde_json::to_string(&normalized).unwrap();
 
-    sqlx::query("UPDATE team_members SET payment_permissions = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE team_members SET payment_permissions = $1, updated_at = $2 WHERE id = $3")
         .bind(&json_str)
         .bind(now_iso())
         .bind(m.id)
@@ -122,7 +122,7 @@ async fn set_member_status(
     status: &str,
 ) -> AppResult<Json<Value>> {
     let m = load_owned(state, user_id, id).await?;
-    sqlx::query("UPDATE team_members SET status = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE team_members SET status = $1, updated_at = $2 WHERE id = $3")
         .bind(status)
         .bind(now_iso())
         .bind(m.id)
@@ -160,7 +160,7 @@ pub async fn promote(
 
     // current manager (firstOrFail -> 404 when none)
     let current_manager: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM team_members WHERE team_id = ? AND role = 'manager' LIMIT 1",
+        "SELECT id FROM team_members WHERE team_id = $1 AND role = 'manager' LIMIT 1",
     )
     .bind(m.team_id)
     .fetch_optional(&state.db.pool)
@@ -170,9 +170,9 @@ pub async fn promote(
     };
 
     let now = now_iso();
-    sqlx::query("UPDATE team_members SET role = 'staff', updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE team_members SET role = 'staff', updated_at = $1 WHERE id = $2")
         .bind(&now).bind(manager_id).execute(&state.db.pool).await?;
-    sqlx::query("UPDATE team_members SET role = 'manager', updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE team_members SET role = 'manager', updated_at = $1 WHERE id = $2")
         .bind(&now).bind(m.id).execute(&state.db.pool).await?;
 
     let m = load_member(&state, id).await?;
@@ -197,7 +197,7 @@ pub async fn set_online(
     auth: AuthClient,
     State(state): State<AppState>,
 ) -> AppResult<impl IntoResponse> {
-    sqlx::query("UPDATE team_members SET is_online = 1, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE team_members SET is_online = 1, updated_at = $1 WHERE id = $2")
         .bind(now_iso())
         .bind(auth.member_id)
         .execute(&state.db.pool)
@@ -211,7 +211,7 @@ pub async fn set_offline(
     auth: AuthClient,
     State(state): State<AppState>,
 ) -> AppResult<impl IntoResponse> {
-    sqlx::query("UPDATE team_members SET is_online = 0, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE team_members SET is_online = 0, updated_at = $1 WHERE id = $2")
         .bind(now_iso())
         .bind(auth.member_id)
         .execute(&state.db.pool)
@@ -227,11 +227,11 @@ pub async fn update_profile(
 ) -> AppResult<Json<Value>> {
     let now = now_iso();
     if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
-        sqlx::query("UPDATE team_members SET name = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE team_members SET name = $1, updated_at = $2 WHERE id = $3")
             .bind(name).bind(&now).bind(auth.member_id).execute(&state.db.pool).await?;
     }
     if let Some(avatar) = body.get("avatarUrl").and_then(|v| v.as_str()) {
-        sqlx::query("UPDATE team_members SET avatar_url = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE team_members SET avatar_url = $1, updated_at = $2 WHERE id = $3")
             .bind(avatar).bind(&now).bind(auth.member_id).execute(&state.db.pool).await?;
     }
     let m = load_member(&state, auth.member_id).await?;

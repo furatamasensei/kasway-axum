@@ -295,14 +295,14 @@ pub(crate) async fn load_relations(
     let items = sqlx::query_as::<_, ItemRow>(&format!(
         "SELECT id, invoice_id, name, quantity, unit_amount, total_amount, pricing_country_code, \
          pricing_currency, pricing_source, metadata, created_at, updated_at \
-         FROM invoice_items WHERE invoice_id = ? ORDER BY id ASC"
+         FROM invoice_items WHERE invoice_id = $1 ORDER BY id ASC"
     ))
     .bind(invoice_id)
     .fetch_all(&state.db.pool)
     .await?;
 
     let intent = sqlx::query_as::<_, IntentRow>(&format!(
-        "SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE invoice_id = ?"
+        "SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE invoice_id = $1"
     ))
     .bind(invoice_id)
     .fetch_optional(&state.db.pool)
@@ -318,7 +318,7 @@ pub(crate) async fn expire_if_needed(state: &AppState, inv: &mut InvoiceRow) -> 
             if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(exp) {
                 if exp_dt <= chrono::Utc::now() {
                     inv.status = "expired".to_string();
-                    sqlx::query("UPDATE invoices SET status = 'expired' WHERE id = ?")
+                    sqlx::query("UPDATE invoices SET status = 'expired' WHERE id = $1")
                         .bind(inv.id)
                         .execute(&state.db.pool)
                         .await?;
@@ -336,7 +336,7 @@ pub(crate) async fn load_owned_invoice(
     id: i64,
 ) -> AppResult<InvoiceRow> {
     sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE user_id = ? AND store_id = ? AND id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE user_id = $1 AND store_id = $2 AND id = $3"
     ))
     .bind(user_id)
     .bind(store_id)
@@ -362,7 +362,7 @@ pub(crate) fn serialize_kpr1_contract(
 /// Load an invoice by public_id (no user scope) — checkout getByPublicId.
 pub(crate) async fn load_by_public_id(state: &AppState, public_id: &str) -> AppResult<InvoiceRow> {
     sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE public_id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE public_id = $1"
     ))
     .bind(public_id)
     .fetch_optional(&state.db.pool)
@@ -378,7 +378,7 @@ pub(crate) async fn load_owned_by_public_id(
     public_id: &str,
 ) -> AppResult<InvoiceRow> {
     sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE user_id = ? AND store_id = ? AND public_id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE user_id = $1 AND store_id = $2 AND public_id = $3"
     ))
     .bind(user_id)
     .bind(store_id)
@@ -419,14 +419,14 @@ pub(crate) async fn derive_payment_status(state: &AppState, inv: &InvoiceRow) ->
     let required_confirmations: i64 = 10;
     let invoice_total = inv.total_amount as i128;
 
-    let credits: Vec<i64> = sqlx::query_scalar("SELECT amount FROM payment_credits WHERE invoice_id = ?")
+    let credits: Vec<i64> = sqlx::query_scalar("SELECT amount FROM payment_credits WHERE invoice_id = $1")
         .bind(inv.id)
         .fetch_all(&state.db.pool)
         .await?;
     let applied_credit_total: i128 = credits.iter().map(|a| *a as i128).sum();
 
     let payments = sqlx::query_as::<_, (String, i64, Option<String>)>(
-        "SELECT status, amount, metadata FROM payments WHERE invoice_id = ? ORDER BY id DESC",
+        "SELECT status, amount, metadata FROM payments WHERE invoice_id = $1 ORDER BY id DESC",
     )
     .bind(inv.id)
     .fetch_all(&state.db.pool)
@@ -449,7 +449,7 @@ pub(crate) async fn derive_payment_status(state: &AppState, inv: &InvoiceRow) ->
 
     let observations = sqlx::query_as::<_, (String, i64, i64, Option<String>, Option<String>)>(
         "SELECT status, amount, confirmations, accepted_at, created_at FROM payment_observations \
-         WHERE invoice_id = ? ORDER BY id DESC",
+         WHERE invoice_id = $1 ORDER BY id DESC",
     )
     .bind(inv.id)
     .fetch_all(&state.db.pool)
@@ -575,7 +575,7 @@ pub(crate) async fn derive_payment_status_by_id(state: &AppState, id: i64) -> Ap
 /// Load an invoice by id (no scoping) — used after a public link spawn.
 pub(crate) async fn load_by_id(state: &AppState, id: i64) -> AppResult<InvoiceRow> {
     sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE id = $1"
     ))
     .bind(id)
     .fetch_optional(&state.db.pool)
@@ -589,7 +589,7 @@ pub(crate) async fn find_by_public_id(
     public_id: &str,
 ) -> AppResult<Option<InvoiceRow>> {
     Ok(sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE public_id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE public_id = $1"
     ))
     .bind(public_id)
     .fetch_optional(&state.db.pool)
@@ -627,7 +627,7 @@ pub(crate) async fn fetch_kpr1_intent(state: &AppState, public_id: &str) -> AppR
         .map(|dt| dt <= chrono::Utc::now())
         .unwrap_or(false);
     if expired {
-        sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = ?")
+        sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = $1")
             .bind(intent.id)
             .execute(&state.db.pool)
             .await?;
@@ -636,7 +636,7 @@ pub(crate) async fn fetch_kpr1_intent(state: &AppState, public_id: &str) -> AppR
 
     if intent.status == "created" {
         let now = now_iso();
-        sqlx::query("UPDATE kpr1_payment_intents SET status = 'fetched', fetched_at = ? WHERE id = ?")
+        sqlx::query("UPDATE kpr1_payment_intents SET status = 'fetched', fetched_at = $1 WHERE id = $2")
             .bind(&now)
             .bind(intent.id)
             .execute(&state.db.pool)
@@ -659,9 +659,9 @@ pub async fn index(
     let payment_link_only = q.source.as_deref() == Some("payment_link");
 
     let filter = if payment_link_only {
-        "user_id = ? AND store_id = ? AND payment_link_id IS NOT NULL"
+        "user_id = $1 AND store_id = $2 AND payment_link_id IS NOT NULL"
     } else {
-        "user_id = ? AND store_id = ?"
+        "user_id = $1 AND store_id = $2"
     };
 
     let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM invoices WHERE {filter}"))
@@ -671,7 +671,7 @@ pub async fn index(
         .await?;
 
     let invoices = sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE {filter} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE {filter} ORDER BY created_at DESC LIMIT $3 OFFSET $4"
     ))
     .bind(auth.user_id)
     .bind(store_id)
@@ -869,7 +869,7 @@ pub(crate) async fn create_for_merchant(
     // externalId uniqueness (user-scoped)
     if let Some(ext) = &input.external_id {
         let existing: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = ? AND external_id = ?")
+            sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = $1 AND external_id = $2")
                 .bind(user_id)
                 .bind(ext)
                 .fetch_optional(&state.db.pool)
@@ -904,12 +904,12 @@ pub(crate) async fn create_for_merchant(
     let now = now_iso();
     let metadata_str = input.metadata.as_ref().map(|m| m.to_string());
 
-    let result = sqlx::query(
+    let invoice_id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO invoices \
          (user_id, store_id, public_id, external_id, payment_link_id, subscription_id, subscription_cycle_id, status, payment_address, payment_network, \
           payment_asset, payment_reference, subtotal_amount, total_amount, fee_delegation, payment_mode, \
           service_fee_amount, currency, pricing_country_code, metadata, expires_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) RETURNING id",
     )
     .bind(user_id)
     .bind(store_id)
@@ -933,14 +933,13 @@ pub(crate) async fn create_for_merchant(
     .bind(&expires_at)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-    let invoice_id = result.last_insert_rowid();
 
     for it in &input.items {
         sqlx::query(
             "INSERT INTO invoice_items (invoice_id, name, quantity, unit_amount, total_amount, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(invoice_id)
         .bind(&it.name)
@@ -970,7 +969,7 @@ pub(crate) async fn create_for_merchant(
     )
     .await?;
 
-    sqlx::query("UPDATE invoices SET payment_address = ? WHERE id = ?")
+    sqlx::query("UPDATE invoices SET payment_address = $1 WHERE id = $2")
         .bind(format!("kpr1:{intent_id}"))
         .bind(invoice_id)
         .execute(&state.db.pool)
@@ -1009,7 +1008,7 @@ pub async fn cancel(
     }
 
     let now = now_iso();
-    sqlx::query("UPDATE invoices SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE invoices SET status = 'cancelled', cancelled_at = $1, updated_at = $2 WHERE id = $3")
         .bind(&now)
         .bind(&now)
         .bind(inv.id)

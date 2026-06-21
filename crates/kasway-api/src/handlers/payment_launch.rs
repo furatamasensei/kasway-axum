@@ -81,7 +81,7 @@ struct TenantCaps {
 
 async fn tenant_caps(state: &AppState, user_id: i64) -> AppResult<TenantCaps> {
     let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
-        "SELECT enabled_payment_modules, webhook_retry_profile, exception_notification_categories FROM payment_tenant_settings WHERE user_id = ?",
+        "SELECT enabled_payment_modules, webhook_retry_profile, exception_notification_categories FROM payment_tenant_settings WHERE user_id = $1",
     ).bind(user_id).fetch_optional(&state.db.pool).await?;
     let (modules, retry_profile, exception_categories) = match row {
         Some((m, rp, ec)) => {
@@ -95,9 +95,9 @@ async fn tenant_caps(state: &AppState, user_id: i64) -> AppResult<TenantCaps> {
         None => (vec![], "balanced".into(), vec![]),
     };
     let active_endpoints: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = ? AND is_active = 1 AND paused_at IS NULL",
+        "SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = $1 AND is_active = 1 AND paused_at IS NULL",
     ).bind(user_id).fetch_one(&state.db.pool).await?;
-    let setup = sqlx::query_as::<_, (Option<String>,)>("SELECT webhook_url FROM setups WHERE user_id = ?")
+    let setup = sqlx::query_as::<_, (Option<String>,)>("SELECT webhook_url FROM setups WHERE user_id = $1")
         .bind(user_id).fetch_optional(&state.db.pool).await?;
     Ok(TenantCaps {
         modules, retry_profile, exception_categories, active_endpoints,
@@ -123,7 +123,7 @@ pub async fn status(auth: AuthMerchant, State(state): State<AppState>) -> AppRes
     );
 
     // wallet setup
-    let setup = sqlx::query_as::<_, (Option<String>, Option<String>)>("SELECT kaspa_main_address, webhook_url FROM setups WHERE user_id = ?")
+    let setup = sqlx::query_as::<_, (Option<String>, Option<String>)>("SELECT kaspa_main_address, webhook_url FROM setups WHERE user_id = $1")
         .bind(uid).fetch_optional(&state.db.pool).await?;
     let wallet_setup = match &setup {
         None => chk("merchant.walletSetup", "fail", "payments.status.walletSetup.missingSetup", json!({ "setupExists": false })),
@@ -212,7 +212,7 @@ pub async fn internal_status(_token: crate::auth::InternalToken, State(state): S
 // retention policy with Adonis defaults (no row → defaults).
 async fn retention_policy(state: &AppState, user_id: i64) -> AppResult<RetView> {
     let row = sqlx::query_as::<_, (i64, i64, i64, i64, Option<i64>, i64)>(
-        "SELECT exports_retention_days, evidence_packs_retention_days, notifications_retention_days, webhook_response_body_retention_days, support_notes_retention_days, anomaly_signals_retention_days FROM payment_retention_policies WHERE user_id = ?",
+        "SELECT exports_retention_days, evidence_packs_retention_days, notifications_retention_days, webhook_response_body_retention_days, support_notes_retention_days, anomaly_signals_retention_days FROM payment_retention_policies WHERE user_id = $1",
     ).bind(user_id).fetch_optional(&state.db.pool).await?;
     Ok(match row {
         Some((e, ev, n, w, s, a)) => RetView { exports: e, evidence: ev, notifications: n, webhook_body: w, support_notes: s, anomaly: a },

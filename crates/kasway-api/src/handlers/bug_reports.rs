@@ -95,7 +95,7 @@ pub async fn store(
 
     // default store of reporter
     let store_id: Option<i64> = match reporter_user_id {
-        Some(uid) => sqlx::query_scalar("SELECT id FROM stores WHERE user_id = ? AND is_default = 1")
+        Some(uid) => sqlx::query_scalar("SELECT id FROM stores WHERE user_id = $1 AND is_default = 1")
             .bind(uid).fetch_optional(&state.db.pool).await?,
         None => None,
     };
@@ -110,7 +110,7 @@ pub async fn store(
           actual_behavior, contact_email, contact_name, page_url, browser, os, invoice_id, payment_id, \
           transaction_id, reporter_user_id, store_id, ip_hash, user_agent, captcha_provider, captcha_success, \
           safe_metadata, tracker_provider, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'turnstile', 1, ?, 'manual_export_stub', ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, 'turnstile', 1, $22, 'manual_export_stub', $23, $24)",
     )
     .bind(&public_id).bind(status).bind(category).bind(&impact).bind(&summary).bind(&description)
     .bind(opt_str(&body, "stepsToReproduce", 4000)).bind(opt_str(&body, "expectedBehavior", 2000))

@@ -81,7 +81,7 @@ async fn load_settings(state: &AppState, user_id: i64) -> AppResult<Option<Setti
     Ok(sqlx::query_as::<_, SettingsRow>(
         "SELECT enabled_payment_modules, allowed_networks, allowed_assets, default_export_retention_days, \
          webhook_retry_profile, exception_notification_categories, allowed_manual_adjustment_kinds, confirmation_policy \
-         FROM payment_tenant_settings WHERE user_id = ?",
+         FROM payment_tenant_settings WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.db.pool)
@@ -119,7 +119,7 @@ pub async fn update_settings(
     sqlx::query(
         "INSERT INTO payment_tenant_settings (user_id, enabled_payment_modules, allowed_networks, allowed_assets, \
          default_export_retention_days, webhook_retry_profile, exception_notification_categories, allowed_manual_adjustment_kinds, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT(user_id) DO UPDATE SET enabled_payment_modules = excluded.enabled_payment_modules, \
          allowed_networks = excluded.allowed_networks, allowed_assets = excluded.allowed_assets, \
          default_export_retention_days = excluded.default_export_retention_days, webhook_retry_profile = excluded.webhook_retry_profile, \
@@ -207,10 +207,10 @@ pub async fn capabilities(auth: AuthMerchant, State(state): State<AppState>) -> 
     let modules: Vec<String> = settings["enabledPaymentModules"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
     let module_enabled = |m: &str| modules.iter().any(|x| x == m);
 
-    let setup_exists: Option<i64> = sqlx::query_scalar("SELECT id FROM setups WHERE user_id = ? LIMIT 1").bind(auth.user_id).fetch_optional(&state.db.pool).await?;
+    let setup_exists: Option<i64> = sqlx::query_scalar("SELECT id FROM setups WHERE user_id = $1 LIMIT 1").bind(auth.user_id).fetch_optional(&state.db.pool).await?;
     let setup_ready = setup_exists.is_some();
-    let webhook_url: Option<String> = sqlx::query_scalar("SELECT webhook_url FROM setups WHERE user_id = ? AND webhook_url IS NOT NULL LIMIT 1").bind(auth.user_id).fetch_optional(&state.db.pool).await?.flatten();
-    let active_endpoints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = ? AND is_active = 1 AND paused_at IS NULL").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let webhook_url: Option<String> = sqlx::query_scalar("SELECT webhook_url FROM setups WHERE user_id = $1 AND webhook_url IS NOT NULL LIMIT 1").bind(auth.user_id).fetch_optional(&state.db.pool).await?.flatten();
+    let active_endpoints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = $1 AND is_active = 1 AND paused_at IS NULL").bind(auth.user_id).fetch_one(&state.db.pool).await?;
     let has_active_endpoint = active_endpoints > 0;
 
     let exc_cats: Vec<String> = settings["exceptionNotificationCategories"].as_object().unwrap().iter().filter(|(_, v)| v.as_bool() == Some(true)).map(|(k, _)| k.clone()).collect();
@@ -389,7 +389,7 @@ pub async fn update_confirmation_policy(
     sqlx::query(
         "INSERT INTO payment_tenant_settings (user_id, enabled_payment_modules, allowed_networks, allowed_assets, \
          default_export_retention_days, webhook_retry_profile, exception_notification_categories, allowed_manual_adjustment_kinds, confirmation_policy, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          ON CONFLICT(user_id) DO UPDATE SET confirmation_policy = excluded.confirmation_policy, updated_at = excluded.updated_at",
     )
     .bind(auth.user_id)

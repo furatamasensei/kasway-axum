@@ -48,7 +48,7 @@ async fn ensure_defaults(state: &AppState, user_id: i64) -> AppResult<()> {
     for c in CATEGORIES {
         sqlx::query(
             "INSERT INTO payment_notification_preferences (user_id, category, channels, enabled, created_at, updated_at) \
-             VALUES (?, ?, '[\"email\",\"in_app\"]', 1, ?, ?) ON CONFLICT(user_id, category) DO NOTHING",
+             VALUES ($1, $2, '[\"email\",\"in_app\"]', 1, $3, $4) ON CONFLICT(user_id, category) DO NOTHING",
         )
         .bind(user_id).bind(c).bind(&now).bind(&now)
         .execute(&state.db.pool).await?;
@@ -58,7 +58,7 @@ async fn ensure_defaults(state: &AppState, user_id: i64) -> AppResult<()> {
 
 async fn list_prefs(state: &AppState, user_id: i64) -> AppResult<Vec<Value>> {
     let rows = sqlx::query_as::<_, PrefRow>(
-        "SELECT id, user_id, category, channels, enabled, created_at, updated_at FROM payment_notification_preferences WHERE user_id = ? ORDER BY category ASC",
+        "SELECT id, user_id, category, channels, enabled, created_at, updated_at FROM payment_notification_preferences WHERE user_id = $1 ORDER BY category ASC",
     )
     .bind(user_id)
     .fetch_all(&state.db.pool)
@@ -101,7 +101,7 @@ pub async fn update_preferences(
 
         sqlx::query(
             "INSERT INTO payment_notification_preferences (user_id, category, channels, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, category) DO UPDATE SET channels = excluded.channels, enabled = excluded.enabled, updated_at = excluded.updated_at",
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT(user_id, category) DO UPDATE SET channels = excluded.channels, enabled = excluded.enabled, updated_at = excluded.updated_at",
         )
         .bind(auth.user_id).bind(category).bind(serde_json::to_string(&chans).unwrap()).bind(enabled as i64).bind(&now).bind(&now)
         .execute(&state.db.pool).await?;
@@ -148,19 +148,19 @@ fn serialize_notif(n: &NotifRow) -> Value {
 pub async fn index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_notifications WHERE user_id = ?").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, NotifRow>(&format!("SELECT {NOTIF_COLS} FROM payment_notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_notifications WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let rows = sqlx::query_as::<_, NotifRow>(&format!("SELECT {NOTIF_COLS} FROM payment_notifications WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_notif).collect::<Vec<_>>() })))
 }
 
 /// `POST /api/payments/ops/notifications/:id/read`
 pub async fn read(auth: AuthMerchant, State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Value>> {
-    let notif: Option<NotifRow> = sqlx::query_as::<_, NotifRow>(&format!("SELECT {NOTIF_COLS} FROM payment_notifications WHERE user_id = ? AND id = ?"))
+    let notif: Option<NotifRow> = sqlx::query_as::<_, NotifRow>(&format!("SELECT {NOTIF_COLS} FROM payment_notifications WHERE user_id = $1 AND id = $2"))
         .bind(auth.user_id).bind(id).fetch_optional(&state.db.pool).await?;
     let notif = notif.ok_or_else(|| AppError::commerce(404, "Payment notification not found"))?;
-    sqlx::query("UPDATE payment_notifications SET read_at = ?, updated_at = ? WHERE id = ?").bind(now_iso()).bind(now_iso()).bind(notif.id).execute(&state.db.pool).await?;
-    let notif = sqlx::query_as::<_, NotifRow>(&format!("SELECT {NOTIF_COLS} FROM payment_notifications WHERE id = ?")).bind(notif.id).fetch_one(&state.db.pool).await?;
+    sqlx::query("UPDATE payment_notifications SET read_at = $1, updated_at = $2 WHERE id = $3").bind(now_iso()).bind(now_iso()).bind(notif.id).execute(&state.db.pool).await?;
+    let notif = sqlx::query_as::<_, NotifRow>(&format!("SELECT {NOTIF_COLS} FROM payment_notifications WHERE id = $1")).bind(notif.id).fetch_one(&state.db.pool).await?;
     Ok(Json(serialize_notif(&notif)))
 }
 

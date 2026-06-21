@@ -264,7 +264,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     if let Some(store_id) = ctx.store_id {
         setup = sqlx::query_as::<_, SetupRow>(
             "SELECT kaspa_main_address, kaspa_tax_enabled, kaspa_tax_address, kaspa_tax_percentage, \
-             kaspa_split_enabled, kaspa_split_addresses FROM setups WHERE user_id = ? AND store_id = ?",
+             kaspa_split_enabled, kaspa_split_addresses FROM setups WHERE user_id = $1 AND store_id = $2",
         )
         .bind(ctx.user_id)
         .bind(store_id)
@@ -274,7 +274,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     if setup.is_none() {
         setup = sqlx::query_as::<_, SetupRow>(
             "SELECT kaspa_main_address, kaspa_tax_enabled, kaspa_tax_address, kaspa_tax_percentage, \
-             kaspa_split_enabled, kaspa_split_addresses FROM setups WHERE user_id = ? AND store_id IS NULL",
+             kaspa_split_enabled, kaspa_split_addresses FROM setups WHERE user_id = $1 AND store_id IS NULL",
         )
         .bind(ctx.user_id)
         .fetch_optional(&state.db.pool)
@@ -459,7 +459,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
           template_id, template_version, script_hash, canonical_hash, payment_request_uri, payment_intent_url, \
           signature_algorithm, signature_key_id, signature_value, required_outputs, canonical_intent, metadata, \
           expires_at, created_at, updated_at) \
-         VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, 'created', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)",
     )
     .bind(ctx.invoice_id)
     .bind(ctx.user_id)

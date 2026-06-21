@@ -75,7 +75,7 @@ fn serialize_adj(a: &AdjRow, invoice: Option<Value>) -> Value {
 /// invoiceForMerchant: by numeric id or public_id, user-scoped.
 async fn invoice_for_merchant(state: &AppState, user_id: i64, id_param: &str) -> AppResult<i64> {
     let found: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM invoices WHERE user_id = ? AND (CAST(id AS TEXT) = ? OR public_id = ?)",
+        "SELECT id FROM invoices WHERE user_id = $1 AND (CAST(id AS TEXT) = $2 OR public_id = $3)",
     )
     .bind(user_id)
     .bind(id_param)
@@ -94,9 +94,9 @@ pub async fn index(
     let invoice_id = invoice_for_merchant(&state, auth.user_id, &id).await?;
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_adjustments WHERE user_id = ? AND invoice_id = ?")
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_adjustments WHERE user_id = $1 AND invoice_id = $2")
         .bind(auth.user_id).bind(invoice_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, AdjRow>(&format!("SELECT {ADJ_COLS} FROM payment_adjustments WHERE user_id = ? AND invoice_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let rows = sqlx::query_as::<_, AdjRow>(&format!("SELECT {ADJ_COLS} FROM payment_adjustments WHERE user_id = $1 AND invoice_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4"))
         .bind(auth.user_id).bind(invoice_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({
         "meta": crate::util::paginator_meta(total, per_page, page),
@@ -131,7 +131,7 @@ pub async fn store(
     let metadata = body.get("metadata").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
 
     // tenant settings: allowed manual adjustment kinds (default = all 4)
-    let allowed: Option<String> = sqlx::query_scalar("SELECT allowed_manual_adjustment_kinds FROM payment_tenant_settings WHERE user_id = ?")
+    let allowed: Option<String> = sqlx::query_scalar("SELECT allowed_manual_adjustment_kinds FROM payment_tenant_settings WHERE user_id = $1")
         .bind(auth.user_id).fetch_optional(&state.db.pool).await?;
     let allowed_kinds: Vec<String> = allowed.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| KINDS.iter().map(|s| s.to_string()).collect());
     if !allowed_kinds.contains(&kind) {
@@ -145,7 +145,7 @@ pub async fn store(
     }
     // reporting category must be active when provided
     if let Some(code) = &reporting_category_code {
-        let active: Option<i64> = sqlx::query_scalar("SELECT id FROM payment_reporting_categories WHERE user_id = ? AND code = ? AND is_active = 1")
+        let active: Option<i64> = sqlx::query_scalar("SELECT id FROM payment_reporting_categories WHERE user_id = $1 AND code = $2 AND is_active = 1")
             .bind(auth.user_id).bind(code).fetch_optional(&state.db.pool).await?;
         if active.is_none() {
             return Err(AppError::commerce(422, &format!("Reporting category '{code}' is not active")));
@@ -162,23 +162,23 @@ pub async fn store(
             }
         }
         None => {
-            let created: Option<String> = sqlx::query_scalar("SELECT created_at FROM invoices WHERE id = ?").bind(invoice_id).fetch_one(&state.db.pool).await?;
+            let created: Option<String> = sqlx::query_scalar("SELECT created_at FROM invoices WHERE id = $1").bind(invoice_id).fetch_one(&state.db.pool).await?;
             created.and_then(|c| chrono::DateTime::parse_from_rfc3339(&c).ok()).map(|d| d.date_naive().format("%Y-%m-%d").to_string()).unwrap_or_else(|| "2026-01-01".into())
         }
     };
     // assertMutableAccountingDate (close periods) -> deferred no-op
 
     let now = now_iso();
-    let r = sqlx::query(
+    let r = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_adjustments (user_id, invoice_id, kind, direction, amount, currency, network, asset_id, external_reference, reporting_category_code, accounting_date, reason, metadata, created_by_user_id, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING id",
     )
     .bind(auth.user_id).bind(invoice_id).bind(&kind).bind(&direction).bind(amount.parse::<i64>().unwrap_or(0)).bind(&currency)
     .bind(opt_str(&body, "network")).bind(opt_str(&body, "assetId")).bind(&external_reference).bind(&reporting_category_code)
     .bind(&accounting_date).bind(&reason).bind(metadata.to_string()).bind(auth.user_id).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?;
+    .fetch_one(&state.db.pool).await?;
 
-    let adj = sqlx::query_as::<_, AdjRow>(&format!("SELECT {ADJ_COLS} FROM payment_adjustments WHERE id = ?")).bind(r.last_insert_rowid()).fetch_one(&state.db.pool).await?;
+    let adj = sqlx::query_as::<_, AdjRow>(&format!("SELECT {ADJ_COLS} FROM payment_adjustments WHERE id = $1")).bind(r).fetch_one(&state.db.pool).await?;
     Ok((StatusCode::CREATED, Json(serialize_adj(&adj, None))))
 }
 
@@ -187,7 +187,7 @@ pub async fn show(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
-    let adj = sqlx::query_as::<_, AdjRow>(&format!("SELECT {ADJ_COLS} FROM payment_adjustments WHERE user_id = ? AND id = ?"))
+    let adj = sqlx::query_as::<_, AdjRow>(&format!("SELECT {ADJ_COLS} FROM payment_adjustments WHERE user_id = $1 AND id = $2"))
         .bind(auth.user_id).bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Payment adjustment not found"))?;
     // preload invoice

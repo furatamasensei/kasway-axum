@@ -8,7 +8,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 
 use crate::util::{constant_time_eq, now_iso};
 
@@ -43,7 +43,7 @@ fn sha256_hex(input: &[u8]) -> String {
 
 /// Create and persist a token for `tokenable_id`; returns the public value.
 pub async fn mint(
-    pool: &SqlitePool,
+    pool: &PgPool,
     kind: &TokenKind,
     tokenable_id: i64,
 ) -> Result<String, sqlx::Error> {
@@ -55,19 +55,18 @@ pub async fn mint(
 
     let sql = format!(
         "INSERT INTO {} (tokenable_id, type, name, hash, abilities, created_at, updated_at, last_used_at, expires_at) \
-         VALUES (?, ?, NULL, ?, '[\"*\"]', ?, ?, NULL, NULL)",
+         VALUES ($1, $2, NULL, $3, '[\"*\"]', $4, $5, NULL, NULL) RETURNING id",
         kind.table
     );
-    let result = sqlx::query(&sql)
+    let id: i64 = sqlx::query_scalar::<_, i64>(&sql)
         .bind(tokenable_id)
         .bind(kind.type_)
         .bind(&hash)
         .bind(&now)
         .bind(&now)
-        .execute(pool)
+        .fetch_one(pool)
         .await?;
 
-    let id = result.last_insert_rowid();
     let value = format!(
         "{}{}",
         kind.prefix,
@@ -78,7 +77,7 @@ pub async fn mint(
 
 /// Verify a token string; returns the tokenable + token row id when valid.
 pub async fn verify(
-    pool: &SqlitePool,
+    pool: &PgPool,
     kind: &TokenKind,
     token: &str,
 ) -> Result<Option<Verified>, sqlx::Error> {
@@ -99,7 +98,7 @@ pub async fn verify(
     };
 
     let sql = format!(
-        "SELECT tokenable_id, hash, expires_at FROM {} WHERE id = ? AND type = ?",
+        "SELECT tokenable_id, hash, expires_at FROM {} WHERE id = $1 AND type = $2",
         kind.table
     );
     let row = sqlx::query_as::<_, (i64, String, Option<String>)>(&sql)
@@ -126,8 +125,8 @@ pub async fn verify(
 }
 
 /// Delete a token row (logout). Matches `accessTokens.delete(user, identifier)`.
-pub async fn delete(pool: &SqlitePool, kind: &TokenKind, token_id: i64) -> Result<(), sqlx::Error> {
-    let sql = format!("DELETE FROM {} WHERE id = ?", kind.table);
+pub async fn delete(pool: &PgPool, kind: &TokenKind, token_id: i64) -> Result<(), sqlx::Error> {
+    let sql = format!("DELETE FROM {} WHERE id = $1", kind.table);
     sqlx::query(&sql).bind(token_id).execute(pool).await?;
     Ok(())
 }

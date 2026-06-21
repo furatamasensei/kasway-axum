@@ -1,6 +1,7 @@
 //! `/api/metrics/*` — MetricsController + MetricsService (port).
-//! Postgres `date_trunc` is mapped to SQLite `strftime`; the response shapes
-//! mirror Adonis. Time-window bounds compare against ISO timestamp strings.
+//! Time buckets use Postgres `to_char` over the ISO timestamp text columns; the
+//! response shapes mirror Adonis. Time-window bounds compare against ISO
+//! timestamp strings.
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult};
@@ -72,11 +73,22 @@ fn seed_counts(statuses: &[&str]) -> Map<String, Value> {
     m
 }
 
+/// Builds the optional `store_id` filter and the placeholder numbers for the
+/// `from`/`to` window bounds, given that `$1` is always the `user_id` bind and
+/// the optional store filter (when present) takes `$2`.
+fn store_window_params(store_id: Option<i64>, store_col: &str) -> (String, u8, u8) {
+    if store_id.is_some() {
+        (format!(" AND {store_col} = $2"), 3, 4)
+    } else {
+        (String::new(), 2, 3)
+    }
+}
+
 async fn invoice_counts(state: &AppState, user_id: i64, w: &Window, store_id: Option<i64>) -> AppResult<Value> {
     let mut counts = seed_counts(&["open", "paid", "expired", "cancelled"]);
+    let (store_clause, from_n, to_n) = store_window_params(store_id, "store_id");
     let sql = format!(
-        "SELECT status, COUNT(*) c FROM invoices WHERE user_id = ?{} AND created_at BETWEEN ? AND ? GROUP BY status",
-        if store_id.is_some() { " AND store_id = ?" } else { "" }
+        "SELECT status, COUNT(*) c FROM invoices WHERE user_id = $1{store_clause} AND created_at BETWEEN ${from_n} AND ${to_n} GROUP BY status"
     );
     let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(user_id);
     if let Some(s) = store_id { q = q.bind(s); }
@@ -87,10 +99,10 @@ async fn invoice_counts(state: &AppState, user_id: i64, w: &Window, store_id: Op
 
 async fn payment_counts(state: &AppState, user_id: i64, w: &Window, store_id: Option<i64>) -> AppResult<Value> {
     let mut counts = seed_counts(&["pending", "submitted", "confirmed", "failed"]);
+    let (store_clause, from_n, to_n) = store_window_params(store_id, "i.store_id");
     let sql = format!(
         "SELECT p.status, COUNT(*) c FROM payments p JOIN invoices i ON i.id = p.invoice_id \
-         WHERE i.user_id = ?{} AND p.created_at BETWEEN ? AND ? GROUP BY p.status",
-        if store_id.is_some() { " AND i.store_id = ?" } else { "" }
+         WHERE i.user_id = $1{store_clause} AND p.created_at BETWEEN ${from_n} AND ${to_n} GROUP BY p.status"
     );
     let mut q = sqlx::query_as::<_, (String, i64)>(&sql).bind(user_id);
     if let Some(s) = store_id { q = q.bind(s); }
@@ -101,11 +113,11 @@ async fn payment_counts(state: &AppState, user_id: i64, w: &Window, store_id: Op
 
 async fn observation_summary(state: &AppState, user_id: i64, w: &Window, store_id: Option<i64>) -> AppResult<Value> {
     let mut counts = seed_counts(&["pending", "matched", "settled", "ignored"]);
+    let (store_clause, from_n, to_n) = store_window_params(store_id, "i.store_id");
     let sql = format!(
         "SELECT po.status, COUNT(*) c, COALESCE(SUM(po.amount),0) t FROM payment_observations po \
-         JOIN invoices i ON i.id = po.invoice_id WHERE i.user_id = ?{} \
-         AND COALESCE(po.accepted_at, po.created_at) BETWEEN ? AND ? GROUP BY po.status",
-        if store_id.is_some() { " AND i.store_id = ?" } else { "" }
+         JOIN invoices i ON i.id = po.invoice_id WHERE i.user_id = $1{store_clause} \
+         AND COALESCE(po.accepted_at, po.created_at) BETWEEN ${from_n} AND ${to_n} GROUP BY po.status"
     );
     let mut q = sqlx::query_as::<_, (String, i64, i64)>(&sql).bind(user_id);
     if let Some(s) = store_id { q = q.bind(s); }
@@ -127,8 +139,8 @@ async fn webhook_counts(state: &AppState, user_id: i64, w: &Window) -> AppResult
     let mut counts = seed_counts(&["success", "failure"]);
     let rows = sqlx::query_as::<_, (String, i64)>(
         "SELECT d.status, COUNT(*) c FROM webhook_deliveries d \
-         JOIN webhook_events e ON e.id = d.webhook_event_id WHERE e.user_id = ? \
-         AND d.delivered_at BETWEEN ? AND ? GROUP BY d.status",
+         JOIN webhook_events e ON e.id = d.webhook_event_id WHERE e.user_id = $1 \
+         AND d.delivered_at BETWEEN $2 AND $3 GROUP BY d.status",
     )
     .bind(user_id)
     .bind(&w.from)
@@ -150,25 +162,25 @@ async fn webhook_counts(state: &AppState, user_id: i64, w: &Window) -> AppResult
 }
 
 async fn revenue_data(state: &AppState, user_id: i64, w: &Window, store_id: Option<i64>) -> AppResult<Value> {
+    let (store_clause, from_n, to_n) = store_window_params(store_id, "store_id");
     let totals_sql = format!(
-        "SELECT CAST(COALESCE(SUM(total_amount),0) AS REAL) total, CAST(COALESCE(AVG(total_amount),0) AS REAL) average \
-         FROM invoices WHERE user_id = ?{} AND status = 'paid' AND paid_at BETWEEN ? AND ?",
-        if store_id.is_some() { " AND store_id = ?" } else { "" }
+        "SELECT CAST(COALESCE(SUM(total_amount),0) AS DOUBLE PRECISION) total, CAST(COALESCE(AVG(total_amount),0) AS DOUBLE PRECISION) average \
+         FROM invoices WHERE user_id = $1{store_clause} AND status = 'paid' AND paid_at BETWEEN ${from_n} AND ${to_n}"
     );
     let mut tq = sqlx::query_as::<_, (f64, f64)>(&totals_sql).bind(user_id);
     if let Some(s) = store_id { tq = tq.bind(s); }
     let (total, average) = tq.bind(&w.from).bind(&w.to).fetch_one(&state.db.pool).await?;
 
     let bucket_fmt = match w.interval.as_str() {
-        "month" => "%Y-%m",
-        "week" => "%Y-%W",
-        _ => "%Y-%m-%d",
+        "month" => "YYYY-MM",
+        "week" => "IYYY-IW",
+        _ => "YYYY-MM-DD",
     };
+    let (store_clause, from_n, to_n) = store_window_params(store_id, "store_id");
     let series_sql = format!(
-        "SELECT strftime('{bucket_fmt}', paid_at) bucket, CAST(COALESCE(SUM(total_amount),0) AS REAL) total, COUNT(*) c \
-         FROM invoices WHERE user_id = ?{} AND status = 'paid' AND paid_at BETWEEN ? AND ? \
-         GROUP BY bucket ORDER BY bucket ASC",
-        if store_id.is_some() { " AND store_id = ?" } else { "" }
+        "SELECT to_char((paid_at)::timestamptz, '{bucket_fmt}') bucket, CAST(COALESCE(SUM(total_amount),0) AS DOUBLE PRECISION) total, COUNT(*) c \
+         FROM invoices WHERE user_id = $1{store_clause} AND status = 'paid' AND paid_at BETWEEN ${from_n} AND ${to_n} \
+         GROUP BY bucket ORDER BY bucket ASC"
     );
     let mut sq = sqlx::query_as::<_, (Option<String>, f64, i64)>(&series_sql).bind(user_id);
     if let Some(s) = store_id { sq = sq.bind(s); }

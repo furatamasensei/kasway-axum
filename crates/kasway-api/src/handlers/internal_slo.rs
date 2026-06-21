@@ -100,7 +100,8 @@ async fn indexer_freshness(state: &AppState, now: DateTime<Utc>) -> AppResult<Va
 
 async fn observation_age_indicator(state: &AppState, statuses: &[&str], now: DateTime<Utc>, warn: i64, crit: i64) -> AppResult<Value> {
     let threshold = json!({ "warnSeconds": warn, "criticalSeconds": crit });
-    let placeholders = statuses.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let mut n = 1;
+    let placeholders = statuses.iter().map(|_| { let p = format!("${n}"); n += 1; p }).collect::<Vec<_>>().join(",");
     let count_sql = format!("SELECT COUNT(*) FROM payment_observations WHERE status IN ({placeholders})");
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql);
     for s in statuses { cq = cq.bind(*s); }
@@ -127,7 +128,7 @@ async fn webhook_failure_rate(state: &AppState, now: DateTime<Utc>) -> AppResult
     let from = iso(now - chrono::Duration::minutes(60));
     let to = iso(now);
     let rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT status, COUNT(*) FROM webhook_deliveries WHERE created_at BETWEEN ? AND ? GROUP BY status",
+        "SELECT status, COUNT(*) FROM webhook_deliveries WHERE created_at BETWEEN $1 AND $2 GROUP BY status",
     ).bind(&from).bind(&to).fetch_all(&state.db.pool).await?;
     let (mut succeeded, mut failed) = (0i64, 0i64);
     for (s, c) in rows { if s == "succeeded" { succeeded = c; } if s == "failed" { failed = c; } }
@@ -144,7 +145,7 @@ async fn async_export_rate(state: &AppState, now: DateTime<Utc>) -> AppResult<Va
     let from = iso(now - chrono::Duration::hours(24));
     let to = iso(now);
     let rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT status, COUNT(*) FROM payment_operation_exports WHERE generated_at BETWEEN ? AND ? GROUP BY status",
+        "SELECT status, COUNT(*) FROM payment_operation_exports WHERE generated_at BETWEEN $1 AND $2 GROUP BY status",
     ).bind(&from).bind(&to).fetch_all(&state.db.pool).await?;
     let (mut succeeded, mut failed, mut queued, mut running, mut expired, mut other) = (0i64, 0, 0, 0, 0, 0);
     for (s, c) in rows {
@@ -175,7 +176,7 @@ async fn notification_counts(state: &AppState, now: DateTime<Utc>) -> AppResult<
     let from = iso(now - chrono::Duration::hours(1));
     let to = iso(now);
     let rows = sqlx::query_as::<_, (String, i64)>(
-        "SELECT severity, COUNT(*) FROM payment_notifications WHERE created_at BETWEEN ? AND ? GROUP BY severity",
+        "SELECT severity, COUNT(*) FROM payment_notifications WHERE created_at BETWEEN $1 AND $2 GROUP BY severity",
     ).bind(&from).bind(&to).fetch_all(&state.db.pool).await?;
     let (mut success, mut failure) = (0i64, 0i64);
     for (sev, c) in rows { if sev == "critical" { failure += c; } else { success += c; } }

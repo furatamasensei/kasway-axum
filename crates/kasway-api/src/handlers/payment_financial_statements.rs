@@ -109,17 +109,17 @@ async fn build_totals(
 ) -> AppResult<Value> {
     // invoices
     let (gross, paid, invoice_count): (i64, i64, i64) = sqlx::query_as(
-        "SELECT CAST(COALESCE(SUM(total_amount), 0) AS INTEGER), \
-         CAST(COALESCE(SUM(CASE WHEN status = 'paid' THEN total_amount ELSE 0 END), 0) AS INTEGER), \
-         COUNT(*) FROM invoices WHERE user_id = ? AND created_at >= ? AND created_at < ?",
+        "SELECT CAST(COALESCE(SUM(total_amount), 0) AS BIGINT), \
+         CAST(COALESCE(SUM(CASE WHEN status = 'paid' THEN total_amount ELSE 0 END), 0) AS BIGINT), \
+         COUNT(*) FROM invoices WHERE user_id = $1 AND created_at >= $2 AND created_at < $3",
     )
     .bind(user_id).bind(start_sql).bind(end_sql)
     .fetch_one(&state.db.pool).await?;
 
     // credits
     let (credited, credit_count): (i64, i64) = sqlx::query_as(
-        "SELECT CAST(COALESCE(SUM(amount), 0) AS INTEGER), COUNT(*) FROM payment_credits \
-         WHERE user_id = ? AND credited_at >= ? AND credited_at < ?",
+        "SELECT CAST(COALESCE(SUM(amount), 0) AS BIGINT), COUNT(*) FROM payment_credits \
+         WHERE user_id = $1 AND credited_at >= $2 AND credited_at < $3",
     )
     .bind(user_id).bind(start_sql).bind(end_sql)
     .fetch_one(&state.db.pool).await?;
@@ -127,8 +127,8 @@ async fn build_totals(
     // adjustments
     let adjustments = sqlx::query_as::<_, (String, String, i64, Option<String>)>(
         "SELECT kind, direction, amount, reporting_category_code FROM payment_adjustments \
-         WHERE user_id = ? AND COALESCE(accounting_date, created_at) >= ? \
-         AND COALESCE(accounting_date, created_at) < ?",
+         WHERE user_id = $1 AND COALESCE(accounting_date, created_at) >= $2 \
+         AND COALESCE(accounting_date, created_at) < $3",
     )
     .bind(user_id).bind(start_sql).bind(end_sql)
     .fetch_all(&state.db.pool).await?;
@@ -196,7 +196,7 @@ async fn build_totals(
     // exceptions
     let resolved: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM payment_exception_resolutions \
-         WHERE user_id = ? AND created_at >= ? AND created_at < ?",
+         WHERE user_id = $1 AND created_at >= $2 AND created_at < $3",
     )
     .bind(user_id).bind(start_sql).bind(end_sql)
     .fetch_one(&state.db.pool).await?;
@@ -228,12 +228,12 @@ pub async fn index(
 ) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).clamp(1, 100);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_statements WHERE user_id = ?")
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_statements WHERE user_id = $1")
         .bind(auth.user_id)
         .fetch_one(&state.db.pool)
         .await?;
     let rows = sqlx::query_as::<_, StatementRow>(
-        "SELECT * FROM payment_statements WHERE user_id = ? ORDER BY period_start DESC, id DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM payment_statements WHERE user_id = $1 ORDER BY period_start DESC, id DESC LIMIT $2 OFFSET $3",
     )
     .bind(auth.user_id)
     .bind(per_page)
@@ -263,8 +263,8 @@ pub(crate) async fn generate(
 
     // ensureNoOverlap
     let overlap: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM payment_statements WHERE user_id = ? AND status = 'generated' \
-         AND period_start <= ? AND period_end >= ? LIMIT 1",
+        "SELECT id FROM payment_statements WHERE user_id = $1 AND status = 'generated' \
+         AND period_start <= $2 AND period_end >= $3 LIMIT 1",
     )
     .bind(user_id).bind(&end_date).bind(&start_date)
     .fetch_optional(&state.db.pool).await?;
@@ -278,11 +278,11 @@ pub(crate) async fn generate(
     let byte_size = artifact.len() as i64;
     let now = now_iso();
 
-    let id = sqlx::query(
+    let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_statements \
          (user_id, period_start, period_end, status, totals, checksum, storage_disk, storage_path, \
           content_type, byte_size, generated_at, created_at, updated_at) \
-         VALUES (?, ?, ?, 'generated', ?, ?, 'default', '', 'application/json', ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, 'generated', $4, $5, 'default', '', 'application/json', $6, $7, $8, $9) RETURNING id",
     )
     .bind(user_id)
     .bind(&start_date)
@@ -293,18 +293,17 @@ pub(crate) async fn generate(
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
-    .await?
-    .last_insert_rowid();
+    .fetch_one(&state.db.pool)
+    .await?;
 
     let storage_path = format!("payment-statements/{}/{}.json", user_id, id);
-    sqlx::query("UPDATE payment_statements SET storage_path = ? WHERE id = ?")
+    sqlx::query("UPDATE payment_statements SET storage_path = $1 WHERE id = $2")
         .bind(&storage_path)
         .bind(id)
         .execute(&state.db.pool)
         .await?;
 
-    Ok(sqlx::query_as::<_, StatementRow>("SELECT * FROM payment_statements WHERE id = ?")
+    Ok(sqlx::query_as::<_, StatementRow>("SELECT * FROM payment_statements WHERE id = $1")
         .bind(id)
         .fetch_one(&state.db.pool)
         .await?)
@@ -329,7 +328,7 @@ pub async fn store(
 
 async fn load(state: &AppState, user_id: i64, id: &str) -> AppResult<Option<StatementRow>> {
     Ok(sqlx::query_as::<_, StatementRow>(
-        "SELECT * FROM payment_statements WHERE user_id = ? AND id = ?",
+        "SELECT * FROM payment_statements WHERE user_id = $1 AND id = $2",
     )
     .bind(user_id)
     .bind(id)

@@ -82,13 +82,13 @@ fn validate_category(body: &Value) -> AppResult<(String, String, String, String,
 }
 
 async fn category_code_taken(state: &AppState, user_id: i64, code: &str, except: Option<i64>) -> AppResult<bool> {
-    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM payment_reporting_categories WHERE user_id = ? AND code = ? AND id != ?")
+    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM payment_reporting_categories WHERE user_id = $1 AND code = $2 AND id != $3")
         .bind(user_id).bind(code).bind(except.unwrap_or(0)).fetch_optional(&state.db.pool).await?;
     Ok(found.is_some())
 }
 
 async fn load_category(state: &AppState, user_id: i64, id: i64) -> AppResult<CategoryRow> {
-    sqlx::query_as::<_, CategoryRow>(&format!("SELECT {CATEGORY_COLS} FROM payment_reporting_categories WHERE user_id = ? AND id = ?"))
+    sqlx::query_as::<_, CategoryRow>(&format!("SELECT {CATEGORY_COLS} FROM payment_reporting_categories WHERE user_id = $1 AND id = $2"))
         .bind(user_id).bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Payment reporting category not found"))
 }
@@ -96,8 +96,8 @@ async fn load_category(state: &AppState, user_id: i64, id: i64) -> AppResult<Cat
 pub async fn categories_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_reporting_categories WHERE user_id = ?").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, CategoryRow>(&format!("SELECT {CATEGORY_COLS} FROM payment_reporting_categories WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_reporting_categories WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let rows = sqlx::query_as::<_, CategoryRow>(&format!("SELECT {CATEGORY_COLS} FROM payment_reporting_categories WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_category).collect::<Vec<_>>() })))
 }
@@ -108,10 +108,10 @@ pub async fn categories_store(auth: AuthMerchant, State(state): State<AppState>,
         return Err(AppError::commerce(422, &format!("Reporting category code '{code}' already exists")));
     }
     let now = now_iso();
-    let r = sqlx::query("INSERT INTO payment_reporting_categories (user_id, label, code, type, calculation_mode, rate, amount, is_active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    let new_id = sqlx::query_scalar::<_, i64>("INSERT INTO payment_reporting_categories (user_id, label, code, type, calculation_mode, rate, amount, is_active, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id")
         .bind(auth.user_id).bind(&label).bind(&code).bind(&type_).bind(&calc).bind(&rate).bind(amount).bind(is_active as i64).bind(&now).bind(&now)
-        .execute(&state.db.pool).await?;
-    Ok((StatusCode::CREATED, Json(serialize_category(&load_category(&state, auth.user_id, r.last_insert_rowid()).await?))))
+        .fetch_one(&state.db.pool).await?;
+    Ok((StatusCode::CREATED, Json(serialize_category(&load_category(&state, auth.user_id, new_id).await?))))
 }
 
 pub async fn categories_update(auth: AuthMerchant, State(state): State<AppState>, Path(id): Path<i64>, Json(body): Json<Value>) -> AppResult<Json<Value>> {
@@ -120,7 +120,7 @@ pub async fn categories_update(auth: AuthMerchant, State(state): State<AppState>
     if code != cat.code && category_code_taken(&state, auth.user_id, &code, Some(cat.id)).await? {
         return Err(AppError::commerce(422, &format!("Reporting category code '{code}' already exists")));
     }
-    sqlx::query("UPDATE payment_reporting_categories SET label = ?, code = ?, type = ?, calculation_mode = ?, rate = ?, amount = ?, is_active = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE payment_reporting_categories SET label = $1, code = $2, type = $3, calculation_mode = $4, rate = $5, amount = $6, is_active = $7, updated_at = $8 WHERE id = $9")
         .bind(&label).bind(&code).bind(&type_).bind(&calc).bind(&rate).bind(amount).bind(is_active as i64).bind(now_iso()).bind(cat.id)
         .execute(&state.db.pool).await?;
     Ok(Json(serialize_category(&load_category(&state, auth.user_id, id).await?)))
@@ -128,7 +128,7 @@ pub async fn categories_update(auth: AuthMerchant, State(state): State<AppState>
 
 pub async fn categories_destroy(auth: AuthMerchant, State(state): State<AppState>, Path(id): Path<i64>) -> AppResult<Json<Value>> {
     let cat = load_category(&state, auth.user_id, id).await?;
-    sqlx::query("UPDATE payment_reporting_categories SET is_active = 0, updated_at = ? WHERE id = ?").bind(now_iso()).bind(cat.id).execute(&state.db.pool).await?;
+    sqlx::query("UPDATE payment_reporting_categories SET is_active = 0, updated_at = $1 WHERE id = $2").bind(now_iso()).bind(cat.id).execute(&state.db.pool).await?;
     Ok(Json(serialize_category(&load_category(&state, auth.user_id, id).await?)))
 }
 
@@ -177,13 +177,13 @@ fn validate_profile(body: &Value) -> AppResult<(String, String, String, String, 
 }
 
 async fn profile_name_taken(state: &AppState, user_id: i64, name: &str, except: Option<i64>) -> AppResult<bool> {
-    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM payment_accounting_profiles WHERE user_id = ? AND name = ? AND id != ?")
+    let found: Option<i64> = sqlx::query_scalar("SELECT id FROM payment_accounting_profiles WHERE user_id = $1 AND name = $2 AND id != $3")
         .bind(user_id).bind(name).bind(except.unwrap_or(0)).fetch_optional(&state.db.pool).await?;
     Ok(found.is_some())
 }
 
 async fn load_profile(state: &AppState, user_id: i64, id: i64) -> AppResult<ProfileRow> {
-    sqlx::query_as::<_, ProfileRow>(&format!("SELECT {PROFILE_COLS} FROM payment_accounting_profiles WHERE user_id = ? AND id = ?"))
+    sqlx::query_as::<_, ProfileRow>(&format!("SELECT {PROFILE_COLS} FROM payment_accounting_profiles WHERE user_id = $1 AND id = $2"))
         .bind(user_id).bind(id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Payment accounting profile not found"))
 }
@@ -191,8 +191,8 @@ async fn load_profile(state: &AppState, user_id: i64, id: i64) -> AppResult<Prof
 pub async fn profiles_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_accounting_profiles WHERE user_id = ?").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, ProfileRow>(&format!("SELECT {PROFILE_COLS} FROM payment_accounting_profiles WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?"))
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_accounting_profiles WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
+    let rows = sqlx::query_as::<_, ProfileRow>(&format!("SELECT {PROFILE_COLS} FROM payment_accounting_profiles WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_profile).collect::<Vec<_>>() })))
 }
@@ -203,10 +203,10 @@ pub async fn profiles_store(auth: AuthMerchant, State(state): State<AppState>, J
         return Err(AppError::commerce(422, &format!("Accounting profile '{name}' already exists")));
     }
     let now = now_iso();
-    let r = sqlx::query("INSERT INTO payment_accounting_profiles (user_id, name, account_codes, category_mappings, currency_handling, date_format, timezone, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    let new_id = sqlx::query_scalar::<_, i64>("INSERT INTO payment_accounting_profiles (user_id, name, account_codes, category_mappings, currency_handling, date_format, timezone, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id")
         .bind(auth.user_id).bind(&name).bind(&ac).bind(&cm).bind(&ch).bind(&df).bind(&tz).bind(&now).bind(&now)
-        .execute(&state.db.pool).await?;
-    Ok((StatusCode::CREATED, Json(serialize_profile(&load_profile(&state, auth.user_id, r.last_insert_rowid()).await?))))
+        .fetch_one(&state.db.pool).await?;
+    Ok((StatusCode::CREATED, Json(serialize_profile(&load_profile(&state, auth.user_id, new_id).await?))))
 }
 
 pub async fn profiles_update(auth: AuthMerchant, State(state): State<AppState>, Path(id): Path<i64>, Json(body): Json<Value>) -> AppResult<Json<Value>> {
@@ -215,7 +215,7 @@ pub async fn profiles_update(auth: AuthMerchant, State(state): State<AppState>, 
     if name != profile.name && profile_name_taken(&state, auth.user_id, &name, Some(profile.id)).await? {
         return Err(AppError::commerce(422, &format!("Accounting profile '{name}' already exists")));
     }
-    sqlx::query("UPDATE payment_accounting_profiles SET name = ?, account_codes = ?, category_mappings = ?, currency_handling = ?, date_format = ?, timezone = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE payment_accounting_profiles SET name = $1, account_codes = $2, category_mappings = $3, currency_handling = $4, date_format = $5, timezone = $6, updated_at = $7 WHERE id = $8")
         .bind(&name).bind(&ac).bind(&cm).bind(&ch).bind(&df).bind(&tz).bind(now_iso()).bind(profile.id)
         .execute(&state.db.pool).await?;
     Ok(Json(serialize_profile(&load_profile(&state, auth.user_id, id).await?)))

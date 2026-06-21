@@ -117,18 +117,21 @@ fn validate_query(q: &ExportQuery) -> AppResult<()> {
     Ok(())
 }
 
-fn push_filters(sql: &mut String, binds: &mut Vec<Bind>, q: &ExportQuery, cols: &FilterCols) {
+fn push_filters(sql: &mut String, binds: &mut Vec<Bind>, n: &mut usize, q: &ExportQuery, cols: &FilterCols) {
     if let Some(f) = q.from.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        sql.push_str(&format!(" AND {} >= ?", cols.date));
+        sql.push_str(&format!(" AND {} >= ${n}", cols.date));
+        *n += 1;
         binds.push(Bind::Str(f.to_string()));
     }
     if let Some(t) = q.to.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        sql.push_str(&format!(" AND {} <= ?", cols.date));
+        sql.push_str(&format!(" AND {} <= ${n}", cols.date));
+        *n += 1;
         binds.push(Bind::Str(t.to_string()));
     }
     let mut str_filter = |val: &Option<String>, col: Option<&str>| {
         if let (Some(col), Some(v)) = (col, val.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty())) {
-            sql.push_str(&format!(" AND {col} = ?"));
+            sql.push_str(&format!(" AND {col} = ${n}"));
+            *n += 1;
             binds.push(Bind::Str(v.to_string()));
         }
     };
@@ -141,9 +144,10 @@ fn push_filters(sql: &mut String, binds: &mut Vec<Bind>, q: &ExportQuery, cols: 
     if let (Some(col), Some(v)) =
         (cols.invoice_id, q.invoice_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()))
     {
-        if let Ok(n) = v.parse::<i64>() {
-            sql.push_str(&format!(" AND {col} = ?"));
-            binds.push(Bind::Int(n));
+        if let Ok(parsed) = v.parse::<i64>() {
+            sql.push_str(&format!(" AND {col} = ${n}"));
+            *n += 1;
+            binds.push(Bind::Int(parsed));
         }
     }
 }
@@ -163,7 +167,7 @@ async fn fetch_rows(
     state: &AppState,
     sql: String,
     binds: Vec<Bind>,
-) -> AppResult<Vec<sqlx::sqlite::SqliteRow>> {
+) -> AppResult<Vec<sqlx::postgres::PgRow>> {
     let mut q = sqlx::query(&sql);
     for b in binds {
         q = match b {
@@ -185,13 +189,13 @@ fn too_broad(kind: &str) -> AppError {
 
 use sqlx::Row as _;
 
-fn opt_int(row: &sqlx::sqlite::SqliteRow, idx: &str) -> Option<String> {
+fn opt_int(row: &sqlx::postgres::PgRow, idx: &str) -> Option<String> {
     row.try_get::<Option<i64>, _>(idx).ok().flatten().map(|v| v.to_string())
 }
-fn opt_str(row: &sqlx::sqlite::SqliteRow, idx: &str) -> Option<String> {
+fn opt_str(row: &sqlx::postgres::PgRow, idx: &str) -> Option<String> {
     row.try_get::<Option<String>, _>(idx).ok().flatten()
 }
-fn req_int(row: &sqlx::sqlite::SqliteRow, idx: &str) -> Option<String> {
+fn req_int(row: &sqlx::postgres::PgRow, idx: &str) -> Option<String> {
     Some(row.try_get::<i64, _>(idx).unwrap_or_default().to_string())
 }
 
@@ -203,20 +207,23 @@ async fn build_invoices_csv(
     let mut sql = String::from(
         "SELECT id, public_id, external_id, status, payment_network, payment_asset, payment_address, \
          payment_reference, subtotal_amount, total_amount, currency, pricing_country_code, \
-         (SELECT group_concat(ps, ',') FROM (SELECT DISTINCT ii.pricing_source AS ps FROM invoice_items ii \
-            WHERE ii.invoice_id = invoices.id AND ii.pricing_source IS NOT NULL ORDER BY ii.pricing_source)) \
+         (SELECT string_agg(ps, ',') FROM (SELECT DISTINCT ii.pricing_source AS ps FROM invoice_items ii \
+            WHERE ii.invoice_id = invoices.id AND ii.pricing_source IS NOT NULL ORDER BY ii.pricing_source) sub) \
             AS regional_pricing_sources, \
          expires_at, paid_at, cancelled_at, created_at, updated_at \
-         FROM invoices WHERE user_id = ?",
+         FROM invoices WHERE user_id = $1",
     );
+    let mut n = 2;
     let mut binds = vec![Bind::Int(user_id)];
     if let Some(s) = q.store_id.as_ref().and_then(|s| s.trim().parse::<i64>().ok()) {
-        sql.push_str(" AND store_id = ?");
+        sql.push_str(&format!(" AND store_id = ${n}"));
+        n += 1;
         binds.push(Bind::Int(s));
     }
     push_filters(
         &mut sql,
         &mut binds,
+        &mut n,
         q,
         &FilterCols {
             date: "created_at",
@@ -279,11 +286,13 @@ async fn build_observations_csv(
          po.block_daa_score, po.confirmations, po.status, po.accepted_at, po.matched_at, po.settled_at, \
          po.created_at, po.updated_at \
          FROM payment_observations po LEFT JOIN invoices i ON i.id = po.invoice_id \
-         WHERE EXISTS (SELECT 1 FROM invoices owner_invoice WHERE owner_invoice.user_id = ?",
+         WHERE EXISTS (SELECT 1 FROM invoices owner_invoice WHERE owner_invoice.user_id = $1",
     );
+    let mut n = 2;
     let mut binds = vec![Bind::Int(user_id)];
     if let Some(s) = q.store_id.as_ref().and_then(|s| s.trim().parse::<i64>().ok()) {
-        sql.push_str(" AND owner_invoice.store_id = ?");
+        sql.push_str(&format!(" AND owner_invoice.store_id = ${n}"));
+        n += 1;
         binds.push(Bind::Int(s));
     }
     sql.push_str(
@@ -293,6 +302,7 @@ async fn build_observations_csv(
     push_filters(
         &mut sql,
         &mut binds,
+        &mut n,
         q,
         &FilterCols {
             date: "COALESCE(po.accepted_at, po.created_at)",
@@ -356,16 +366,19 @@ async fn build_credits_csv(
     let mut sql = String::from(
         "SELECT pc.id, pc.payment_observation_id, pc.invoice_id, i.public_id AS invoice_public_id, \
          pc.network, pc.asset_id, pc.amount, pc.credited_at, pc.created_at, pc.updated_at \
-         FROM payment_credits pc LEFT JOIN invoices i ON i.id = pc.invoice_id WHERE pc.user_id = ?",
+         FROM payment_credits pc LEFT JOIN invoices i ON i.id = pc.invoice_id WHERE pc.user_id = $1",
     );
+    let mut n = 2;
     let mut binds = vec![Bind::Int(user_id)];
     if let Some(s) = q.store_id.as_ref().and_then(|s| s.trim().parse::<i64>().ok()) {
-        sql.push_str(" AND i.store_id = ?");
+        sql.push_str(&format!(" AND i.store_id = ${n}"));
+        n += 1;
         binds.push(Bind::Int(s));
     }
     push_filters(
         &mut sql,
         &mut binds,
+        &mut n,
         q,
         &FilterCols {
             date: "pc.credited_at",
@@ -441,11 +454,11 @@ async fn insert_manifest(
     actor_id: i64,
 ) -> AppResult<i64> {
     let now = now_iso();
-    let id = sqlx::query(
+    let id = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_operation_exports \
          (user_id, kind, format, profile_id, filters, mapping_metadata, row_count, checksum, status, \
           actor_type, actor_id, generated_at, created_at, updated_at) \
-         VALUES (?, ?, ?, NULL, ?, '{}', ?, ?, ?, 'merchant', ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, NULL, $4, '{}', $5, $6, $7, 'merchant', $8, $9, $10, $11) RETURNING id",
     )
     .bind(user_id)
     .bind(kind)
@@ -458,9 +471,8 @@ async fn insert_manifest(
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
-    .await?
-    .last_insert_rowid();
+    .fetch_one(&state.db.pool)
+    .await?;
     Ok(id)
 }
 
@@ -520,7 +532,7 @@ fn serialize_manifest(m: &ManifestRow) -> Value {
 
 async fn load_manifest(state: &AppState, user_id: i64, id: &str) -> AppResult<Option<ManifestRow>> {
     Ok(sqlx::query_as::<_, ManifestRow>(
-        "SELECT * FROM payment_operation_exports WHERE user_id = ? AND id = ?",
+        "SELECT * FROM payment_operation_exports WHERE user_id = $1 AND id = $2",
     )
     .bind(user_id)
     .bind(id)
@@ -581,12 +593,12 @@ pub async fn index(
 ) -> AppResult<Json<Value>> {
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).clamp(1, 100);
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_operation_exports WHERE user_id = ?")
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payment_operation_exports WHERE user_id = $1")
         .bind(auth.user_id)
         .fetch_one(&state.db.pool)
         .await?;
     let rows = sqlx::query_as::<_, ManifestRow>(
-        "SELECT * FROM payment_operation_exports WHERE user_id = ? ORDER BY generated_at DESC, id DESC LIMIT ? OFFSET ?",
+        "SELECT * FROM payment_operation_exports WHERE user_id = $1 ORDER BY generated_at DESC, id DESC LIMIT $2 OFFSET $3",
     )
     .bind(auth.user_id)
     .bind(per_page)

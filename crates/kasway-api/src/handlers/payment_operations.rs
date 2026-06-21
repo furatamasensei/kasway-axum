@@ -40,14 +40,16 @@ pub async fn invoices_index(
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
 
-    let mut filter = String::from("user_id = ?");
-    if q.status.is_some() { filter.push_str(" AND status = ?"); }
-    if q.network.is_some() { filter.push_str(" AND payment_network = ?"); }
-    if q.asset_id.is_some() { filter.push_str(" AND payment_asset = ?"); }
-    if q.invoice_id.is_some() { filter.push_str(" AND id = ?"); }
-    if q.public_id.is_some() { filter.push_str(" AND public_id = ?"); }
-    if q.external_id.is_some() { filter.push_str(" AND external_id = ?"); }
-    if q.store_id.is_some() { filter.push_str(" AND store_id = ?"); }
+    let mut n = 1;
+    let mut filter = format!("user_id = ${n}"); n += 1;
+    if q.status.is_some() { filter.push_str(&format!(" AND status = ${n}")); n += 1; }
+    if q.network.is_some() { filter.push_str(&format!(" AND payment_network = ${n}")); n += 1; }
+    if q.asset_id.is_some() { filter.push_str(&format!(" AND payment_asset = ${n}")); n += 1; }
+    if q.invoice_id.is_some() { filter.push_str(&format!(" AND id = ${n}")); n += 1; }
+    if q.public_id.is_some() { filter.push_str(&format!(" AND public_id = ${n}")); n += 1; }
+    if q.external_id.is_some() { filter.push_str(&format!(" AND external_id = ${n}")); n += 1; }
+    if q.store_id.is_some() { filter.push_str(&format!(" AND store_id = ${n}")); n += 1; }
+    let _ = n;
 
     let count_sql = format!("SELECT COUNT(*) FROM invoices WHERE {filter}");
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(auth.user_id);
@@ -90,7 +92,7 @@ pub async fn invoice_detail(
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let invoice_id: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM invoices WHERE user_id = ? AND (CAST(id AS TEXT) = ? OR public_id = ?)",
+        "SELECT id FROM invoices WHERE user_id = $1 AND (CAST(id AS TEXT) = $2 OR public_id = $3)",
     )
     .bind(auth.user_id).bind(&id).bind(&id)
     .fetch_optional(&state.db.pool).await?;
@@ -102,7 +104,7 @@ pub async fn invoice_detail(
     let status = invoices::derive_payment_status(&state, &inv).await?;
 
     // adjustmentSummary
-    let rows = sqlx::query_as::<_, (String, i64)>("SELECT direction, amount FROM payment_adjustments WHERE invoice_id = ?")
+    let rows = sqlx::query_as::<_, (String, i64)>("SELECT direction, amount FROM payment_adjustments WHERE invoice_id = $1")
         .bind(invoice_id).fetch_all(&state.db.pool).await?;
     let (mut credit, mut debit) = (0i128, 0i128);
     for (dir, amt) in &rows {
@@ -145,7 +147,7 @@ pub async fn timeline(
 ) -> AppResult<Json<Value>> {
     // user-scoped existence check (404), then build the shared event list
     let inv_id: i64 = sqlx::query_scalar(
-        "SELECT id FROM invoices WHERE user_id = ? AND (CAST(id AS TEXT) = ? OR public_id = ?)",
+        "SELECT id FROM invoices WHERE user_id = $1 AND (CAST(id AS TEXT) = $2 OR public_id = $3)",
     )
     .bind(auth.user_id).bind(&id).bind(&id)
     .fetch_optional(&state.db.pool).await?
@@ -160,7 +162,7 @@ pub async fn timeline(
 pub(crate) async fn timeline_events(state: &AppState, invoice_id: i64) -> AppResult<Option<Vec<Value>>> {
     let inv: Option<TlInvoice> = sqlx::query_as::<_, TlInvoice>(
         "SELECT id, public_id, external_id, status, currency, total_amount, metadata, created_at, \
-         paid_at, expires_at, cancelled_at FROM invoices WHERE id = ?",
+         paid_at, expires_at, cancelled_at FROM invoices WHERE id = $1",
     )
     .bind(invoice_id)
     .fetch_optional(&state.db.pool).await?;
@@ -194,7 +196,7 @@ pub(crate) async fn timeline_events(state: &AppState, invoice_id: i64) -> AppRes
 
     // adjustments (full table available)
     let adjustments = sqlx::query_as::<_, (i64, String, String, i64, String, Option<String>, String, Option<String>)>(
-        "SELECT id, kind, direction, amount, currency, external_reference, reason, created_at FROM payment_adjustments WHERE invoice_id = ? ORDER BY id ASC",
+        "SELECT id, kind, direction, amount, currency, external_reference, reason, created_at FROM payment_adjustments WHERE invoice_id = $1 ORDER BY id ASC",
     ).bind(inv.id).fetch_all(&state.db.pool).await?;
     for (aid, kind, direction, amt, currency, ext, reason, c) in adjustments {
         let occurred = c.clone().unwrap_or_default();
@@ -206,7 +208,7 @@ pub(crate) async fn timeline_events(state: &AppState, invoice_id: i64) -> AppRes
     }
 
     // credits (minimal table)
-    let credits = sqlx::query_as::<_, (i64, i64, Option<String>)>("SELECT id, amount, created_at FROM payment_credits WHERE invoice_id = ? ORDER BY id ASC").bind(inv.id).fetch_all(&state.db.pool).await?;
+    let credits = sqlx::query_as::<_, (i64, i64, Option<String>)>("SELECT id, amount, created_at FROM payment_credits WHERE invoice_id = $1 ORDER BY id ASC").bind(inv.id).fetch_all(&state.db.pool).await?;
     for (cid, amt, c) in credits {
         let occurred = c.clone().unwrap_or_default();
         push(&mut entries, &occurred, 40, cid, json!({
@@ -228,12 +230,12 @@ pub async fn observations(
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
     let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM payment_observations po JOIN invoices i ON i.id = po.invoice_id WHERE i.user_id = ?",
+        "SELECT COUNT(*) FROM payment_observations po JOIN invoices i ON i.id = po.invoice_id WHERE i.user_id = $1",
     ).bind(auth.user_id).fetch_one(&state.db.pool).await?;
     let rows = sqlx::query_as::<_, (i64, Option<i64>, String, i64, i64, Option<String>)>(
         "SELECT po.id, po.invoice_id, po.status, po.amount, po.confirmations, po.created_at \
-         FROM payment_observations po JOIN invoices i ON i.id = po.invoice_id WHERE i.user_id = ? \
-         ORDER BY po.id DESC LIMIT ? OFFSET ?",
+         FROM payment_observations po JOIN invoices i ON i.id = po.invoice_id WHERE i.user_id = $1 \
+         ORDER BY po.id DESC LIMIT $2 OFFSET $3",
     ).bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     let data: Vec<Value> = rows.into_iter().map(|(id, inv, status, amount, conf, created)| json!({
         "id": id, "invoiceId": inv, "status": status, "amount": amount.to_string(), "confirmations": conf, "createdAt": created,
@@ -250,11 +252,11 @@ pub async fn credits(
     let page = q.page.unwrap_or(1).max(1);
     let per_page = q.per_page.unwrap_or(25).max(1);
     let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM payment_credits pc JOIN invoices i ON i.id = pc.invoice_id WHERE i.user_id = ?",
+        "SELECT COUNT(*) FROM payment_credits pc JOIN invoices i ON i.id = pc.invoice_id WHERE i.user_id = $1",
     ).bind(auth.user_id).fetch_one(&state.db.pool).await?;
     let rows = sqlx::query_as::<_, (i64, Option<i64>, i64, Option<String>)>(
         "SELECT pc.id, pc.invoice_id, pc.amount, pc.created_at FROM payment_credits pc \
-         JOIN invoices i ON i.id = pc.invoice_id WHERE i.user_id = ? ORDER BY pc.id DESC LIMIT ? OFFSET ?",
+         JOIN invoices i ON i.id = pc.invoice_id WHERE i.user_id = $1 ORDER BY pc.id DESC LIMIT $2 OFFSET $3",
     ).bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     let data: Vec<Value> = rows.into_iter().map(|(id, inv, amount, created)| json!({
         "id": id, "invoiceId": inv, "amount": amount.to_string(), "createdAt": created,

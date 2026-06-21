@@ -44,7 +44,7 @@ pub async fn evidence(
         "SELECT intent_id, invoice_id, status, tx_id, canonical_hash, signature_algorithm, \
          signature_key_id, template_id, template_version, script_hash, required_outputs, \
          verification_status, failure_reason, metadata FROM kpr1_payment_intents \
-         WHERE intent_id = ? OR canonical_hash = ?",
+         WHERE intent_id = $1 OR canonical_hash = $2",
     )
     .bind(&intent_id)
     .bind(&intent_id)
