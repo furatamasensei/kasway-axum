@@ -19,6 +19,36 @@ pub struct AppConfig {
     pub turnstile_secret: Option<String>,
     pub node_env: String,
     pub kpr1: Kpr1Config,
+    pub google: GoogleConfig,
+    /// CoinGecko simple-price base URL (overridable for tests). PricesController.
+    pub price_api_url: String,
+}
+
+/// Google OAuth (auth_controller redirectGoogle/callbackGoogle via @adonisjs/ally).
+/// Endpoint URLs are overridable so tests can point at a local mock.
+#[derive(Clone, Debug)]
+pub struct GoogleConfig {
+    pub client_id: String,
+    pub client_secret: String,
+    pub app_url: String,
+    pub frontend_url: String,
+    pub authorize_url: String,
+    pub token_url: String,
+    pub userinfo_url: String,
+}
+
+impl Default for GoogleConfig {
+    fn default() -> Self {
+        Self {
+            client_id: String::new(),
+            client_secret: String::new(),
+            app_url: "https://app.kasway.test".to_string(),
+            frontend_url: "https://kasway.test".to_string(),
+            authorize_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+            token_url: "https://oauth2.googleapis.com/token".to_string(),
+            userinfo_url: "https://www.googleapis.com/oauth2/v3/userinfo".to_string(),
+        }
+    }
 }
 
 /// KPR-1 intent minter config (env: KASWAY_PLATFORM_FEE_*, KPR1_*).
@@ -90,11 +120,18 @@ impl AppConfig {
                 kpr1.app_name = v;
             }
         }
+        let mut google = GoogleConfig::default();
+        if let Ok(v) = std::env::var("GOOGLE_CLIENT_ID") { google.client_id = v; }
+        if let Ok(v) = std::env::var("GOOGLE_CLIENT_SECRET") { google.client_secret = v; }
+        if let Ok(v) = std::env::var("APP_URL") { if !v.is_empty() { google.app_url = v; } }
+        if let Ok(v) = std::env::var("FRONTEND_URL") { if !v.is_empty() { google.frontend_url = v; } }
         Self {
             internal_api_token: std::env::var("INTERNAL_API_TOKEN").ok().filter(|s| !s.is_empty()),
             turnstile_secret: std::env::var("TURNSTILE_SECRET").ok().filter(|s| !s.is_empty()),
             node_env: std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
             kpr1,
+            google,
+            price_api_url: std::env::var("PRICE_API_URL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "https://api.coingecko.com/api/v3/simple/price".to_string()),
         }
     }
 
@@ -105,6 +142,8 @@ impl AppConfig {
             turnstile_secret: None,
             node_env: "test".to_string(),
             kpr1: Kpr1Config::default(),
+            google: GoogleConfig::default(),
+            price_api_url: "https://api.coingecko.com/api/v3/simple/price".to_string(),
         }
     }
 

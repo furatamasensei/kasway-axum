@@ -29,10 +29,20 @@ pub async fn spawn_app() -> TestApp {
 
 /// Spawn with explicit internal-token config (None => `internalApiToken` 503s).
 pub async fn spawn_with(internal_api_token: Option<String>) -> TestApp {
+    spawn_with_config(|c| c.internal_api_token = Some(INTERNAL_TOKEN.to_string()), internal_api_token.is_none()).await
+}
+
+/// Spawn the app with a custom config mutator (for OAuth endpoint overrides etc).
+/// `clear_internal_token` removes the internal token after the mutator runs.
+pub async fn spawn_with_config(mutate: impl FnOnce(&mut AppConfig), clear_internal_token: bool) -> TestApp {
     let db = Db::connect_memory().await.expect("connect memory db");
 
     let mut config = AppConfig::test_default();
-    config.internal_api_token = internal_api_token;
+    config.internal_api_token = Some(INTERNAL_TOKEN.to_string());
+    mutate(&mut config);
+    if clear_internal_token {
+        config.internal_api_token = None;
+    }
 
     let state = AppState {
         db: db.clone(),

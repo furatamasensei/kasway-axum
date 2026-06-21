@@ -1,0 +1,43 @@
+-- Public bug reports (BugReportService). Attachments + tracker forwarding are
+-- stubbed (manual_export_stub) exactly as the Adonis v1 service does.
+
+CREATE TABLE bug_reports (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_id TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL DEFAULT 'new',
+  category TEXT NOT NULL,
+  impact TEXT NOT NULL DEFAULT 'medium',
+  summary TEXT NOT NULL,
+  description TEXT NOT NULL,
+  steps_to_reproduce TEXT,
+  expected_behavior TEXT,
+  actual_behavior TEXT,
+  contact_email TEXT,
+  contact_name TEXT,
+  page_url TEXT,
+  browser TEXT,
+  os TEXT,
+  invoice_id TEXT,
+  payment_id TEXT,
+  transaction_id TEXT,
+  reporter_user_id INTEGER,
+  store_id INTEGER,
+  ip_hash TEXT,
+  user_agent TEXT,
+  captcha_provider TEXT,
+  captcha_success INTEGER NOT NULL DEFAULT 0,
+  captcha_hostname TEXT,
+  captcha_action TEXT,
+  captcha_error_codes TEXT,
+  safe_metadata TEXT,
+  tracker_provider TEXT,
+  tracker_external_id TEXT,
+  tracker_external_url TEXT,
+  forwarded_at TEXT,
+  forward_error TEXT,
+  triaged_at TEXT,
+  closed_at TEXT,
+  created_at TEXT,
+  updated_at TEXT
+);
+CREATE INDEX bug_reports_status_index ON bug_reports(status, created_at);

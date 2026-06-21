@@ -14,7 +14,7 @@ pub mod state;
 pub mod store_context;
 pub mod util;
 
-use axum::routing::{get, post};
+use axum::routing::{any, delete, get, post};
 use axum::Router;
 use state::AppState;
 
@@ -58,11 +58,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/failures", get(handlers::internal_observability::failures))
         .route("/internal/payment-ops/tn10/status", get(handlers::internal_observability::tn10_status))
         // --- Internal SLO (DB-derived) ---
+        .route("/internal/payment-ops/status", get(handlers::payment_launch::internal_status))
         .route("/internal/payment-ops/slo", get(handlers::internal_slo::slo))
         .route("/internal/payment-ops/slo/queues", get(handlers::internal_slo::queues))
         .route("/internal/payment-ops/slo/incidents", get(handlers::internal_slo::incidents))
         // --- Internal static contracts ---
         .route("/internal/payment-ops/tocatta/silverscript/templates", get(handlers::internal_silverscript::index))
+        .route("/internal/payment-ops/tocatta/silverscript/status", get(handlers::internal_silverscript::status))
+        .route("/internal/payment-ops/tocatta/silverscript/templates/:id/compile", post(handlers::internal_silverscript::compile))
+        .route("/internal/payment-ops/tocatta/covenants/transactions/dry-run", post(handlers::internal_covenant::dry_run))
+        .route("/internal/payment-ops/tocatta/covenants/tn10/status", get(handlers::internal_covenant::tn10_status))
+        .route("/internal/payment-ops/tocatta/covenants/tn10/split-executions", post(handlers::internal_covenant::execute_split))
+        .route("/internal/payment-ops/tocatta/covenants/tn10/hold-release-executions", post(handlers::internal_covenant::execute_hold_release))
         .route("/internal/payment-ops/security/launch-gate", get(handlers::internal_security_gate::show))
         .route("/internal/payment-ops/tocatta/production/status", get(handlers::internal_tocatta_production::status))
         .route("/internal/payment-ops/tocatta/production/cutover-runbook", get(handlers::internal_tocatta_production::cutover_runbook_handler))
@@ -75,6 +82,26 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/tocatta/beta/contracts", get(handlers::internal_tocatta_beta::contract))
         // --- Internal KPR-1 ops (DB evidence) ---
         .route("/internal/payment-ops/kpr1/intents/:intentId/evidence", get(handlers::internal_kpr1_ops::evidence))
+        .route("/internal/payment-ops/kpr1/conformance", get(handlers::internal_kpr1_ops::conformance))
+        .route("/internal/payment-ops/kpr1/status", get(handlers::internal_kpr1_ops::status))
+        // --- Media (merchant) ---
+        .route("/api/media", post(handlers::medias::store))
+        .route("/api/media/:id", delete(handlers::medias::destroy))
+        // --- Public bug reports ---
+        .route("/api/bug-reports", post(handlers::bug_reports::store))
+        // --- Public docs (static) ---
+        .route("/openapi.json", get(handlers::docs::openapi))
+        .route("/docs", get(handlers::docs::docs))
+        // --- Public misc (beta templates, price) ---
+        .route("/api/payments/tocatta/beta/templates", get(handlers::public_misc::beta_templates))
+        .route("/api/price", get(handlers::public_misc::price))
+        // --- Transmit (SSE) ---
+        .route("/__transmit/events", get(handlers::transmit::events))
+        .route("/__transmit/subscribe", post(handlers::transmit::subscribe))
+        .route("/__transmit/unsubscribe", post(handlers::transmit::unsubscribe))
+        // --- Admin queue dashboard (disabled gate) ---
+        .route("/admin/queue", any(handlers::admin_queue::gate))
+        .route("/admin/queue/*rest", any(handlers::admin_queue::gate))
         // --- Public KPR-1 explorer ---
         .route("/api/explorer/kpr1/intents/:intentId", get(handlers::explorer_kpr1::show_intent))
         .route("/api/explorer/kpr1/intents/:intentId/wallet-verification", get(handlers::explorer_kpr1::wallet_verification))
@@ -85,6 +112,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/register", post(handlers::auth::register))
         .route("/api/auth/profile", get(handlers::auth::profile))
+        .route("/api/auth/google/redirect", get(handlers::auth::redirect_google))
+        .route("/auth/google/callback", get(handlers::auth::callback_google))
         .route("/api/auth/logout", post(handlers::auth::logout))
         // --- Merchant API (auth) ---
         .route("/api/currencies", get(handlers::currencies::index))
@@ -126,8 +155,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/payments/ops/exceptions/:id/resolution", get(handlers::payment_exceptions::resolution))
         .route("/api/payments/ops/exceptions/:id/resolve", post(handlers::payment_exceptions::resolve))
         .route("/api/payments/ops/exceptions/:id/dismiss", post(handlers::payment_exceptions::dismiss))
+        .route("/api/payments/ops/exceptions/:id/link-observation", post(handlers::payment_exceptions::link_observation))
+        .route("/api/payments/ops/exceptions/:id/ignore-observation", post(handlers::payment_exceptions::ignore_observation))
         // --- Payment-ops risk (auth) ---
         .route("/api/payments/ops/risk/catalog", get(handlers::payment_risk::catalog))
+        .route("/api/payments/ops/risk/evaluate", post(handlers::payment_risk::evaluate))
         .route("/api/payments/ops/risk/rule-hits", get(handlers::payment_risk::index))
         .route("/api/payments/ops/risk/rule-hits/:id", get(handlers::payment_risk::show))
         .route("/api/payments/ops/risk/rule-hits/:id/acknowledge", post(handlers::payment_risk::acknowledge))
@@ -174,6 +206,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/payments/ops/exports/:id", get(handlers::payment_operations_exports::show))
         .route("/api/payments/ops/exports/:id/download", get(handlers::payment_operations_exports::download))
+        // --- Payment-ops launch status (auth) ---
+        .route("/api/payments/ops/status", get(handlers::payment_launch::status))
         // --- Payment-ops analytics (auth) ---
         .route("/api/payments/ops/analytics/summary", get(handlers::payment_analytics::summary))
         .route("/api/payments/ops/analytics/timeseries", get(handlers::payment_analytics::timeseries))
@@ -210,6 +244,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/support/payments/webhook-deliveries/:id", get(handlers::payment_support_operations::get_webhook_delivery))
         .route("/api/support/payments/invoices/:id/notes", post(handlers::payment_support_operations::add_invoice_note))
         .route("/api/support/payments/invoices/:id/evidence-packs/regenerate", post(handlers::payment_support_operations::regenerate_evidence_pack))
+        .route("/api/support/payments/webhook-deliveries/:id/replay", post(handlers::payment_support_operations::replay_webhook_delivery))
         // --- Payment audit token-read endpoints (public; grant token + scope) ---
         .route("/api/payments/audit/:token/statements", get(handlers::payment_audit_access::statements))
         .route("/api/payments/audit/:token/exports", get(handlers::payment_audit_access::exports))
@@ -286,6 +321,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/checkout/invoices/:publicId/kpr1-intent",
             get(handlers::checkout::kpr1_intent),
         )
+        .route("/api/checkout/invoices/:publicId/kpr1-payments", post(handlers::checkout::submit_kpr1_payment))
         .route("/api/checkout/links/:publicId", get(handlers::checkout::link_show))
         .route(
             "/api/checkout/links/:publicId/invoices",

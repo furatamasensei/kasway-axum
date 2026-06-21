@@ -164,6 +164,38 @@ async fn exceptions_unknown_merchant_empty() {
 }
 
 #[tokio::test]
+async fn replay_webhook_delivery_creates_replay() {
+    let app = common::spawn_app().await;
+    let (uid, inv) = seed(&app, "sup5@example.com").await;
+    let ep = sqlx::query("INSERT INTO webhook_endpoints (user_id, url, events, signing_secret, is_active, created_at, updated_at) VALUES (?, 'https://x.test/hook', '[\"invoice.paid\"]', 'whsec_s', 1, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
+        .bind(uid).execute(&app.db.pool).await.unwrap().last_insert_rowid();
+    let ev = sqlx::query("INSERT INTO webhook_events (user_id, event_type, resource_type, resource_id, payload, created_at, updated_at) VALUES (?, 'invoice.paid', 'invoice', ?, '{}', '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
+        .bind(uid).bind(inv.to_string()).execute(&app.db.pool).await.unwrap().last_insert_rowid();
+    let dl = sqlx::query("INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, is_replay, created_at, updated_at) VALUES (?, ?, 'failed', 3, 0, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
+        .bind(ev).bind(ep).execute(&app.db.pool).await.unwrap().last_insert_rowid();
+
+    let res = app.client.post(app.url(&format!("/api/support/payments/webhook-deliveries/{dl}/replay")))
+        .bearer_auth(common::INTERNAL_TOKEN).send().await.unwrap();
+    assert_eq!(res.status(), 202);
+    let r: Value = res.json().await.unwrap();
+    assert_eq!(r["status"], "pending");
+    assert_eq!(r["isReplay"], true);
+    assert_eq!(r["attemptCount"], 0);
+    assert_eq!(r["webhookEventId"], ev);
+    assert_eq!(r["merchantId"], uid);
+    assert_ne!(r["id"], dl); // a new row
+
+    // two delivery rows now exist for the event
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_event_id = ?").bind(ev).fetch_one(&app.db.pool).await.unwrap();
+    assert_eq!(count, 2);
+
+    // replay missing -> 404
+    let nf = app.client.post(app.url("/api/support/payments/webhook-deliveries/99999/replay")).bearer_auth(common::INTERNAL_TOKEN).send().await.unwrap();
+    assert_eq!(nf.status(), 404);
+    assert_eq!(nf.json::<Value>().await.unwrap()["message"], "Webhook delivery not found");
+}
+
+#[tokio::test]
 async fn support_requires_internal_token() {
     let app = common::spawn_app().await;
     assert_eq!(app.client.get(app.url("/api/support/payments/search")).send().await.unwrap().status(), 401);

@@ -397,12 +397,9 @@ pub async fn invoice_timeline(
     Ok(Json(json!({ "data": masked })))
 }
 
-/// `GET /api/support/payments/webhook-deliveries/:id`
-pub async fn get_webhook_delivery(
-    _token: InternalToken,
-    State(state): State<AppState>,
-    Path(id): Path<i64>,
-) -> AppResult<Json<Value>> {
+/// Build the support webhook-delivery shape (masked endpoint secret + event
+/// payload). Returns None if the delivery or its event is missing.
+async fn support_delivery_json(state: &AppState, id: i64) -> AppResult<Option<Value>> {
     let d = sqlx::query_as::<_, (i64, i64, i64, String, i64, Option<i64>, Option<String>, Option<String>, bool, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
         "SELECT id, webhook_event_id, webhook_endpoint_id, status, attempt_count, response_status, \
          response_body, error, is_replay, last_attempted_at, next_attempt_at, delivered_at, created_at, updated_at \
@@ -411,21 +408,21 @@ pub async fn get_webhook_delivery(
     .bind(id)
     .fetch_optional(&state.db.pool)
     .await?;
-    let (did, event_id, endpoint_id, status, attempt_count, response_status, response_body, error, is_replay, last_attempted_at, next_attempt_at, delivered_at, created_at, updated_at) =
-        d.ok_or_else(|| AppError::commerce(404, "Webhook delivery not found"))?;
+    let Some((did, event_id, endpoint_id, status, attempt_count, response_status, response_body, error, is_replay, last_attempted_at, next_attempt_at, delivered_at, created_at, updated_at)) = d else {
+        return Ok(None);
+    };
 
-    // event (required: 404 if absent)
     let event = sqlx::query_as::<_, (i64, i64, String, String, String, String, Option<String>, Option<String>)>(
         "SELECT id, user_id, event_type, resource_type, resource_id, payload, created_at, updated_at \
          FROM webhook_events WHERE id = ?",
     )
     .bind(event_id)
     .fetch_optional(&state.db.pool)
-    .await?
-    .ok_or_else(|| AppError::commerce(404, "Webhook delivery not found"))?;
-    let (ev_id, ev_user, ev_type, ev_rtype, ev_rid, ev_payload, ev_created, ev_updated) = event;
+    .await?;
+    let Some((ev_id, ev_user, ev_type, ev_rtype, ev_rid, ev_payload, ev_created, ev_updated)) = event else {
+        return Ok(None);
+    };
 
-    // endpoint (optional)
     let endpoint = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, bool, Option<String>, Option<String>, Option<String>, Option<String>)>(
         "SELECT id, user_id, store_id, url, events, is_active, paused_at, secret_rotated_at, created_at, updated_at \
          FROM webhook_endpoints WHERE id = ?",
@@ -445,7 +442,7 @@ pub async fn get_webhook_delivery(
     let body_len = response_body.as_ref().map(|s| s.len()).unwrap_or(0);
     let payload: Value = serde_json::from_str(&ev_payload).unwrap_or(json!({}));
 
-    Ok(Json(json!({
+    Ok(Some(json!({
         "id": did,
         "webhookEventId": event_id,
         "webhookEndpointId": endpoint_id,
@@ -470,6 +467,52 @@ pub async fn get_webhook_delivery(
             "resourceId": ev_rid, "payload": mask_value(&payload), "createdAt": ev_created, "updatedAt": ev_updated,
         },
     })))
+}
+
+/// `GET /api/support/payments/webhook-deliveries/:id`
+pub async fn get_webhook_delivery(
+    _token: InternalToken,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<Value>> {
+    support_delivery_json(&state, id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| AppError::commerce(404, "Webhook delivery not found"))
+}
+
+/// `POST /api/support/payments/webhook-deliveries/:id/replay`
+/// Creates a replay delivery row (pending, isReplay) and returns it. The actual
+/// re-delivery is the worker's job (DeliverWebhookJob) — stubbed here.
+pub async fn replay_webhook_delivery(
+    _token: InternalToken,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Response> {
+    let original = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT webhook_event_id, webhook_endpoint_id FROM webhook_deliveries WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&state.db.pool)
+    .await?
+    .ok_or_else(|| AppError::commerce(404, "Webhook delivery not found"))?;
+    let (event_id, endpoint_id) = original;
+
+    let now = now_iso();
+    let replay_id = sqlx::query(
+        "INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, is_replay, created_at, updated_at) \
+         VALUES (?, ?, 'pending', 0, 1, ?, ?)",
+    )
+    .bind(event_id)
+    .bind(endpoint_id)
+    .bind(&now)
+    .bind(&now)
+    .execute(&state.db.pool)
+    .await?
+    .last_insert_rowid();
+
+    let value = support_delivery_json(&state, replay_id).await?.expect("just inserted");
+    Ok((StatusCode::ACCEPTED, Json(value)).into_response())
 }
 
 fn support_actor_id(headers: &HeaderMap) -> Option<String> {

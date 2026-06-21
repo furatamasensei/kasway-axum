@@ -8,7 +8,7 @@ license = "UNLICENSED"
 publish = false
 
 [workspace.dependencies]
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
@@ -20,9 +20,10 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+futures = "0.3"
 base64 = "0.22"
 rand = "0.8"
 scrypt = "0.11"

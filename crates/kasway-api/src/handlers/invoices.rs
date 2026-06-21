@@ -165,7 +165,7 @@ fn serialize_item(item: &ItemRow) -> Value {
     })
 }
 
-fn serialize_intent(intent: &IntentRow) -> Value {
+pub(crate) fn serialize_intent(intent: &IntentRow) -> Value {
     json!({
         "id": intent.id,
         "invoiceId": intent.invoice_id,

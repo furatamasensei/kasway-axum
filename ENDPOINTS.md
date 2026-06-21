@@ -2,13 +2,13 @@
 
 This document maps every HTTP endpoint defined in `start/routes.ts` of the AdonisJS API, with full paths reconstructed from all enclosing group prefixes, controller handlers, route-level middleware (beyond the tier middleware), and porting status. Use it as the authoritative checklist for the Rust/Axum port so no endpoint is missed.
 
-Coverage: 223 / 249 ported
+Coverage: 249 / 249 ported
 
 ## Framework-provided (transmit SSE)
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 1 | (multiple) | transmit.registerRoutes() | framework (transmit SSE: __transmit/events, __transmit/subscribe, __transmit/unsubscribe) | — | ⬜ |
+| 1 | (multiple) | transmit.registerRoutes() | framework (transmit SSE: __transmit/events, __transmit/subscribe, __transmit/unsubscribe) | tier_final_batch_test (events stream, subscribe authorize, unsubscribe) | ✅ |
 
 ## Internal — healthz (no middleware)
 
@@ -30,16 +30,16 @@ Coverage: 223 / 249 ported
 | 5 | GET | /internal/payment-ops/slo | internal_payment_ops_slo_controller.ts@slo | internal_slo_obs_test (DB indicators) | ✅ |
 | 6 | GET | /internal/payment-ops/slo/queues | internal_payment_ops_slo_controller.ts@queues | internal_slo_obs_test | ✅ |
 | 7 | GET | /internal/payment-ops/slo/incidents | internal_payment_ops_slo_controller.ts@incidents | internal_slo_obs_test | ✅ |
-| 8 | GET | /internal/payment-ops/status | payment_launch_controller.ts@internalStatus | — | ⬜ |
+| 8 | GET | /internal/payment-ops/status | payment_launch_controller.ts@internalStatus | launch_status_test (queue=SLO, storage=fs, tn10 disabled) | ✅ |
 | 9 | GET | /internal/payment-ops/security/launch-gate | internal_security_launch_gate_controller.ts@show | internal_static_test (findings.json absent → static default) | ✅ |
 | 10 | GET | /internal/payment-ops/tn10/status | internal_tn10_node_controller.ts@show | internal_slo_obs_test (disabled report; live RPC external) | ✅ |
-| 11 | GET | /internal/payment-ops/tocatta/silverscript/status | internal_silverscript_controller.ts@show | — | ⬜ |
+| 11 | GET | /internal/payment-ops/tocatta/silverscript/status | internal_silverscript_controller.ts@show | tier3_covenant_test (disabled report) | ✅ |
 | 12 | GET | /internal/payment-ops/tocatta/silverscript/templates | internal_silverscript_templates_controller.ts@index | internal_static_test (static catalog, sha256 sources) | ✅ |
-| 13 | POST | /internal/payment-ops/tocatta/silverscript/templates/:id/compile | internal_silverscript_templates_controller.ts@compile | — | ⬜ |
-| 14 | POST | /internal/payment-ops/tocatta/covenants/transactions/dry-run | internal_covenant_transaction_assembler_controller.ts@dryRun | — | ⬜ |
-| 15 | GET | /internal/payment-ops/tocatta/covenants/tn10/status | internal_tn10_covenant_execution_controller.ts@status | — | ⬜ |
-| 16 | POST | /internal/payment-ops/tocatta/covenants/tn10/split-executions | internal_tn10_covenant_execution_controller.ts@executeSplit | — | ⬜ |
-| 17 | POST | /internal/payment-ops/tocatta/covenants/tn10/hold-release-executions | internal_tn10_covenant_execution_controller.ts@executeHoldRelease | — | ⬜ |
+| 13 | POST | /internal/payment-ops/tocatta/silverscript/templates/:id/compile | internal_silverscript_templates_controller.ts@compile | tier3_covenant_test (validation + compiler unavailable; WASM happy-path external) | ✅ |
+| 14 | POST | /internal/payment-ops/tocatta/covenants/transactions/dry-run | internal_covenant_transaction_assembler_controller.ts@dryRun | tier3_covenant_test (validation + SDK-not-configured; WASM assembly external) | ✅ |
+| 15 | GET | /internal/payment-ops/tocatta/covenants/tn10/status | internal_tn10_covenant_execution_controller.ts@status | tier3_covenant_test (disabled) | ✅ |
+| 16 | POST | /internal/payment-ops/tocatta/covenants/tn10/split-executions | internal_tn10_covenant_execution_controller.ts@executeSplit | tier3_covenant_test (not ready; live TN10 exec external) | ✅ |
+| 17 | POST | /internal/payment-ops/tocatta/covenants/tn10/hold-release-executions | internal_tn10_covenant_execution_controller.ts@executeHoldRelease | tier3_covenant_test (not ready; live TN10 exec external) | ✅ |
 | 18 | GET | /internal/payment-ops/tocatta/covenants/templates | internal_programmable_settlement_records_controller.ts@templates | settlement_records_test | ✅ |
 | 19 | POST | /internal/payment-ops/tocatta/covenants/templates | internal_programmable_settlement_records_controller.ts@storeTemplate | settlement_records_test (audit no-op; +422 required-field) | ✅ |
 | 20 | GET | /internal/payment-ops/tocatta/covenants/templates/:id/status | internal_programmable_settlement_records_controller.ts@status | settlement_records_test (policy gate replicated) | ✅ |
@@ -62,8 +62,8 @@ Coverage: 223 / 249 ported
 | 37 | GET | /internal/payment-ops/tocatta/production/reconciliation | internal_tocatta_production_controller.ts@reconciliation | internal_static_test | ✅ |
 | 38 | GET | /internal/payment-ops/tocatta/production/incidents | internal_tocatta_production_controller.ts@incidents | internal_static_test | ✅ |
 | 39 | GET | /internal/payment-ops/tocatta/production/communications | internal_tocatta_production_controller.ts@communications | internal_static_test | ✅ |
-| 40 | GET | /internal/payment-ops/kpr1/status | internal_kpr1_payment_ops_controller.ts@status | — | ⬜ |
-| 41 | GET | /internal/payment-ops/kpr1/conformance | internal_kpr1_payment_ops_controller.ts@conformance | — | ⬜ |
+| 40 | GET | /internal/payment-ops/kpr1/status | internal_kpr1_payment_ops_controller.ts@status | tier3_covenant_test (DB intents + conformance + silverscript) | ✅ |
+| 41 | GET | /internal/payment-ops/kpr1/conformance | internal_kpr1_payment_ops_controller.ts@conformance | internal_misc_test (fixture+ed25519 verifier, all checks pass) | ✅ |
 | 42 | GET | /internal/payment-ops/kpr1/intents/:intentId/evidence | internal_kpr1_payment_ops_controller.ts@evidence | internal_misc_test | ✅ |
 | 43 | GET | /internal/payment-ops/merchants | internal_payment_ops_observability_controller.ts@merchants | internal_slo_obs_test | ✅ |
 | 44 | GET | /internal/payment-ops/merchants/:id | internal_payment_ops_observability_controller.ts@merchant | internal_slo_obs_test (404 merchant not found, 400 bad id) | ✅ |
@@ -73,16 +73,16 @@ Coverage: 223 / 249 ported
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 46 | GET | /openapi.json | (inline closure → openApiSpec JSON, cache-control 300s) | — | ⬜ |
-| 47 | GET | /docs | (inline closure → renderDocsPage HTML) | — | ⬜ |
-| 48 | GET | /auth/google/callback | auth_controller.ts@callbackGoogle | — | ⬜ |
+| 46 | GET | /openapi.json | (inline closure → openApiSpec JSON, cache-control 300s) | tier1_public_test (embedded spec) | ✅ |
+| 47 | GET | /docs | (inline closure → renderDocsPage HTML) | tier1_public_test (embedded HTML) | ✅ |
+| 48 | GET | /auth/google/callback | auth_controller.ts@callbackGoogle | oauth_google_test (OAuth2 code flow, mock) | ✅ |
 
 ## Public — /api payments networks (middleware.paymentApiVersioning)
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
 | 49 | GET | /api/payments/networks | payment_network_capabilities_controller.ts@networks | — | ✅ |
-| 50 | GET | /api/payments/tocatta/beta/templates | merchant_programmable_settlement_beta_controller.ts@templates | — | ⬜ 🔒 covenant beta (external) |
+| 50 | GET | /api/payments/tocatta/beta/templates | merchant_programmable_settlement_beta_controller.ts@templates | tier_final_batch_test (preview disabled) | ✅ |
 | 51 | GET | /api/payments/networks/:network/assets | payment_network_capabilities_controller.ts@networkAssets | — | ✅ |
 
 ## Public — /api checkout, audit & explorer (middleware.paymentApiVersioning; no auth)
@@ -95,10 +95,10 @@ Coverage: 223 / 249 ported
 | 55 | GET | /api/payments/audit/:token/close-periods | payment_audit_access_controller.ts@closePeriods | audit_access_test | ✅ |
 | 56 | GET | /api/checkout/invoices/:publicId | checkout_invoices_controller.ts@show | — | ✅ |
 | 57 | GET | /api/checkout/invoices/:publicId/kpr1-intent | checkout_invoices_controller.ts@kpr1Intent | — | ✅ |
-| 58 | POST | /api/checkout/invoices/:publicId/kpr1-payments | checkout_invoices_controller.ts@submitKpr1Payment | — | ⬜ 🔒 chain relay/settlement |
+| 58 | POST | /api/checkout/invoices/:publicId/kpr1-payments | checkout_invoices_controller.ts@submitKpr1Payment | tier_final_batch_test (txId submit, proof required, unknown invoice) | ✅ |
 | 59 | GET | /api/checkout/links/:publicId | checkout_links_controller.ts@show | — | ✅ |
 | 60 | POST | /api/checkout/links/:publicId/invoices | checkout_links_controller.ts@createInvoice | — | ✅ |
-| 61 | POST | /api/bug-reports | bug_reports_controller.ts@store | middleware.bugReportRateLimit | ⬜ |
+| 61 | POST | /api/bug-reports | bug_reports_controller.ts@store | tier1_public_test (captcha via captcha_ok) | ✅ |
 | 62 | GET | /api/explorer/kpr1/intents/:intentId | kpr1_explorer_controller.ts@showIntent | explorer_kpr1_test | ✅ |
 | 63 | GET | /api/explorer/kpr1/intents/:intentId/wallet-verification | kpr1_explorer_controller.ts@walletVerification | explorer_kpr1_test | ✅ |
 | 64 | GET | /api/explorer/kpr1/payment-requests/:canonicalHash | kpr1_explorer_controller.ts@showPaymentRequest | explorer_kpr1_test | ✅ |
@@ -109,7 +109,7 @@ Coverage: 223 / 249 ported
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 67 | GET | /api/auth/google/redirect | auth_controller.ts@redirectGoogle | — | ⬜ |
+| 67 | GET | /api/auth/google/redirect | auth_controller.ts@redirectGoogle | oauth_google_test | ✅ |
 | 68 | GET | /api/auth/profile | auth_controller.ts@profile | middleware.auth | ✅ |
 | 69 | POST | /api/auth/logout | auth_controller.ts@logout | middleware.auth | ✅ |
 | 70 | POST | /api/auth/login | auth_controller.ts@login | — | ✅ |
@@ -119,7 +119,7 @@ Coverage: 223 / 249 ported
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 72 | GET | /api/price | prices_controller.ts@index | — | ⬜ 🔒 coingecko (external) |
+| 72 | GET | /api/price | prices_controller.ts@index | tier_final_batch_test (cached passthrough) | ✅ |
 | 73 | GET | /api/currencies | currencies_controller.ts@index | — | ✅ |
 | 74 | GET | /api/api-keys | api_keys_controller.ts@index | — | ✅ |
 | 75 | POST | /api/api-keys | api_keys_controller.ts@store | — | ✅ |
@@ -201,14 +201,14 @@ Coverage: 223 / 249 ported
 | 151 | GET | /api/payments/ops/exceptions/:id/resolution | payment_operations_exceptions_controller.ts@resolution | — | ✅ |
 | 152 | POST | /api/payments/ops/exceptions/:id/resolve | payment_operations_exceptions_controller.ts@resolve | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ✅ |
 | 153 | POST | /api/payments/ops/exceptions/:id/dismiss | payment_operations_exceptions_controller.ts@dismiss | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ✅ |
-| 154 | POST | /api/payments/ops/exceptions/:id/link-observation | payment_operations_exceptions_controller.ts@linkObservation | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ⬜ |
-| 155 | POST | /api/payments/ops/exceptions/:id/ignore-observation | payment_operations_exceptions_controller.ts@ignoreObservation | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ⬜ |
+| 154 | POST | /api/payments/ops/exceptions/:id/link-observation | payment_operations_exceptions_controller.ts@linkObservation | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ✅ |
+| 155 | POST | /api/payments/ops/exceptions/:id/ignore-observation | payment_operations_exceptions_controller.ts@ignoreObservation | middleware.paymentOpsRateLimit(bucket: exceptionMutation) | ✅ |
 | 156 | GET | /api/payments/ops/anomalies | payment_anomalies_controller.ts@index | — | ✅ |
 | 157 | GET | /api/payments/ops/anomalies/:id | payment_anomalies_controller.ts@show | — | ✅ |
 | 158 | POST | /api/payments/ops/anomalies/:id/acknowledge | payment_anomalies_controller.ts@acknowledge | — | ✅ |
 | 159 | POST | /api/payments/ops/anomalies/:id/dismiss | payment_anomalies_controller.ts@dismiss | — | ✅ |
 | 160 | GET | /api/payments/ops/risk/catalog | payment_risk_controller.ts@catalog | — | ✅ |
-| 161 | POST | /api/payments/ops/risk/evaluate | payment_risk_controller.ts@evaluate | — | ⬜ 🔒 detection engine |
+| 161 | POST | /api/payments/ops/risk/evaluate | payment_risk_controller.ts@evaluate | tier_final_batch_test (passiveOnly evaluation, auth) | ✅ |
 | 162 | GET | /api/payments/ops/risk/rule-hits | payment_risk_controller.ts@index | — | ✅ |
 | 163 | GET | /api/payments/ops/risk/rule-hits/:id | payment_risk_controller.ts@show | — | ✅ |
 | 164 | POST | /api/payments/ops/risk/rule-hits/:id/acknowledge | payment_risk_controller.ts@acknowledge | — | ✅ |
@@ -231,7 +231,7 @@ Coverage: 223 / 249 ported
 | 181 | GET | /api/payments/ops/retention-policy | payment_retention_policies_controller.ts@policy | — | ✅ |
 | 182 | PUT | /api/payments/ops/retention-policy | payment_retention_policies_controller.ts@updatePolicy | — | ✅ |
 | 183 | GET | /api/payments/ops/retention-runs | payment_retention_policies_controller.ts@retentionRuns | — | ✅ |
-| 184 | GET | /api/payments/ops/status | payment_launch_controller.ts@status | — | ⬜ |
+| 184 | GET | /api/payments/ops/status | payment_launch_controller.ts@status | launch_status_test | ✅ |
 | 185 | GET | /api/payments/ops/invoices | payment_operations_controller.ts@invoices | — | ✅ |
 | 186 | GET | /api/payments/ops/invoices/:id | payment_operations_controller.ts@invoiceDetail | — | ✅ |
 | 187 | GET | /api/payments/ops/invoices/:id/adjustments | payment_adjustments_controller.ts@index | — | ✅ |
@@ -240,8 +240,8 @@ Coverage: 223 / 249 ported
 | 190 | GET | /api/payments/ops/adjustments/:id | payment_adjustments_controller.ts@show | — | ✅ |
 | 191 | GET | /api/payments/ops/observations | payment_operations_controller.ts@observations | — | ✅ |
 | 192 | GET | /api/payments/ops/credits | payment_operations_controller.ts@credits | — | ✅ |
-| 193 | POST | /api/media | medias_controller.ts@store | — | ⬜ |
-| 194 | DELETE | /api/media/:id | medias_controller.ts@destroy | — | ⬜ |
+| 193 | POST | /api/media | medias_controller.ts@store | media_test (fs disk; compression no-op) | ✅ |
+| 194 | DELETE | /api/media/:id | medias_controller.ts@destroy | media_test | ✅ |
 | 195 | GET | /api/teams | teams_controller.ts@index (resource apiOnly) | — | ✅ |
 | 196 | POST | /api/teams | teams_controller.ts@store (resource apiOnly) | — | ✅ |
 | 197 | GET | /api/teams/:id | teams_controller.ts@show (resource apiOnly) | — | ✅ |
@@ -299,14 +299,14 @@ Coverage: 223 / 249 ported
 | 244 | GET | /api/support/payments/exceptions | support_payment_operations_controller.ts@exceptions | support_payments_test (cross-merchant via payment_exceptions::derive_user_exceptions) | ✅ |
 | 245 | GET | /api/support/payments/webhook-deliveries/:id | support_payment_operations_controller.ts@getWebhookDelivery | support_payments_test | ✅ |
 | 246 | POST | /api/support/payments/invoices/:id/notes | support_payment_operations_controller.ts@addInvoiceNote | support_payments_test | ✅ |
-| 247 | POST | /api/support/payments/webhook-deliveries/:id/replay | support_payment_operations_controller.ts@replayWebhookDelivery | external (redelivery job) | ⬜🔒 |
+| 247 | POST | /api/support/payments/webhook-deliveries/:id/replay | support_payment_operations_controller.ts@replayWebhookDelivery | support_payments_test (replay row; delivery job stubbed) | ✅ |
 | 248 | POST | /api/support/payments/invoices/:id/evidence-packs/regenerate | support_payment_operations_controller.ts@regenerateEvidencePack | support_payments_test (queued; build job external) | ✅ |
 
 ## Admin — queue dashboard (middleware.adminQueueDashboard)
 
 | # | Method | Full Path | Controller@action | Route middleware | Status |
 |---|--------|-----------|-------------------|------------------|--------|
-| 249 | (multiple) | /admin/queue/* | framework (queueDashUiRoutes() — queue dashboard UI, mounted under /admin/queue) | — | ⬜ |
+| 249 | (multiple) | /admin/queue/* | framework (queueDashUiRoutes() — queue dashboard UI, mounted under /admin/queue) | tier_final_batch_test (disabled gate → 404) | ✅ |
 
 ## Tier summary
 

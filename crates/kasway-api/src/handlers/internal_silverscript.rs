@@ -103,3 +103,132 @@ pub async fn index(_token: InternalToken) -> Json<Value> {
         "templates": templates,
     }))
 }
+
+/// `GET /internal/payment-ops/tocatta/silverscript/status` —
+/// SilverScriptCompatibilityService.getStatus(). Disabled in the shipped config
+/// (SILVERSCRIPT_COMPATIBILITY_ENABLED unset) → static disabled report.
+pub async fn status(_token: InternalToken) -> Json<Value> {
+    let now = now_iso();
+    Json(json!({
+        "status": "disabled",
+        "ready": false,
+        "compatibilityOutcome": "blocked",
+        "targetNetwork": "tn10",
+        "generatedAt": now,
+        "sourceCheckedAt": now,
+        "checks": [{ "key": "silverscript.enabled", "status": "fail", "message": "SilverScript status is disabled by default" }],
+        "tn10NodeStatus": Value::Null,
+        "metadata": {
+            "enabled": false, "repoPath": Value::Null, "compilerCommand": Value::Null, "compilerCommit": Value::Null,
+            "expectedNetwork": "tn10", "rustyKaspaSdkPath": Value::Null, "rustyKaspaSdkSha256": Value::Null, "rustyKaspaCommit": Value::Null,
+        },
+    }))
+}
+
+// ---- compile (#13) ---------------------------------------------------------
+
+use crate::error::AppResult;
+use axum::extract::Path;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+
+// (name, kind, required, allowed_values)
+fn schema_for(id: &str) -> Option<Vec<(&'static str, &'static str, bool, &'static [&'static str])>> {
+    let empty: &[&str] = &[];
+    match id {
+        "split_settlement" => Some(vec![
+            ("grossAmount", "atomic_amount", true, empty),
+            ("taxBps", "basis_points", true, empty),
+            ("splitBps", "basis_points", true, empty),
+            ("platformFeeBps", "basis_points", true, empty),
+            ("merchantDestination", "address", true, empty),
+            ("taxDestination", "address", false, empty),
+            ("platformFeeDestination", "address", false, empty),
+        ]),
+        "refund_window" => Some(vec![
+            ("grossAmount", "atomic_amount", true, empty),
+            ("holdReason", "text", true, empty),
+            ("timeoutSeconds", "seconds", true, empty),
+            ("responsibleActor", "enum", true, &["merchant", "support", "system"]),
+        ]),
+        "conditional_release" => Some(vec![
+            ("grossAmount", "atomic_amount", true, empty),
+            ("releaseCondition", "enum", true, &["timeout", "merchant_confirmed", "support_approved"]),
+            ("responsibleActor", "enum", true, &["merchant", "support", "system"]),
+        ]),
+        _ => None,
+    }
+}
+
+fn compiler_err(code: &str, message: String, metadata: Option<Value>) -> Response {
+    let mut body = json!({ "code": code, "message": message });
+    if let Some(m) = metadata { body["metadata"] = m; }
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
+}
+
+fn is_empty_arg(v: &Value) -> bool {
+    matches!(v, Value::Null) || matches!(v, Value::String(s) if s.is_empty())
+}
+
+fn validate_value(id: &str, name: &str, kind: &str, allowed: &[&str], v: &Value) -> Result<(), Response> {
+    let positive_int = |val: &Value| -> bool {
+        let t = match val { Value::String(s) => s.clone(), Value::Number(n) => n.to_string(), _ => return false };
+        !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) && t.parse::<u128>().map(|n| n > 0).unwrap_or(false)
+    };
+    match kind {
+        "atomic_amount" | "seconds" => {
+            if !positive_int(v) {
+                return Err(compiler_err("INVALID_SILVERSCRIPT_ARGUMENT", format!("{name} must be a positive integer"), None));
+            }
+        }
+        "basis_points" => {
+            let n = match v { Value::Number(n) => n.as_i64(), Value::String(s) => s.parse::<i64>().ok(), _ => None };
+            match n { Some(b) if (0..=10000).contains(&b) => {}, _ => return Err(compiler_err("INVALID_SILVERSCRIPT_ARGUMENT", format!("{name} must be an integer between 0 and 10000"), None)) }
+        }
+        "address" | "text" => {
+            match v { Value::String(s) if !s.trim().is_empty() => {}, _ => return Err(compiler_err("INVALID_SILVERSCRIPT_ARGUMENT", format!("{name} must be a non-empty string"), None)) }
+        }
+        "enum" => {
+            let sv = match v { Value::String(s) => s.clone(), other => other.to_string() };
+            if !allowed.contains(&sv.as_str()) {
+                return Err(compiler_err("INVALID_SILVERSCRIPT_ARGUMENT", format!("{name} is not supported by {id}"), None));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `POST /internal/payment-ops/tocatta/silverscript/templates/:id/compile`
+pub async fn compile(_token: InternalToken, Path(id): Path<String>, Json(body): Json<Value>) -> AppResult<Response> {
+    let schema = match schema_for(&id) {
+        Some(s) => s,
+        None => return Ok(compiler_err("UNSUPPORTED_SILVERSCRIPT_TEMPLATE", "Only allowlisted Kasway SilverScript templates can be compiled".into(), None)),
+    };
+    let args = body.get("args").cloned().unwrap_or(json!({}));
+    let args_obj = args.as_object().cloned().unwrap_or_default();
+    let allowed_names: Vec<&str> = schema.iter().map(|(n, ..)| *n).collect();
+
+    // unknown argument names
+    for key in args_obj.keys() {
+        if !allowed_names.contains(&key.as_str()) {
+            return Ok(compiler_err("UNSUPPORTED_SILVERSCRIPT_ARGUMENT", format!("{key} is not supported by {id}"), None));
+        }
+    }
+    // required + per-kind validation
+    for (name, kind, required, allowed) in &schema {
+        let val = args_obj.get(*name);
+        let present = val.map(|v| !is_empty_arg(v)).unwrap_or(false);
+        if *required && !present {
+            return Ok(compiler_err("MISSING_SILVERSCRIPT_ARGUMENT", format!("{name} is required"), None));
+        }
+        if present {
+            if let Err(resp) = validate_value(&id, name, kind, allowed, val.unwrap()) {
+                return Ok(resp);
+            }
+        }
+    }
+
+    // compiler unavailable in the shipped config (SilverScript status disabled → metadata missing)
+    Ok(compiler_err("SILVERSCRIPT_STATUS_METADATA_MISSING", "compilerCommand is missing from SilverScript status metadata".into(), None))
+}

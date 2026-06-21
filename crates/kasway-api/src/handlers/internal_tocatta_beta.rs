@@ -32,7 +32,7 @@ fn status_language() -> Value {
         "unsupported": "Programmable settlement unsupported"
     })
 }
-fn merchant_contract() -> Value {
+pub(crate) fn merchant_contract() -> Value {
     json!({
         "enabled": false, "previewOnly": true, "creationEnabled": false, "executionEnabled": false,
         "approvedTemplatesOnly": true, "freeFormScriptsAccepted": false, "mainnetSupported": false,
