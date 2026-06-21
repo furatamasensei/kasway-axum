@@ -30,7 +30,7 @@ struct TemplateRow {
     status: String,
     source_hash: String,
     compiler_commit: Option<String>,
-    kill_switch_enabled: bool,
+    kill_switch_enabled: i64,
     created_by_user_id: Option<i64>,
     approved_by_user_id: Option<i64>,
     approved_at: Option<String>,
@@ -50,7 +50,7 @@ fn ser_template(t: &TemplateRow, relations: Option<(Vec<Value>, Vec<Value>, Vec<
         "status": t.status,
         "sourceHash": t.source_hash,
         "compilerCommit": t.compiler_commit,
-        "killSwitchEnabled": t.kill_switch_enabled,
+        "killSwitchEnabled": t.kill_switch_enabled != 0,
         "createdByUserId": t.created_by_user_id,
         "approvedByUserId": t.approved_by_user_id,
         "approvedAt": t.approved_at,
@@ -386,7 +386,7 @@ pub async fn status(_token: InternalToken, State(state): State<AppState>, Path(i
 
     let mut checks: Vec<(String, bool, String)> = vec![
         ("template.status".into(), t.status == "approved", "Template must be approved before beta exposure".into()),
-        ("template.killSwitch".into(), t.kill_switch_enabled, "Kill switch must be active before beta exposure".into()),
+        ("template.killSwitch".into(), t.kill_switch_enabled != 0, "Kill switch must be active before beta exposure".into()),
         ("template.compiledArtifact".into(), has_artifact, "A compiled artifact record is required".into()),
         ("template.executionEvidence".into(), has_execution_evidence, "Successful TN10 execution evidence is required".into()),
     ];

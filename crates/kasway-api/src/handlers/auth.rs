@@ -18,6 +18,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use url::Url;
 
+/// Serializes an integer-backed boolean flag (Postgres stores booleans as
+/// 0/1 BIGINT) as a JSON boolean to preserve the API contract.
+fn ser_int_as_bool<S: serde::Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_bool(*v != 0)
+}
+
 #[derive(Serialize, sqlx::FromRow)]
 #[serde(rename_all = "camelCase")]
 pub struct UserDto {
@@ -25,7 +31,8 @@ pub struct UserDto {
     full_name: Option<String>,
     email: String,
     avatar_url: Option<String>,
-    onboarded: bool,
+    #[serde(serialize_with = "ser_int_as_bool")]
+    onboarded: i64,
     created_at: Option<String>,
     updated_at: Option<String>,
 }
@@ -63,7 +70,7 @@ pub async fn login(
             return Err(AppError::bad_credentials());
         }
         let token = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, id).await?;
-        let onboarded: bool =
+        let onboarded: i64 =
             sqlx::query_scalar("SELECT onboarded FROM users WHERE id = $1")
                 .bind(id)
                 .fetch_one(&state.db.pool)
@@ -71,7 +78,7 @@ pub async fn login(
         return Ok(Json(json!({
             "token": token,
             "role": "merchant",
-            "onboarded": onboarded,
+            "onboarded": onboarded != 0,
         })));
     }
 
@@ -332,7 +339,7 @@ pub async fn callback_google(
     let email = info.email.filter(|e| !e.is_empty()).ok_or_else(|| AppError::commerce(502, "Google account has no email"))?;
 
     // firstOrCreate by email
-    let existing: Option<(i64, bool)> = sqlx::query_as("SELECT id, onboarded FROM users WHERE email = $1")
+    let existing: Option<(i64, i64)> = sqlx::query_as("SELECT id, onboarded FROM users WHERE email = $1")
         .bind(&email)
         .fetch_optional(&state.db.pool)
         .await?;
@@ -353,14 +360,14 @@ pub async fn callback_google(
             .bind(&now)
             .fetch_one(&state.db.pool)
             .await?;
-            (id, false)
+            (id, 0i64)
         }
     };
 
     let token_value = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, user_id).await?;
     let location = format!(
         "{}/auth/callback?token={}&onboarded={}",
-        g.frontend_url, token_value, onboarded
+        g.frontend_url, token_value, onboarded != 0
     );
     Ok((StatusCode::FOUND, [(header::LOCATION, location)]).into_response())
 }

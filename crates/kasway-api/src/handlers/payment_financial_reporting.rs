@@ -38,7 +38,7 @@ struct CategoryRow {
     calculation_mode: String,
     rate: Option<String>,
     amount: Option<i64>,
-    is_active: bool,
+    is_active: i64,
     created_at: Option<String>,
     updated_at: Option<String>,
 }
@@ -55,7 +55,7 @@ fn serialize_category(c: &CategoryRow) -> Value {
         "calculationMode": c.calculation_mode,
         "rate": c.rate,
         "amount": c.amount.map(|a| a.to_string()),
-        "isActive": c.is_active,
+        "isActive": c.is_active != 0,
         "createdAt": c.created_at,
         "updatedAt": c.updated_at,
     })

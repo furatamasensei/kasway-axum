@@ -415,7 +415,7 @@ pub async fn invoice_timeline(
 /// Build the support webhook-delivery shape (masked endpoint secret + event
 /// payload). Returns None if the delivery or its event is missing.
 async fn support_delivery_json(state: &AppState, id: i64) -> AppResult<Option<Value>> {
-    let d = sqlx::query_as::<_, (i64, i64, i64, String, i64, Option<i64>, Option<String>, Option<String>, bool, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
+    let d = sqlx::query_as::<_, (i64, i64, i64, String, i64, Option<i64>, Option<String>, Option<String>, i64, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)>(
         "SELECT id, webhook_event_id, webhook_endpoint_id, status, attempt_count, response_status, \
          response_body, error, is_replay, last_attempted_at, next_attempt_at, delivered_at, created_at, updated_at \
          FROM webhook_deliveries WHERE id = $1",
@@ -438,7 +438,7 @@ async fn support_delivery_json(state: &AppState, id: i64) -> AppResult<Option<Va
         return Ok(None);
     };
 
-    let endpoint = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, bool, Option<String>, Option<String>, Option<String>, Option<String>)>(
+    let endpoint = sqlx::query_as::<_, (i64, i64, Option<i64>, String, String, i64, Option<String>, Option<String>, Option<String>, Option<String>)>(
         "SELECT id, user_id, store_id, url, events, is_active, paused_at, secret_rotated_at, created_at, updated_at \
          FROM webhook_endpoints WHERE id = $1",
     )
@@ -449,7 +449,7 @@ async fn support_delivery_json(state: &AppState, id: i64) -> AppResult<Option<Va
         json!({
             "id": eid, "userId": euser, "storeId": estore, "url": url,
             "events": serde_json::from_str::<Value>(&events).unwrap_or(json!([])),
-            "isActive": active, "pausedAt": paused, "secretRotatedAt": rotated,
+            "isActive": active != 0, "pausedAt": paused, "secretRotatedAt": rotated,
             "createdAt": ec, "updatedAt": eu, "signingSecret": "[redacted]",
         })
     });
@@ -465,7 +465,7 @@ async fn support_delivery_json(state: &AppState, id: i64) -> AppResult<Option<Va
         "attemptCount": attempt_count,
         "responseStatus": response_status,
         "error": error,
-        "isReplay": is_replay,
+        "isReplay": is_replay != 0,
         "lastAttemptedAt": last_attempted_at,
         "nextAttemptAt": next_attempt_at,
         "deliveredAt": delivered_at,

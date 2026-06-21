@@ -44,7 +44,7 @@ struct EndpointRow {
     store_id: Option<i64>,
     url: String,
     events: String,
-    is_active: bool,
+    is_active: i64,
     paused_at: Option<String>,
     secret_rotated_at: Option<String>,
     created_at: Option<String>,
@@ -61,7 +61,7 @@ fn serialize_endpoint(e: &EndpointRow, deliveries: Option<&[DeliveryRow]>) -> Va
         "storeId": e.store_id,
         "url": e.url,
         "events": serde_json::from_str::<Value>(&e.events).unwrap_or(json!([])),
-        "isActive": e.is_active,
+        "isActive": e.is_active != 0,
         "pausedAt": e.paused_at,
         "secretRotatedAt": e.secret_rotated_at,
         "createdAt": e.created_at,
@@ -119,7 +119,7 @@ struct DeliveryRow {
     response_status: Option<i64>,
     response_body: Option<String>,
     error: Option<String>,
-    is_replay: bool,
+    is_replay: i64,
     last_attempted_at: Option<String>,
     next_attempt_at: Option<String>,
     delivered_at: Option<String>,
@@ -141,7 +141,7 @@ fn serialize_delivery(d: &DeliveryRow, endpoint: Option<&EndpointRow>, event: Op
         "responseStatus": d.response_status,
         "responseBody": d.response_body,
         "error": d.error,
-        "isReplay": d.is_replay,
+        "isReplay": d.is_replay != 0,
         "lastAttemptedAt": d.last_attempted_at,
         "nextAttemptAt": d.next_attempt_at,
         "deliveredAt": d.delivered_at,
@@ -421,7 +421,7 @@ pub async fn endpoints_test_send(
     };
 
     let events: Vec<String> = serde_json::from_str(&e.events).unwrap_or_default();
-    let subscribed = e.is_active && e.paused_at.is_none() && events.contains(&event_type);
+    let subscribed = e.is_active != 0 && e.paused_at.is_none() && events.contains(&event_type);
     if !subscribed {
         return Err(AppError::Validation(vec![ValidationFailure {
             message: format!("Endpoint is not subscribed to {event_type}"),

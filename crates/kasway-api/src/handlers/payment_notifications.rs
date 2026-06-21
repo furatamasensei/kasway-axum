@@ -26,7 +26,7 @@ struct PrefRow {
     user_id: i64,
     category: String,
     channels: String,
-    enabled: bool,
+    enabled: i64,
     created_at: Option<String>,
     updated_at: Option<String>,
 }
@@ -37,7 +37,7 @@ fn serialize_pref(p: &PrefRow) -> Value {
         "userId": p.user_id,
         "category": p.category,
         "channels": serde_json::from_str::<Value>(&p.channels).unwrap_or(json!([])),
-        "enabled": p.enabled,
+        "enabled": p.enabled != 0,
         "createdAt": p.created_at,
         "updatedAt": p.updated_at,
     })
