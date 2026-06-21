@@ -59,7 +59,7 @@ fn serialize_pack(p: &PackRow) -> Value {
     })
 }
 
-async fn load(state: &AppState, user_id: i64, id: &str) -> AppResult<Option<PackRow>> {
+async fn load(state: &AppState, user_id: i64, id: i64) -> AppResult<Option<PackRow>> {
     Ok(sqlx::query_as::<_, PackRow>(
         "SELECT * FROM payment_evidence_packs WHERE user_id = $1 AND id = $2",
     )
@@ -125,7 +125,7 @@ pub async fn store(
     .bind(&now)
     .fetch_one(&state.db.pool)
     .await?;
-    let row = load(&state, auth.user_id, &new_id.to_string()).await?.expect("just inserted");
+    let row = load(&state, auth.user_id, new_id).await?.expect("just inserted");
     Ok((StatusCode::ACCEPTED, Json(serialize_pack(&row))).into_response())
 }
 
@@ -135,7 +135,8 @@ pub async fn show(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let p = load(&state, auth.user_id, &id)
+    let id: i64 = id.parse().map_err(|_| AppError::commerce(404, "Payment evidence pack not found"))?;
+    let p = load(&state, auth.user_id, id)
         .await?
         .ok_or_else(|| AppError::commerce(404, "Payment evidence pack not found"))?;
     Ok(Json(serialize_pack(&p)))
@@ -147,7 +148,8 @@ pub async fn download(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    let p = load(&state, auth.user_id, &id)
+    let id: i64 = id.parse().map_err(|_| AppError::commerce(404, "Payment evidence pack not found"))?;
+    let p = load(&state, auth.user_id, id)
         .await?
         .ok_or_else(|| AppError::commerce(404, "Payment evidence pack not found"))?;
     if p.status != "succeeded" || p.storage_path.as_deref().unwrap_or("").is_empty() {

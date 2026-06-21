@@ -530,7 +530,7 @@ fn serialize_manifest(m: &ManifestRow) -> Value {
     })
 }
 
-async fn load_manifest(state: &AppState, user_id: i64, id: &str) -> AppResult<Option<ManifestRow>> {
+async fn load_manifest(state: &AppState, user_id: i64, id: i64) -> AppResult<Option<ManifestRow>> {
     Ok(sqlx::query_as::<_, ManifestRow>(
         "SELECT * FROM payment_operation_exports WHERE user_id = $1 AND id = $2",
     )
@@ -642,7 +642,7 @@ pub async fn store(
         &state, auth.user_id, kind, format, "queued", &filters, 0, "", auth.user_id,
     )
     .await?;
-    let m = load_manifest(&state, auth.user_id, &id.to_string()).await?.expect("just inserted");
+    let m = load_manifest(&state, auth.user_id, id).await?.expect("just inserted");
     Ok((StatusCode::ACCEPTED, Json(serialize_manifest(&m))).into_response())
 }
 
@@ -651,7 +651,8 @@ pub async fn show(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let m = load_manifest(&state, auth.user_id, &id)
+    let id: i64 = id.parse().map_err(|_| AppError::commerce(404, "Payment operation export not found"))?;
+    let m = load_manifest(&state, auth.user_id, id)
         .await?
         .ok_or_else(|| AppError::commerce(404, "Payment operation export not found"))?;
     Ok(Json(serialize_manifest(&m)))
@@ -662,7 +663,8 @@ pub async fn download(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    let m = load_manifest(&state, auth.user_id, &id)
+    let id: i64 = id.parse().map_err(|_| AppError::commerce(404, "Payment operation export not found"))?;
+    let m = load_manifest(&state, auth.user_id, id)
         .await?
         .ok_or_else(|| AppError::commerce(404, "Payment operation export not found"))?;
     if m.status != "succeeded" || m.storage_path.is_none() {
