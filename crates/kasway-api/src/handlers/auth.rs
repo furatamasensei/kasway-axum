@@ -60,7 +60,7 @@ pub async fn login(
 
     // merchant (User) path
     if let Some((id, stored)) = sqlx::query_as::<_, (i64, String)>(
-        "SELECT id, password FROM users WHERE email = $1",
+        "SELECT id, password FROM users WHERE LOWER(email) = LOWER($1)",
     )
     .bind(&email)
     .fetch_optional(&state.db.pool)
@@ -84,7 +84,7 @@ pub async fn login(
 
     // team-member (client) path
     let member = sqlx::query_as::<_, (i64, Option<String>, String)>(
-        "SELECT id, password, role FROM team_members WHERE email = $1",
+        "SELECT id, password, role FROM team_members WHERE LOWER(email) = LOWER($1)",
     )
     .bind(&email)
     .fetch_optional(&state.db.pool)
@@ -339,7 +339,7 @@ pub async fn callback_google(
     let email = info.email.filter(|e| !e.is_empty()).ok_or_else(|| AppError::commerce(502, "Google account has no email"))?;
 
     // firstOrCreate by email
-    let existing: Option<(i64, i64)> = sqlx::query_as("SELECT id, onboarded FROM users WHERE email = $1")
+    let existing: Option<(i64, i64)> = sqlx::query_as("SELECT id, onboarded FROM users WHERE LOWER(email) = LOWER($1)")
         .bind(&email)
         .fetch_optional(&state.db.pool)
         .await?;
