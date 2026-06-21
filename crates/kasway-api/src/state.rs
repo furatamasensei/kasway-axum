@@ -147,15 +147,38 @@ impl AppConfig {
         }
     }
 
-    /// Replicates `CaptchaService.validateTurnstile` for the bypass case.
-    /// Returns true when captcha is satisfied. Real Turnstile verification
-    /// (network) is deferred; if a secret is configured we conservatively fail
-    /// closed unless a token is present (full HTTP verify ported later).
-    pub fn captcha_ok(&self, token: Option<&str>) -> bool {
-        if self.turnstile_secret.is_none() && self.node_env != "production" {
-            return true;
+    /// Replicates `CaptchaService.validateTurnstile`. Returns true when captcha
+    /// is satisfied. When no secret is configured the check is bypassed outside
+    /// production (dev/test behavior). When a secret is set, the token is
+    /// verified against Cloudflare's Turnstile siteverify endpoint; any failure
+    /// (missing token, network error, non-success response) fails closed.
+    pub async fn captcha_ok(&self, token: Option<&str>, remote_ip: Option<&str>) -> bool {
+        // No secret configured: bypass outside production, fail closed in prod.
+        let Some(secret) = self.turnstile_secret.as_deref() else {
+            return self.node_env != "production";
+        };
+        // Secret configured: a non-empty token is mandatory.
+        let Some(token) = token.filter(|t| !t.is_empty()) else {
+            return false;
+        };
+
+        // POST secret/response (+ optional remoteip) to Cloudflare siteverify.
+        let mut form: Vec<(&str, &str)> = vec![("secret", secret), ("response", token)];
+        if let Some(ip) = remote_ip.filter(|s| !s.is_empty()) {
+            form.push(("remoteip", ip));
         }
-        // secret configured: cannot verify without the network call yet.
-        token.is_some() && self.turnstile_secret.is_some()
+        let resp = match reqwest::Client::new()
+            .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
+            .form(&form)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return false, // network error -> fail closed
+        };
+        match resp.json::<serde_json::Value>().await {
+            Ok(body) => body.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+            Err(_) => false,
+        }
     }
 }

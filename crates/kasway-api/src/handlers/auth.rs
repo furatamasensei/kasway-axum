@@ -44,7 +44,7 @@ pub async fn login(
 ) -> AppResult<Json<Value>> {
     // captcha first (matches controller order)
     let captcha_token = body.get("token").and_then(|v| v.as_str());
-    if !state.config.captcha_ok(captcha_token) {
+    if !state.config.captcha_ok(captcha_token, None).await {
         return Err(AppError::bad_request("Captcha validation failed"));
     }
 
@@ -114,7 +114,7 @@ pub async fn register(
     Json(body): Json<Value>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     let captcha_token = body.get("token").and_then(|v| v.as_str());
-    if !state.config.captcha_ok(captcha_token) {
+    if !state.config.captcha_ok(captcha_token, None).await {
         return Err(AppError::bad_request("Captcha validation failed"));
     }
 

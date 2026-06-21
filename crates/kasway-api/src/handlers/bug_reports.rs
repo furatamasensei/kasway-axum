@@ -78,8 +78,11 @@ pub async fn store(
         }
     }
 
+    // client IP (best-effort: x-forwarded-for else loopback)
+    let ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).and_then(|s| s.split(',').next()).map(|s| s.trim().to_string()).unwrap_or_else(|| "127.0.0.1".into());
+
     // --- captcha ---
-    if !state.config.captcha_ok(Some(&token)) {
+    if !state.config.captcha_ok(Some(&token), Some(&ip)).await {
         return Err(AppError::commerce(400, "Captcha validation failed"));
     }
 
@@ -87,8 +90,6 @@ pub async fn store(
     let website = opt_str(&body, "website", 255);
     let status = if website.is_some() { "spam" } else { "new" };
 
-    // ip hash (best-effort: x-forwarded-for else loopback)
-    let ip = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).and_then(|s| s.split(',').next()).map(|s| s.trim().to_string()).unwrap_or_else(|| "127.0.0.1".into());
     let ip_hash = format!("{:x}", Sha256::digest(format!("{APP_KEY_DEFAULT}:{ip}").as_bytes()));
     let user_agent = headers.get("user-agent").and_then(|v| v.to_str().ok()).map(|s| s.chars().take(512).collect::<String>());
     let reporter_user_id = reporter.map(|r| r.user_id);

@@ -50,4 +50,5 @@ pub mod stores;
 pub mod subscriptions;
 pub mod team_members;
 pub mod teams;
+pub mod waitlist;
 pub mod webhooks;

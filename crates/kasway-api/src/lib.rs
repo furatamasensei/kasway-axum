@@ -43,6 +43,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // --- Unauthenticated ---
         .route("/internal/healthz", get(handlers::health::healthz))
+        .route("/api/waitlist/join", post(handlers::waitlist::join_waitlist))
         // --- Public payments networks (paymentApiVersioning) ---
         .route("/api/payments/networks", get(handlers::payments_networks::networks))
         .route("/api/payments/networks/:network/assets", get(handlers::payments_networks::network_assets))
