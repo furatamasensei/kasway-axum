@@ -2,10 +2,11 @@
 //! WebhookEndpointsController / WebhookEventsController /
 //! WebhookDeliveryControlsController + their services.
 //!
-//! Merchant-guarded (owner always has `payments.ops.manage_webhooks`). Actual
-//! HTTP delivery (DeliverWebhookJob) + notifications are deferred — delivery
-//! rows are created `pending`. URL registration enforces the SSRF policy
-//! (synchronous checks; DNS resolution is deferred).
+//! Merchant-guarded (owner always has `payments.ops.manage_webhooks`).
+//! Delivery rows are created `pending` and picked up by the background
+//! delivery worker (`crate::webhook_worker`); notifications are deferred.
+//! URL registration enforces the SSRF policy (synchronous checks; DNS
+//! resolution is deferred).
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
@@ -213,7 +214,7 @@ async fn find_endpoint_global(state: &AppState, id: i64) -> AppResult<EndpointRo
 
 // ---------- URL policy (SSRF) ----------
 
-fn validate_webhook_url(raw: &str, allow_loopback: bool) -> Result<(), (&'static str, &'static str)> {
+pub(crate) fn validate_webhook_url(raw: &str, allow_loopback: bool) -> Result<(), (&'static str, &'static str)> {
     let parsed = url::Url::parse(raw).map_err(|_| ("invalid_url", "Webhook URL is not a valid URL"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(("embedded_credentials", "Webhook URL must not contain embedded credentials"));
@@ -248,7 +249,7 @@ fn is_forbidden_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
-fn allow_loopback(state: &AppState) -> bool {
+pub(crate) fn allow_loopback(state: &AppState) -> bool {
     state.config.node_env != "production"
 }
 
@@ -463,7 +464,7 @@ async fn create_delivery(state: &AppState, event_id: i64, endpoint_id: i64, is_r
     )
     .bind(event_id).bind(endpoint_id).bind(is_replay as i64).bind(now).bind(now)
     .fetch_one(&state.db.pool).await?;
-    // DeliverWebhookJob.dispatch -> deferred no-op
+    // Picked up by the background delivery worker (crate::webhook_worker).
     Ok(r)
 }
 

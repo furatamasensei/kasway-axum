@@ -20,6 +20,13 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(AppConfig::from_env()),
     };
 
+    // Background webhook delivery worker (WEBHOOK_WORKER_ENABLED, default on).
+    if kasway_api::webhook_worker::enabled_from_env() {
+        kasway_api::webhook_worker::spawn(state.clone());
+    } else {
+        tracing::info!("webhook delivery worker disabled via WEBHOOK_WORKER_ENABLED");
+    }
+
     let app = kasway_api::build_router(state);
 
     let addr = std::env::var("HOST_PORT").unwrap_or_else(|_| "0.0.0.0:3333".to_string());

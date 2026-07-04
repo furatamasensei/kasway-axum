@@ -873,6 +873,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "futures",
+ "hmac",
  "kasway-db",
  "rand 0.8.6",
  "reqwest",
