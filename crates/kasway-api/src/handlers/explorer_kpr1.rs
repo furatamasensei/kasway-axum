@@ -134,6 +134,12 @@ async fn intent_by(state: &AppState, col: &str, val: &str) -> AppResult<Option<I
         .bind(val).fetch_optional(&state.db.pool).await?)
 }
 
+/// `intent_by` for the BIGINT `invoice_id` column (Postgres rejects bigint = text).
+async fn intent_by_invoice(state: &AppState, invoice_id: i64) -> AppResult<Option<IntentRow>> {
+    Ok(sqlx::query_as::<_, IntentRow>(&format!("SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE invoice_id = $1 LIMIT 1"))
+        .bind(invoice_id).fetch_optional(&state.db.pool).await?)
+}
+
 async fn find_observation(state: &AppState, intent: &IntentRow, tx_id: Option<&str>) -> AppResult<Option<ObsRow>> {
     let tx = match tx_id.or(intent.tx_id.as_deref()) { Some(t) => t.to_string(), None => return Ok(None) };
     Ok(sqlx::query_as::<_, ObsRow>(&format!(
@@ -381,7 +387,7 @@ pub async fn show_payment_request(State(state): State<AppState>, Path(canonical_
 pub async fn show_invoice(State(state): State<AppState>, Path(public_id): Path<String>, Query(q): Query<ExplorerQuery>) -> AppResult<Response> {
     let invoice_id: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE public_id = $1").bind(&public_id).fetch_optional(&state.db.pool).await?;
     let intent = match invoice_id {
-        Some(id) => intent_by(&state, "invoice_id", &id.to_string()).await?,
+        Some(id) => intent_by_invoice(&state, id).await?,
         None => None,
     };
     match intent {

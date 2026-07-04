@@ -50,7 +50,7 @@ async fn notifications_index_and_read() {
     assert_eq!(empty["meta"]["total"], 0);
 
     // seed a notification
-    sqlx::query("INSERT INTO payment_notifications (user_id, category, severity, title_key, body_key, resource_type, resource_id, metadata, created_at, updated_at) VALUES (?, 'export_failed', 'warning', 't', 'b', 'export', '1', '{}', '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')")
+    sqlx::query("INSERT INTO payment_notifications (user_id, category, severity, title_key, body_key, resource_type, resource_id, metadata, created_at, updated_at) VALUES ($1, 'export_failed', 'warning', 't', 'b', 'export', '1', '{}', '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')")
         .bind(uid).execute(&app.db.pool).await.unwrap();
 
     let list: Value = app.client.get(app.url("/api/payments/ops/notifications")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();

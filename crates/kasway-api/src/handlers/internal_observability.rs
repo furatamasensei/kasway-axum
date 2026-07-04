@@ -71,7 +71,7 @@ async fn active_merchant_ids(state: &AppState, from: &str, to: &str, q: &ObsQuer
     let mut sql = String::from("SELECT DISTINCT user_id FROM invoices WHERE created_at BETWEEN $1 AND $2");
     let mut binds: Vec<String> = vec![from.into(), to.into()];
     let mut n = 3;
-    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND user_id = ${n}")); n += 1; binds.push(m.to_string()); }
+    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND user_id = CAST(${n} AS BIGINT)")); n += 1; binds.push(m.to_string()); }
     if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_network = ${n}")); n += 1; binds.push(net.into()); }
     if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_asset = ${n}")); n += 1; binds.push(a.into()); }
     let _ = n;
@@ -102,7 +102,7 @@ async fn invoice_volume(state: &AppState, from: &str, to: &str, q: &ObsQuery) ->
     let mut sql = String::from("SELECT status, COUNT(*), CAST(COALESCE(SUM(total_amount),0) AS BIGINT) FROM invoices WHERE created_at BETWEEN $1 AND $2");
     let mut binds: Vec<String> = vec![from.into(), to.into()];
     let mut n = 3;
-    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND user_id = ${n}")); n += 1; binds.push(m.to_string()); }
+    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND user_id = CAST(${n} AS BIGINT)")); n += 1; binds.push(m.to_string()); }
     if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_network = ${n}")); n += 1; binds.push(net.into()); }
     if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_asset = ${n}")); n += 1; binds.push(a.into()); }
     let _ = n;
@@ -126,7 +126,7 @@ async fn observation_volume(state: &AppState, from: &str, to: &str, q: &ObsQuery
     );
     let mut binds: Vec<String> = vec![from.into(), to.into()];
     let mut n = 3;
-    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND i.user_id = ${n}")); n += 1; binds.push(m.to_string()); }
+    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND i.user_id = CAST(${n} AS BIGINT)")); n += 1; binds.push(m.to_string()); }
     if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND po.network = ${n}")); n += 1; binds.push(net.into()); }
     if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND po.asset_id = ${n}")); n += 1; binds.push(a.into()); }
     let _ = n;
@@ -149,7 +149,7 @@ async fn settlement_summary(state: &AppState, from: &str, to: &str, q: &ObsQuery
     );
     let mut binds: Vec<String> = vec![from.into(), to.into()];
     let mut n = 3;
-    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND i.user_id = ${n}")); n += 1; binds.push(m.to_string()); }
+    if let Some(m) = q.merchant_id { sql.push_str(&format!(" AND i.user_id = CAST(${n} AS BIGINT)")); n += 1; binds.push(m.to_string()); }
     if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND i.payment_network = ${n}")); n += 1; binds.push(net.into()); }
     if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND i.payment_asset = ${n}")); n += 1; binds.push(a.into()); }
     let _ = n;

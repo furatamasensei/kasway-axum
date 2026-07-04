@@ -22,7 +22,7 @@ async fn slo_report_empty_db_indexer_critical() {
 async fn slo_report_fresh_checkpoint_ok() {
     let app = common::spawn_app().await;
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3f+00:00").to_string();
-    sqlx::query("INSERT INTO payment_indexer_checkpoints (network, asset_id, source, checkpoint, created_at, updated_at) VALUES ('tn10','KAS','rusty-kaspa-node','{}', ?, ?)")
+    sqlx::query("INSERT INTO payment_indexer_checkpoints (network, asset_id, source, checkpoint, created_at, updated_at) VALUES ('tn10','KAS','rusty-kaspa-node','{}', $1, $2)")
         .bind(&now).bind(&now).execute(&app.db.pool).await.unwrap();
     let res: Value = app.client.get(app.url("/internal/payment-ops/slo")).bearer_auth(tok()).send().await.unwrap().json().await.unwrap();
     assert_eq!(res["indicators"]["indexerFreshness"]["status"], "ok");

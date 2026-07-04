@@ -106,8 +106,10 @@ async fn audit_token_reads_exports_and_evidence_packs() {
     let uid = common::merchant_user_id(&app.db, "at2@example.com").await;
     let store = common::seed_default_store(&app.db, uid).await;
     let inv = common::seed_invoice(&app.db, uid, store, "inv_at2", "paid", 1000, 1000, 0, None, None, "2026-06-10T00:00:00.000+00:00").await;
-    // grant covers June (when export/evidence manifests are generated)
-    let gtoken = create_grant(&app, &bearer, json!(["exports", "evidence_packs"]), "2026-06-01", "2026-06-30").await;
+    // grant covers today (export/evidence manifests are generated "now")
+    let start = (chrono::Utc::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let end = (chrono::Utc::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let gtoken = create_grant(&app, &bearer, json!(["exports", "evidence_packs"]), &start, &end).await;
 
     let exp = app.client.get(app.url("/api/payments/ops/exports/invoices.csv")).bearer_auth(&bearer).send().await.unwrap();
     assert_eq!(exp.status(), 200);

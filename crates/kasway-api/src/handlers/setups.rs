@@ -24,24 +24,24 @@ struct SetupRow {
     id: i64,
     user_id: i64,
     store_id: Option<i64>,
-    tos_agreed: Option<bool>,
+    tos_agreed: Option<i64>,
     kaspa_main_address: Option<String>,
-    kaspa_tax_enabled: Option<bool>,
+    kaspa_tax_enabled: Option<i64>,
     kaspa_tax_address: Option<String>,
     kaspa_tax_percentage: Option<String>,
-    kaspa_split_enabled: Option<bool>,
+    kaspa_split_enabled: Option<i64>,
     kaspa_split_addresses: Option<String>,
     igra_main_address: Option<String>,
-    igra_tax_enabled: Option<bool>,
+    igra_tax_enabled: Option<i64>,
     igra_tax_address: Option<String>,
     igra_tax_percentage: Option<String>,
-    igra_split_enabled: Option<bool>,
+    igra_split_enabled: Option<i64>,
     igra_split_addresses: Option<String>,
     kasplex_main_address: Option<String>,
-    kasplex_tax_enabled: Option<bool>,
+    kasplex_tax_enabled: Option<i64>,
     kasplex_tax_address: Option<String>,
     kasplex_tax_percentage: Option<String>,
-    kasplex_split_enabled: Option<bool>,
+    kasplex_split_enabled: Option<i64>,
     kasplex_split_addresses: Option<String>,
     redirect_url: Option<String>,
     webhook_url: Option<String>,
@@ -68,24 +68,24 @@ fn serialize_setup(s: &SetupRow) -> Value {
         "id": s.id,
         "userId": s.user_id,
         "storeId": s.store_id,
-        "tosAgreed": s.tos_agreed.unwrap_or(false),
+        "tosAgreed": s.tos_agreed.unwrap_or(0) != 0,
         "kaspaMainAddress": s.kaspa_main_address,
-        "kaspaTaxEnabled": s.kaspa_tax_enabled.unwrap_or(false),
+        "kaspaTaxEnabled": s.kaspa_tax_enabled.unwrap_or(0) != 0,
         "kaspaTaxAddress": s.kaspa_tax_address,
         "kaspaTaxPercentage": s.kaspa_tax_percentage,
-        "kaspaSplitEnabled": s.kaspa_split_enabled.unwrap_or(false),
+        "kaspaSplitEnabled": s.kaspa_split_enabled.unwrap_or(0) != 0,
         "kaspaSplitAddresses": json_or_null(&s.kaspa_split_addresses),
         "igraMainAddress": s.igra_main_address,
-        "igraTaxEnabled": s.igra_tax_enabled.unwrap_or(false),
+        "igraTaxEnabled": s.igra_tax_enabled.unwrap_or(0) != 0,
         "igraTaxAddress": s.igra_tax_address,
         "igraTaxPercentage": s.igra_tax_percentage,
-        "igraSplitEnabled": s.igra_split_enabled.unwrap_or(false),
+        "igraSplitEnabled": s.igra_split_enabled.unwrap_or(0) != 0,
         "igraSplitAddresses": json_or_null(&s.igra_split_addresses),
         "kasplexMainAddress": s.kasplex_main_address,
-        "kasplexTaxEnabled": s.kasplex_tax_enabled.unwrap_or(false),
+        "kasplexTaxEnabled": s.kasplex_tax_enabled.unwrap_or(0) != 0,
         "kasplexTaxAddress": s.kasplex_tax_address,
         "kasplexTaxPercentage": s.kasplex_tax_percentage,
-        "kasplexSplitEnabled": s.kasplex_split_enabled.unwrap_or(false),
+        "kasplexSplitEnabled": s.kasplex_split_enabled.unwrap_or(0) != 0,
         "kasplexSplitAddresses": json_or_null(&s.kasplex_split_addresses),
         "redirectUrl": s.redirect_url,
         "webhookUrl": s.webhook_url,
@@ -462,7 +462,7 @@ async fn update_setup_for_store(
                 }]))
             }
         };
-        let tax_enabled = k.get("taxEnabled").and_then(|v| v.as_bool()).unwrap_or(setup.kaspa_tax_enabled.unwrap_or(false));
+        let tax_enabled = k.get("taxEnabled").and_then(|v| v.as_bool()).unwrap_or(setup.kaspa_tax_enabled.unwrap_or(0) != 0);
         let tax_address = if k.get("taxAddress").is_some() {
             k.get("taxAddress").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
         } else {
@@ -473,7 +473,7 @@ async fn update_setup_for_store(
         } else {
             setup.kaspa_tax_percentage.as_deref().and_then(|s| s.parse().ok())
         };
-        let split_enabled = k.get("splitEnabled").and_then(|v| v.as_bool()).unwrap_or(setup.kaspa_split_enabled.unwrap_or(false));
+        let split_enabled = k.get("splitEnabled").and_then(|v| v.as_bool()).unwrap_or(setup.kaspa_split_enabled.unwrap_or(0) != 0);
         let split_value: Option<Value> = if k.get("splitAddresses").is_some() {
             k.get("splitAddresses").cloned()
         } else {
@@ -542,24 +542,24 @@ fn new_setup_row(user_id: i64, store_id: i64) -> SetupRow {
         id: 0,
         user_id,
         store_id: Some(store_id),
-        tos_agreed: Some(true),
+        tos_agreed: Some(1),
         kaspa_main_address: None,
-        kaspa_tax_enabled: Some(false),
+        kaspa_tax_enabled: Some(0),
         kaspa_tax_address: None,
         kaspa_tax_percentage: None,
-        kaspa_split_enabled: Some(false),
+        kaspa_split_enabled: Some(0),
         kaspa_split_addresses: None,
         igra_main_address: None,
-        igra_tax_enabled: Some(false),
+        igra_tax_enabled: Some(0),
         igra_tax_address: None,
         igra_tax_percentage: None,
-        igra_split_enabled: Some(false),
+        igra_split_enabled: Some(0),
         igra_split_addresses: None,
         kasplex_main_address: None,
-        kasplex_tax_enabled: Some(false),
+        kasplex_tax_enabled: Some(0),
         kasplex_tax_address: None,
         kasplex_tax_percentage: None,
-        kasplex_split_enabled: Some(false),
+        kasplex_split_enabled: Some(0),
         kasplex_split_addresses: None,
         redirect_url: None,
         webhook_url: None,
@@ -604,7 +604,7 @@ fn apply_sections(source: &SetupRow, target: &mut SetupRow, sections: &[String])
 
 async fn upsert_full_setup(state: &AppState, t: &SetupRow, existing_id: Option<i64>) -> AppResult<()> {
     let now = now_iso();
-    let b = |o: Option<bool>| o.unwrap_or(false) as i64;
+    let b = |o: Option<i64>| o.unwrap_or(0);
     if let Some(id) = existing_id {
         sqlx::query(
             "UPDATE setups SET kaspa_main_address=$1, kaspa_tax_enabled=$2, kaspa_tax_address=$3, \

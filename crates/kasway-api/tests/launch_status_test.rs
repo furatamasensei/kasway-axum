@@ -31,9 +31,9 @@ async fn merchant_status_with_setup_and_endpoint() {
     let app = common::spawn_app().await;
     let token = common::register_merchant(&app, "ls2@example.com", "secret123").await;
     let uid = common::merchant_user_id(&app.db, "ls2@example.com").await;
-    sqlx::query("INSERT INTO setups (user_id, kaspa_main_address, webhook_url, created_at, updated_at) VALUES (?, 'kaspatest:merchantaddr', 'https://hook.test', '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')")
+    sqlx::query("INSERT INTO setups (user_id, kaspa_main_address, webhook_url, created_at, updated_at) VALUES ($1, 'kaspatest:merchantaddr', 'https://hook.test', '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')")
         .bind(uid).execute(&app.db.pool).await.unwrap();
-    sqlx::query("INSERT INTO webhook_endpoints (user_id, url, events, signing_secret, is_active, created_at, updated_at) VALUES (?, 'https://hook.test', '[]', 's', 1, '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')")
+    sqlx::query("INSERT INTO webhook_endpoints (user_id, url, events, signing_secret, is_active, created_at, updated_at) VALUES ($1, 'https://hook.test', '[]', 's', 1, '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')")
         .bind(uid).execute(&app.db.pool).await.unwrap();
 
     let r: Value = app.client.get(app.url("/api/payments/ops/status")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();

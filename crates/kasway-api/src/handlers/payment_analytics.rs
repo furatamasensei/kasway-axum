@@ -125,14 +125,15 @@ async fn load_invoices(state: &AppState, user_id: i64, q: &AnalyticsQuery, w: &W
         n, n + 1, n + 2,
     );
     n += 3;
-    let mut binds: Vec<String> = vec![user_id.to_string(), iso(w.from), iso(w.to)];
+    let mut binds: Vec<String> = vec![iso(w.from), iso(w.to)];
     if let Some(net) = q.network.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_network = ${n}")); n += 1; binds.push(net.into()); }
     if let Some(a) = q.asset_id.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND payment_asset = ${n}")); n += 1; binds.push(a.into()); }
     if let Some(c) = q.currency.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND currency = ${n}")); n += 1; binds.push(c.into()); }
     if let Some(s) = q.status.as_deref().filter(|s| !s.is_empty()) { sql.push_str(&format!(" AND status = ${n}")); n += 1; binds.push(s.into()); }
     let _ = n;
     sql.push_str(" ORDER BY created_at ASC");
-    let mut query = sqlx::query_as::<_, InvRow>(&sql);
+    // user_id must be bound as an integer (Postgres does not coerce text = bigint)
+    let mut query = sqlx::query_as::<_, InvRow>(&sql).bind(user_id);
     for b in &binds { query = query.bind(b.clone()); }
     Ok(query.fetch_all(&state.db.pool).await?)
 }

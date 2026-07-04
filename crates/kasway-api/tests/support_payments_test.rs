@@ -91,12 +91,12 @@ async fn get_webhook_delivery_masks_secrets() {
     let (uid, inv) = seed(&app, "sup4@example.com").await;
 
     // seed an endpoint, event, delivery directly
-    let ep = sqlx::query("INSERT INTO webhook_endpoints (user_id, url, events, signing_secret, is_active, created_at, updated_at) VALUES (?, 'https://x.test/hook', '[\"invoice.paid\"]', 'whsec_supersecret', 1, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
-        .bind(uid).execute(&app.db.pool).await.unwrap().last_insert_rowid();
-    let ev = sqlx::query("INSERT INTO webhook_events (user_id, event_type, resource_type, resource_id, payload, created_at, updated_at) VALUES (?, 'invoice.paid', 'invoice', ?, '{\"token\":\"abc\",\"amount\":100}', '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
-        .bind(uid).bind(inv.to_string()).execute(&app.db.pool).await.unwrap().last_insert_rowid();
-    let dl = sqlx::query("INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, response_body, is_replay, created_at, updated_at) VALUES (?, ?, 'delivered', 1, 'OK body', 0, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
-        .bind(ev).bind(ep).execute(&app.db.pool).await.unwrap().last_insert_rowid();
+    let ep = sqlx::query_scalar::<_, i64>("INSERT INTO webhook_endpoints (user_id, url, events, signing_secret, is_active, created_at, updated_at) VALUES ($1, 'https://x.test/hook', '[\"invoice.paid\"]', 'whsec_supersecret', 1, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00') RETURNING id")
+        .bind(uid).fetch_one(&app.db.pool).await.unwrap();
+    let ev = sqlx::query_scalar::<_, i64>("INSERT INTO webhook_events (user_id, event_type, resource_type, resource_id, payload, created_at, updated_at) VALUES ($1, 'invoice.paid', 'invoice', $2, '{\"token\":\"abc\",\"amount\":100}', '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00') RETURNING id")
+        .bind(uid).bind(inv.to_string()).fetch_one(&app.db.pool).await.unwrap();
+    let dl = sqlx::query_scalar::<_, i64>("INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, response_body, is_replay, created_at, updated_at) VALUES ($1, $2, 'delivered', 1, 'OK body', 0, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00') RETURNING id")
+        .bind(ev).bind(ep).fetch_one(&app.db.pool).await.unwrap();
 
     let res: Value = app.client.get(app.url(&format!("/api/support/payments/webhook-deliveries/{dl}")))
         .bearer_auth(common::INTERNAL_TOKEN).send().await.unwrap().json().await.unwrap();
@@ -167,12 +167,12 @@ async fn exceptions_unknown_merchant_empty() {
 async fn replay_webhook_delivery_creates_replay() {
     let app = common::spawn_app().await;
     let (uid, inv) = seed(&app, "sup5@example.com").await;
-    let ep = sqlx::query("INSERT INTO webhook_endpoints (user_id, url, events, signing_secret, is_active, created_at, updated_at) VALUES (?, 'https://x.test/hook', '[\"invoice.paid\"]', 'whsec_s', 1, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
-        .bind(uid).execute(&app.db.pool).await.unwrap().last_insert_rowid();
-    let ev = sqlx::query("INSERT INTO webhook_events (user_id, event_type, resource_type, resource_id, payload, created_at, updated_at) VALUES (?, 'invoice.paid', 'invoice', ?, '{}', '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
-        .bind(uid).bind(inv.to_string()).execute(&app.db.pool).await.unwrap().last_insert_rowid();
-    let dl = sqlx::query("INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, is_replay, created_at, updated_at) VALUES (?, ?, 'failed', 3, 0, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00')")
-        .bind(ev).bind(ep).execute(&app.db.pool).await.unwrap().last_insert_rowid();
+    let ep = sqlx::query_scalar::<_, i64>("INSERT INTO webhook_endpoints (user_id, url, events, signing_secret, is_active, created_at, updated_at) VALUES ($1, 'https://x.test/hook', '[\"invoice.paid\"]', 'whsec_s', 1, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00') RETURNING id")
+        .bind(uid).fetch_one(&app.db.pool).await.unwrap();
+    let ev = sqlx::query_scalar::<_, i64>("INSERT INTO webhook_events (user_id, event_type, resource_type, resource_id, payload, created_at, updated_at) VALUES ($1, 'invoice.paid', 'invoice', $2, '{}', '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00') RETURNING id")
+        .bind(uid).bind(inv.to_string()).fetch_one(&app.db.pool).await.unwrap();
+    let dl = sqlx::query_scalar::<_, i64>("INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, is_replay, created_at, updated_at) VALUES ($1, $2, 'failed', 3, 0, '2026-06-10T00:00:00.000+00:00', '2026-06-10T00:00:00.000+00:00') RETURNING id")
+        .bind(ev).bind(ep).fetch_one(&app.db.pool).await.unwrap();
 
     let res = app.client.post(app.url(&format!("/api/support/payments/webhook-deliveries/{dl}/replay")))
         .bearer_auth(common::INTERNAL_TOKEN).send().await.unwrap();
@@ -186,7 +186,7 @@ async fn replay_webhook_delivery_creates_replay() {
     assert_ne!(r["id"], dl); // a new row
 
     // two delivery rows now exist for the event
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_event_id = ?").bind(ev).fetch_one(&app.db.pool).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries WHERE webhook_event_id = $1").bind(ev).fetch_one(&app.db.pool).await.unwrap();
     assert_eq!(count, 2);
 
     // replay missing -> 404

@@ -22,7 +22,7 @@ async fn create_team(app: &common::TestApp, token: &str, name: &str, currency_id
 /// Set a member's password and log in via the client path -> client token.
 async fn login_member(app: &common::TestApp, email: &str, password: &str) -> String {
     let hash = kasway_api::password::hash_password(password);
-    sqlx::query("UPDATE team_members SET password = ? WHERE email = ?")
+    sqlx::query("UPDATE team_members SET password = $1 WHERE email = $2")
         .bind(&hash)
         .bind(email)
         .execute(&app.db.pool)
@@ -75,7 +75,7 @@ async fn teams_store_creates_team() {
     assert_eq!(body["isActive"], true);
 
     // member persisted
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_members WHERE team_id = ?")
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_members WHERE team_id = $1")
         .bind(body["id"].as_i64().unwrap())
         .fetch_one(&app.db.pool)
         .await
@@ -174,7 +174,7 @@ async fn teams_destroy_cascades_members() {
     let res = app.client.delete(app.url(&format!("/api/teams/{id}"))).bearer_auth(&token).send().await.unwrap();
     assert_eq!(res.status(), 204);
 
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_members WHERE team_id = ?").bind(id).fetch_one(&app.db.pool).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM team_members WHERE team_id = $1").bind(id).fetch_one(&app.db.pool).await.unwrap();
     assert_eq!(count, 0);
 }
 
@@ -296,7 +296,7 @@ async fn team_member_promote_demotes_current_manager() {
     assert_eq!(promoted["role"], "manager");
 
     // old manager demoted
-    let old_role: String = sqlx::query_scalar("SELECT role FROM team_members WHERE id = ?").bind(mgr_id).fetch_one(&app.db.pool).await.unwrap();
+    let old_role: String = sqlx::query_scalar("SELECT role FROM team_members WHERE id = $1").bind(mgr_id).fetch_one(&app.db.pool).await.unwrap();
     assert_eq!(old_role, "staff");
 }
 
@@ -327,8 +327,8 @@ async fn team_member_client_routes() {
     // set-online
     let online = app.client.post(app.url("/api/team-members/set-online")).bearer_auth(&client).send().await.unwrap();
     assert_eq!(online.status(), 200);
-    let is_online: bool = sqlx::query_scalar("SELECT is_online FROM team_members WHERE email = ?").bind("self12@x.com").fetch_one(&app.db.pool).await.unwrap();
-    assert!(is_online);
+    let is_online: i64 = sqlx::query_scalar("SELECT is_online FROM team_members WHERE email = $1").bind("self12@x.com").fetch_one(&app.db.pool).await.unwrap();
+    assert_eq!(is_online, 1);
 
     // update-profile
     let prof: Value = app

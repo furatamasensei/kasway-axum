@@ -127,8 +127,8 @@ pub async fn register(
     // unique email check only if the email passed format validation
     if let Some(email) = email.as_ref() {
         let taken: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM users WHERE LOWER(email) = LOWER($1) \
-             UNION SELECT 1 FROM team_members WHERE LOWER(email) = LOWER($2) LIMIT 1",
+            "SELECT CAST(1 AS BIGINT) FROM users WHERE LOWER(email) = LOWER($1) \
+             UNION SELECT CAST(1 AS BIGINT) FROM team_members WHERE LOWER(email) = LOWER($2) LIMIT 1",
         )
         .bind(email)
         .bind(email)

@@ -159,12 +159,12 @@ async fn setup_index_null_then_store_then_get() {
     assert_eq!(got["kaspaMainAddress"], "kaspatest:merchantpayout00001");
 
     // user is now onboarded
-    let onboarded: bool = sqlx::query_scalar("SELECT onboarded FROM users WHERE email = ?")
+    let onboarded: i64 = sqlx::query_scalar("SELECT onboarded FROM users WHERE email = $1")
         .bind("se1@example.com")
         .fetch_one(&app.db.pool)
         .await
         .unwrap();
-    assert!(onboarded);
+    assert_eq!(onboarded, 1);
 }
 
 #[tokio::test]
@@ -265,7 +265,7 @@ async fn store_setup_clone_copies_from_source() {
         .send()
         .await
         .unwrap();
-    let default_id: i64 = sqlx::query_scalar("SELECT id FROM stores WHERE user_id = (SELECT id FROM users WHERE email = ?) AND is_default = 1")
+    let default_id: i64 = sqlx::query_scalar("SELECT id FROM stores WHERE user_id = (SELECT id FROM users WHERE email = $1) AND is_default = 1")
         .bind("se6@example.com")
         .fetch_one(&app.db.pool)
         .await
@@ -304,7 +304,7 @@ async fn store_setup_copy_only_selected_section() {
         .send()
         .await
         .unwrap();
-    let default_id: i64 = sqlx::query_scalar("SELECT id FROM stores WHERE user_id = (SELECT id FROM users WHERE email = ?) AND is_default = 1")
+    let default_id: i64 = sqlx::query_scalar("SELECT id FROM stores WHERE user_id = (SELECT id FROM users WHERE email = $1) AND is_default = 1")
         .bind("se7@example.com")
         .fetch_one(&app.db.pool)
         .await
@@ -335,7 +335,7 @@ async fn store_setup_copy_missing_source_setup_404() {
     let default_id: i64 = {
         // trigger default store creation
         app.client.get(app.url("/api/stores")).bearer_auth(&token).send().await.unwrap();
-        sqlx::query_scalar("SELECT id FROM stores WHERE user_id = (SELECT id FROM users WHERE email = ?) AND is_default = 1")
+        sqlx::query_scalar("SELECT id FROM stores WHERE user_id = (SELECT id FROM users WHERE email = $1) AND is_default = 1")
             .bind("se8@example.com").fetch_one(&app.db.pool).await.unwrap()
     };
     let target: Value = app.client.post(app.url("/api/stores")).bearer_auth(&token).json(&json!({ "name": "T" })).send().await.unwrap().json().await.unwrap();

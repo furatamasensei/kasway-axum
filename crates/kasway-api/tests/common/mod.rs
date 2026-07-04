@@ -1,5 +1,5 @@
 //! Integration-test harness: boots the real router on an ephemeral port over a
-//! fresh in-memory SQLite database, and hands back a reqwest client + base URL.
+//! fresh disposable PostgreSQL database, and hands back a reqwest client + base URL.
 
 #![allow(dead_code)]
 
@@ -14,6 +14,7 @@ pub struct TestApp {
     pub base_url: String,
     pub client: reqwest::Client,
     pub db: Db,
+    pub state: AppState,
 }
 
 impl TestApp {
@@ -35,7 +36,7 @@ pub async fn spawn_with(internal_api_token: Option<String>) -> TestApp {
 /// Spawn the app with a custom config mutator (for OAuth endpoint overrides etc).
 /// `clear_internal_token` removes the internal token after the mutator runs.
 pub async fn spawn_with_config(mutate: impl FnOnce(&mut AppConfig), clear_internal_token: bool) -> TestApp {
-    let db = Db::connect_memory().await.expect("connect memory db");
+    let db = Db::connect_memory().await.expect("connect test db");
 
     let mut config = AppConfig::test_default();
     config.internal_api_token = Some(INTERNAL_TOKEN.to_string());
@@ -49,7 +50,7 @@ pub async fn spawn_with_config(mutate: impl FnOnce(&mut AppConfig), clear_intern
         config: Arc::new(config),
     };
 
-    let app = kasway_api::build_router(state);
+    let app = kasway_api::build_router(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -64,6 +65,7 @@ pub async fn spawn_with_config(mutate: impl FnOnce(&mut AppConfig), clear_intern
         base_url: format!("http://{addr}"),
         client: reqwest::Client::new(),
         db,
+        state,
     }
 }
 
@@ -87,7 +89,7 @@ pub async fn register_merchant(app: &TestApp, email: &str, password: &str) -> St
 
 /// Look up a user id by email (after `register_merchant`).
 pub async fn merchant_user_id(db: &Db, email: &str) -> i64 {
-    sqlx::query_scalar("SELECT id FROM users WHERE email = ?")
+    sqlx::query_scalar("SELECT id FROM users WHERE email = $1")
         .bind(email)
         .fetch_one(&db.pool)
         .await
@@ -103,9 +105,9 @@ pub async fn seed_api_key(
     scopes_json: &str,
     created_at: &str,
 ) -> i64 {
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO api_keys (user_id, name, prefix, key_hash, scopes, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
     )
     .bind(user_id)
     .bind(name)
@@ -114,47 +116,44 @@ pub async fn seed_api_key(
     .bind(scopes_json)
     .bind(created_at)
     .bind(created_at)
-    .execute(&db.pool)
+    .fetch_one(&db.pool)
     .await
     .expect("seed api key")
-    .last_insert_rowid()
 }
 
 /// Insert a currency row directly; returns its id.
 pub async fn seed_currency(db: &Db, code: &str, name: &str) -> i64 {
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO currencies (type, code, name, symbol, country, locale, created_at, updated_at) \
-         VALUES ('fiat', ?, ?, '$', 'US', 'en-US', ?, ?)",
+         VALUES ('fiat', $1, $2, '$', 'US', 'en-US', $3, $4) RETURNING id",
     )
     .bind(code)
     .bind(name)
     .bind("2026-01-01T00:00:00.000+00:00")
     .bind("2026-01-01T00:00:00.000+00:00")
-    .execute(&db.pool)
+    .fetch_one(&db.pool)
     .await
     .expect("seed currency")
-    .last_insert_rowid()
 }
 
 /// Seed the per-user default store (+ included entitlement); returns store id.
 pub async fn seed_default_store(db: &Db, user_id: i64) -> i64 {
     let now = "2026-01-01T00:00:00.000+00:00";
-    let store_id = sqlx::query(
+    let store_id: i64 = sqlx::query_scalar(
         "INSERT INTO stores (user_id, public_id, name, slug, status, is_included, is_default, metadata, created_at, updated_at) \
-         VALUES (?, ?, 'Default store', 'default', 'active', 1, 1, '{\"backfilled\":true}', ?, ?)",
+         VALUES ($1, $2, 'Default store', 'default', 'active', 1, 1, '{\"backfilled\":true}', $3, $4) RETURNING id",
     )
     .bind(user_id)
     .bind(format!("store_{user_id}_default"))
     .bind(now)
     .bind(now)
-    .execute(&db.pool)
+    .fetch_one(&db.pool)
     .await
-    .expect("seed store")
-    .last_insert_rowid();
+    .expect("seed store");
 
     sqlx::query(
         "INSERT INTO store_entitlements (user_id, store_id, status, source, price_cents, currency, created_at, updated_at) \
-         VALUES (?, ?, 'active', 'included', 0, 'USD', ?, ?)",
+         VALUES ($1, $2, 'active', 'included', 0, 'USD', $3, $4)",
     )
     .bind(user_id)
     .bind(store_id)
@@ -171,7 +170,7 @@ pub async fn seed_default_store(db: &Db, user_id: i64) -> i64 {
 pub async fn seed_setup(db: &Db, user_id: i64, store_id: i64, kaspa_main_address: &str) {
     sqlx::query(
         "INSERT INTO setups (user_id, store_id, tos_agreed, kaspa_main_address, created_at, updated_at) \
-         VALUES (?, ?, 1, ?, '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')",
+         VALUES ($1, $2, 1, $3, '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')",
     )
     .bind(user_id)
     .bind(store_id)
@@ -196,12 +195,12 @@ pub async fn seed_invoice(
     expires_at: Option<&str>,
     created_at: &str,
 ) -> i64 {
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO invoices \
          (user_id, store_id, public_id, status, payment_address, payment_network, payment_asset, \
           payment_reference, subtotal_amount, total_amount, fee_delegation, service_fee_amount, \
           currency, payment_link_id, metadata, expires_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, 'tn10', 'KAS', ?, ?, ?, 'merchant_subsidized', ?, 'KAS', ?, NULL, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, 'tn10', 'KAS', $6, $7, $8, 'merchant_subsidized', $9, 'KAS', $10, NULL, $11, $12, $13) RETURNING id",
     )
     .bind(user_id)
     .bind(store_id)
@@ -216,10 +215,9 @@ pub async fn seed_invoice(
     .bind(expires_at)
     .bind(created_at)
     .bind(created_at)
-    .execute(&db.pool)
+    .fetch_one(&db.pool)
     .await
     .expect("seed invoice")
-    .last_insert_rowid()
 }
 
 /// Seed an invoice item; returns its id.
@@ -231,33 +229,32 @@ pub async fn seed_invoice_item(
     unit_amount: i64,
     total_amount: i64,
 ) -> i64 {
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO invoice_items (invoice_id, name, quantity, unit_amount, total_amount, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')",
+         VALUES ($1, $2, $3, $4, $5, '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00') RETURNING id",
     )
     .bind(invoice_id)
     .bind(name)
     .bind(quantity)
     .bind(unit_amount)
     .bind(total_amount)
-    .execute(&db.pool)
+    .fetch_one(&db.pool)
     .await
     .expect("seed invoice item")
-    .last_insert_rowid()
 }
 
 /// Seed a KPR-1 payment intent for an invoice (stubbed crypto fields).
 pub async fn seed_kpr1_intent(db: &Db, invoice_id: i64, user_id: i64, intent_id: &str) -> i64 {
     let outputs = r#"[{"role":"merchant_net","address":"kaspatest:merchant","amountSompi":"900"},{"role":"split","address":"kaspatest:partner","amountSompi":"100","percentage":10}]"#;
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO kpr1_payment_intents \
          (invoice_id, user_id, intent_id, status, network, asset_id, amount_sompi, platform_fee_bps, \
           platform_fee_amount, merchant_address, platform_fee_address, template_id, template_version, \
           script_hash, canonical_hash, payment_request_uri, payment_intent_url, signature_algorithm, \
           signature_key_id, signature_value, required_outputs, canonical_intent, expires_at, created_at, updated_at) \
-         VALUES (?, ?, ?, 'created', 'tn10', 'KAS', 1000, 100, 10, 'kaspatest:merchant', 'kaspatest:fee', \
-          'covenant-v1', '1', ?, ?, ?, ?, 'ed25519', 'key-1', 'sig', ?, '{}', \
-          '2026-12-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00')",
+         VALUES ($1, $2, $3, 'created', 'tn10', 'KAS', 1000, 100, 10, 'kaspatest:merchant', 'kaspatest:fee', \
+          'covenant-v1', '1', $4, $5, $6, $7, 'ed25519', 'key-1', 'sig', $8, '{}', \
+          '2026-12-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00') RETURNING id",
     )
     .bind(invoice_id)
     .bind(user_id)
@@ -267,49 +264,48 @@ pub async fn seed_kpr1_intent(db: &Db, invoice_id: i64, user_id: i64, intent_id:
     .bind(format!("kaspa:?address=kaspatest:merchant&intent={intent_id}"))
     .bind(format!("https://pay.kasway.test/i/{intent_id}"))
     .bind(outputs)
-    .execute(&db.pool)
+    .fetch_one(&db.pool)
     .await
     .expect("seed intent")
-    .last_insert_rowid()
 }
 
 /// Seed a payment_anomaly_signal row; returns its id.
 pub async fn seed_anomaly(db: &Db, user_id: i64, signal_type: &str, severity: &str, status: &str) -> i64 {
     let t = "2026-01-01T00:00:00.000+00:00";
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO payment_anomaly_signals (user_id, signal_type, severity, status, resource_type, resource_id, detected_at, window_start, window_end, score, reason, metadata, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'payment', '1', ?, ?, ?, 5, 'spike', '{}', ?, ?)",
+         VALUES ($1, $2, $3, $4, 'payment', '1', $5, $6, $7, 5, 'spike', '{}', $8, $9) RETURNING id",
     )
     .bind(user_id).bind(signal_type).bind(severity).bind(status).bind(t).bind(t).bind(t).bind(t).bind(t)
-    .execute(&db.pool).await.expect("seed anomaly").last_insert_rowid()
+    .fetch_one(&db.pool).await.expect("seed anomaly")
 }
 
 /// Seed a payment_risk_rule_hit; returns its id.
 pub async fn seed_risk_hit(db: &Db, user_id: i64, rule_key: &str, severity: &str, status: &str) -> i64 {
     let t = "2026-01-01T00:00:00.000+00:00";
     let dedupe = format!("{rule_key}:{user_id}:{}", uuid::Uuid::new_v4());
-    sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO payment_risk_rule_hits (user_id, rule_key, rule_version, severity, status, outcome, resource_type, resource_id, reason, dedupe_key, evaluator_version, detected_at, window_start, window_end, created_at, updated_at) \
-         VALUES (?, ?, 'v1', ?, ?, 'observed', 'invoice', '1', 'r', ?, 'passive-risk-v1', ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, 'v1', $3, $4, 'observed', 'invoice', '1', 'r', $5, 'passive-risk-v1', $6, $7, $8, $9, $10) RETURNING id",
     )
     .bind(user_id).bind(rule_key).bind(severity).bind(status).bind(dedupe).bind(t).bind(t).bind(t).bind(t).bind(t)
-    .execute(&db.pool).await.expect("seed risk hit").last_insert_rowid()
+    .fetch_one(&db.pool).await.expect("seed risk hit")
 }
 
 /// Seed a payment_close_period row (status closed); returns its id.
 pub async fn seed_close_period(db: &Db, user_id: i64) -> i64 {
     let t = "2026-01-01T00:00:00.000+00:00";
-    sqlx::query("INSERT INTO payment_close_periods (user_id, period_start, period_end, status, totals_checksum, closed_at, metadata, created_at, updated_at) VALUES (?, '2026-01-01', '2026-01-31', 'closed', 'abc123', ?, '{}', ?, ?)")
+    sqlx::query_scalar("INSERT INTO payment_close_periods (user_id, period_start, period_end, status, totals_checksum, closed_at, metadata, created_at, updated_at) VALUES ($1, '2026-01-01', '2026-01-31', 'closed', 'abc123', $2, '{}', $3, $4) RETURNING id")
         .bind(user_id).bind(t).bind(t).bind(t)
-        .execute(&db.pool).await.expect("seed close period").last_insert_rowid()
+        .fetch_one(&db.pool).await.expect("seed close period")
 }
 
 /// Seed a payment_credit row (drives derived paymentStatus → exceptions).
 pub async fn seed_credit(db: &Db, invoice_id: i64, amount: i64) -> i64 {
     let t = "2026-01-01T00:00:00.000+00:00";
-    sqlx::query("INSERT INTO payment_credits (invoice_id, amount, created_at, updated_at) VALUES (?, ?, ?, ?)")
+    sqlx::query_scalar("INSERT INTO payment_credits (invoice_id, amount, created_at, updated_at) VALUES ($1, $2, $3, $4) RETURNING id")
         .bind(invoice_id).bind(amount).bind(t).bind(t)
-        .execute(&db.pool).await.expect("seed credit").last_insert_rowid()
+        .fetch_one(&db.pool).await.expect("seed credit")
 }
 
 /// Insert a payment_indexer_checkpoint row; returns its id.
@@ -322,10 +318,10 @@ pub async fn seed_checkpoint(
     metadata: Option<&str>,
     updated_at: &str,
 ) -> i64 {
-    let result = sqlx::query(
+    sqlx::query_scalar(
         "INSERT INTO payment_indexer_checkpoints \
          (network, asset_id, source, checkpoint, metadata, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
     )
     .bind(network)
     .bind(asset_id)
@@ -334,9 +330,7 @@ pub async fn seed_checkpoint(
     .bind(metadata)
     .bind(updated_at)
     .bind(updated_at)
-    .execute(&db.pool)
+    .fetch_one(&db.pool)
     .await
-    .expect("seed checkpoint");
-
-    result.last_insert_rowid()
+    .expect("seed checkpoint")
 }

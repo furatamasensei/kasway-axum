@@ -73,7 +73,7 @@ async fn google_callback_happy_path_creates_user_and_redirects() {
     // user created
     let uid = common::merchant_user_id(&app.db, "oauthuser@example.com").await;
     assert!(uid > 0);
-    let (name, avatar): (Option<String>, Option<String>) = sqlx::query_as("SELECT full_name, avatar_url FROM users WHERE id = ?")
+    let (name, avatar): (Option<String>, Option<String>) = sqlx::query_as("SELECT full_name, avatar_url FROM users WHERE id = $1")
         .bind(uid).fetch_one(&app.db.pool).await.unwrap();
     assert_eq!(name.as_deref(), Some("Mock User"));
     assert_eq!(avatar.as_deref(), Some("https://img.test/a.png"));
@@ -81,7 +81,7 @@ async fn google_callback_happy_path_creates_user_and_redirects() {
     // second login with same email reuses the user (firstOrCreate)
     let res2 = no_redirect.get(app.url("/auth/google/callback?code=def456")).send().await.unwrap();
     assert_eq!(res2.status(), 302);
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = ?")
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = $1")
         .bind("oauthuser@example.com").fetch_one(&app.db.pool).await.unwrap();
     assert_eq!(count, 1);
 

@@ -41,17 +41,46 @@ impl Db {
         Ok(db)
     }
 
-    /// Connect using the same pool configuration as [`connect`]. Retained for
-    /// the integration test harness, which points `url` at a disposable
-    /// PostgreSQL database.
+    /// Create a fresh, disposable PostgreSQL database (unique name per call)
+    /// and connect to it. Used by the integration-test harness so every test
+    /// gets an isolated schema, mirroring the old in-memory SQLite behavior.
+    ///
+    /// The server/credentials come from `DATABASE_URL` (default
+    /// `postgres://postgres:postgres@localhost:5432/kasway`); the database name
+    /// in that URL is ignored — the admin connection uses the `postgres`
+    /// maintenance database to `CREATE DATABASE kasway_test_<unique>`.
     pub async fn connect_memory() -> Result<Self, DbError> {
-        Self::connect_from_env().await
-    }
-
-    async fn connect_from_env() -> Result<Self, DbError> {
-        let url = std::env::var("DATABASE_URL")
+        let base = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/kasway".to_string());
-        Self::connect(&url).await
+        let opts = PgConnectOptions::from_str(&base)?;
+
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let db_name = format!(
+            "kasway_test_{}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts.clone().database("postgres"))
+            .await?;
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await?;
+        admin.close().await;
+
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts.database(&db_name))
+            .await?;
+        let db = Self { pool };
+        db.migrate().await?;
+        Ok(db)
     }
 
     pub async fn migrate(&self) -> Result<(), DbError> {

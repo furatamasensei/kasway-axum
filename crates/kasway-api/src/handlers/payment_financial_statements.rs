@@ -326,7 +326,7 @@ pub async fn store(
     Ok((StatusCode::CREATED, Json(serialize_statement(&row))).into_response())
 }
 
-async fn load(state: &AppState, user_id: i64, id: &str) -> AppResult<Option<StatementRow>> {
+async fn load(state: &AppState, user_id: i64, id: i64) -> AppResult<Option<StatementRow>> {
     Ok(sqlx::query_as::<_, StatementRow>(
         "SELECT * FROM payment_statements WHERE user_id = $1 AND id = $2",
     )
@@ -341,7 +341,8 @@ pub async fn show(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let s = load(&state, auth.user_id, &id)
+    let id: i64 = id.parse().map_err(|_| AppError::commerce(404, "Payment statement not found"))?;
+    let s = load(&state, auth.user_id, id)
         .await?
         .ok_or_else(|| AppError::commerce(404, "Payment statement not found"))?;
     Ok(Json(serialize_statement(&s)))
@@ -352,7 +353,8 @@ pub async fn download(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<Response> {
-    let s = load(&state, auth.user_id, &id)
+    let id: i64 = id.parse().map_err(|_| AppError::commerce(404, "Payment statement not found"))?;
+    let s = load(&state, auth.user_id, id)
         .await?
         .ok_or_else(|| AppError::commerce(404, "Payment statement not found"))?;
     if s.storage_path.as_deref().unwrap_or("").is_empty() {

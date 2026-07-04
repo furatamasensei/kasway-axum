@@ -147,7 +147,7 @@ async fn checkout_kpr1_intent_returns_canonical_and_marks_fetched() {
 
     // status transitioned created -> fetched
     let status: String = sqlx::query_scalar(
-        "SELECT status FROM kpr1_payment_intents WHERE intent_id = ?",
+        "SELECT status FROM kpr1_payment_intents WHERE intent_id = $1",
     )
     .bind(intent["intentId"].as_str().unwrap())
     .fetch_one(&app.db.pool)

@@ -39,7 +39,7 @@ async fn metrics_revenue_counts_paid_invoices() {
     let now = "2026-06-18T00:00:00.000+00:00";
     // a paid invoice with paid_at within the default 30d window
     let id = common::seed_invoice(&app.db, uid, store, "inv_paid_m", "paid", 1000, 1000, 0, None, None, now).await;
-    sqlx::query("UPDATE invoices SET paid_at = ? WHERE id = ?").bind(now).bind(id).execute(&app.db.pool).await.unwrap();
+    sqlx::query("UPDATE invoices SET paid_at = $1 WHERE id = $2").bind(now).bind(id).execute(&app.db.pool).await.unwrap();
 
     let body: Value = app
         .client
