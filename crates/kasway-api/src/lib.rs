@@ -56,11 +56,6 @@ pub fn build_router(state: AppState) -> Router {
             "/internal/payment-indexer/checkpoints",
             get(handlers::internal_payment_indexer::checkpoints),
         )
-        // --- Internal programmable-settlement sandbox (retired → 410) ---
-        .route("/internal/payment-ops/tocatta/sandbox/overview", get(handlers::internal_settlement_sandbox::overview))
-        .route("/internal/payment-ops/tocatta/sandbox/splits/preview", post(handlers::internal_settlement_sandbox::split_preview))
-        .route("/internal/payment-ops/tocatta/sandbox/holds/preview", post(handlers::internal_settlement_sandbox::hold_preview))
-        .route("/internal/payment-ops/tocatta/sandbox/promotion-gates", get(handlers::internal_settlement_sandbox::promotion_gates))
         // --- Internal programmable-settlement records (DB) ---
         .route(
             "/internal/payment-ops/tocatta/covenants/templates",
@@ -210,12 +205,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/payments/ops/invoices/:id", get(handlers::payment_operations::invoice_detail))
         .route("/api/payments/ops/invoices/:id/timeline", get(handlers::payment_operations::timeline))
         .route("/api/payments/ops/observations", get(handlers::payment_operations::observations))
-        // --- Payment sandbox (retired -> 410 Gone) (auth) ---
-        .route("/api/payments/sandbox/invoices/:id/observations", post(handlers::payment_sandbox::observations))
-        .route("/api/payments/sandbox/invoices/:id/confirm", post(handlers::payment_sandbox::confirm))
-        .route("/api/payments/sandbox/invoices/:id/underpay", post(handlers::payment_sandbox::underpay))
-        .route("/api/payments/sandbox/invoices/:id/overpay", post(handlers::payment_sandbox::overpay))
-        .route("/api/payments/sandbox/webhooks/test-event", post(handlers::payment_sandbox::test_event))
         .route("/api/payments/ops/credits", get(handlers::payment_operations::credits))
         // --- Payment-ops CSV exports + manifests (auth) ---
         .route("/api/payments/ops/exports/invoices.csv", get(handlers::payment_operations_exports::invoices))

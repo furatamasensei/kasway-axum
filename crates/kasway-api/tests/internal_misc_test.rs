@@ -3,32 +3,6 @@ mod common;
 use serde_json::Value;
 
 #[tokio::test]
-async fn settlement_sandbox_retired() {
-    let app = common::spawn_app().await;
-
-    let gets = ["/internal/payment-ops/tocatta/sandbox/overview", "/internal/payment-ops/tocatta/sandbox/promotion-gates"];
-    for p in gets {
-        let res = app.client.get(app.url(p)).bearer_auth(common::INTERNAL_TOKEN).send().await.unwrap();
-        assert_eq!(res.status(), 410, "{p}");
-        assert_eq!(res.json::<Value>().await.unwrap()["code"], "PROGRAMMABLE_SETTLEMENT_SANDBOX_RETIRED");
-    }
-    let posts = ["/internal/payment-ops/tocatta/sandbox/splits/preview", "/internal/payment-ops/tocatta/sandbox/holds/preview"];
-    for p in posts {
-        let res = app.client.post(app.url(p)).bearer_auth(common::INTERNAL_TOKEN).send().await.unwrap();
-        assert_eq!(res.status(), 410, "{p}");
-        let body: Value = res.json().await.unwrap();
-        assert_eq!(body["code"], "PROGRAMMABLE_SETTLEMENT_SANDBOX_RETIRED");
-        assert_eq!(body["replacement"]["kpr1Status"], "/internal/payment-ops/kpr1/status");
-    }
-}
-
-#[tokio::test]
-async fn settlement_sandbox_requires_internal_token() {
-    let app = common::spawn_app().await;
-    assert_eq!(app.client.get(app.url("/internal/payment-ops/tocatta/sandbox/overview")).send().await.unwrap().status(), 401);
-}
-
-#[tokio::test]
 async fn kpr1_evidence_by_intent_id_and_hash() {
     let app = common::spawn_app().await;
     common::register_merchant(&app, "kev1@example.com", "secret123").await;

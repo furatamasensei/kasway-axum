@@ -14,37 +14,6 @@ async fn merchant_with_invoice(app: &common::TestApp, email: &str) -> (String, i
     (token, uid, inv)
 }
 
-// ---------- sandbox (retired -> 410 Gone) ----------
-
-#[tokio::test]
-async fn sandbox_actions_return_gone() {
-    let app = common::spawn_app().await;
-    let (token, _uid, inv) = merchant_with_invoice(&app, "sb1@example.com").await;
-
-    let paths = [
-        format!("/api/payments/sandbox/invoices/{inv}/observations"),
-        format!("/api/payments/sandbox/invoices/{inv}/confirm"),
-        format!("/api/payments/sandbox/invoices/{inv}/underpay"),
-        format!("/api/payments/sandbox/invoices/{inv}/overpay"),
-        "/api/payments/sandbox/webhooks/test-event".to_string(),
-    ];
-
-    for p in paths {
-        let res = app.client.post(app.url(&p)).bearer_auth(&token).json(&json!({})).send().await.unwrap();
-        assert_eq!(res.status(), 410, "path {p} should be 410 Gone");
-        let body: Value = res.json().await.unwrap();
-        assert_eq!(body["code"], "PAYMENT_SANDBOX_RETIRED", "path {p}");
-        assert_eq!(body["replacement"]["operationsStatus"], "/api/payments/ops/invoices/{id}");
-    }
-}
-
-#[tokio::test]
-async fn sandbox_requires_auth() {
-    let app = common::spawn_app().await;
-    let res = app.client.post(app.url("/api/payments/sandbox/webhooks/test-event")).json(&json!({})).send().await.unwrap();
-    assert_eq!(res.status(), 401);
-}
-
 // ---------- timeline ----------
 
 #[tokio::test]
