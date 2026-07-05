@@ -6,8 +6,10 @@
 
 pub mod auth;
 pub mod auth_token;
+pub mod chain_source;
 pub mod error;
 pub mod handlers;
+pub mod kaspa_wrpc;
 pub mod kpr1;
 pub mod password;
 pub mod state;
