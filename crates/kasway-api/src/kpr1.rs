@@ -252,6 +252,66 @@ fn resolve_split_config(setup: &SetupRow) -> AppResult<(i64, Vec<SplitOut>)> {
     Ok((total_bps, splits))
 }
 
+// --- required-output verification (used by the chain observer) ---
+
+/// One required output of a KPR-1 intent (parsed from `required_outputs`).
+pub struct RequiredOutput {
+    pub role: String,
+    pub address: String,
+    pub amount_sompi: i128,
+}
+
+/// Parse the intent's stored `required_outputs` JSON
+/// (`[{ "role", "address", "amountSompi" }, ...]`).
+pub fn parse_required_outputs(raw: &str) -> Vec<RequiredOutput> {
+    let parsed: Value = serde_json::from_str(raw).unwrap_or(json!([]));
+    parsed
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|o| {
+                    let role = o.get("role")?.as_str()?.to_string();
+                    let address = o.get("address")?.as_str()?.to_string();
+                    let amount_sompi = o.get("amountSompi")?.as_str()?.parse().ok()?;
+                    Some(RequiredOutput { role, address, amount_sompi })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Verify observed on-chain outputs against the intent's required outputs:
+/// every required output must appear with the exact address AND amount.
+/// Fails closed with the first stable reason code (the same vocabulary the
+/// explorer treats as safe): `amount_mismatch` when the address is paid a
+/// different amount, `missing_required_<role>_output` when it is absent.
+pub fn verify_required_outputs(
+    required: &[RequiredOutput],
+    observed: &[(String, i128)],
+) -> Result<(), String> {
+    let mut used = vec![false; observed.len()];
+    for req in required {
+        let exact = observed
+            .iter()
+            .enumerate()
+            .position(|(i, (addr, amt))| !used[i] && *addr == req.address && *amt == req.amount_sompi);
+        if let Some(i) = exact {
+            used[i] = true;
+            continue;
+        }
+        let address_seen = observed
+            .iter()
+            .enumerate()
+            .any(|(i, (addr, _))| !used[i] && *addr == req.address);
+        return Err(if address_seen {
+            "amount_mismatch".to_string()
+        } else {
+            format!("missing_required_{}_output", req.role)
+        });
+    }
+    Ok(())
+}
+
 /// Mint and persist a KPR-1 intent for an invoice; returns the intentId.
 pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> AppResult<String> {
     let cfg = &state.config.kpr1;

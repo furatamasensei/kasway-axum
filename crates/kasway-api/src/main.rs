@@ -27,6 +27,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("webhook delivery worker disabled via WEBHOOK_WORKER_ENABLED");
     }
 
+    // Background chain observer (CHAIN_OBSERVER_ENABLED; default on only when
+    // KASPA_NODE_URL is configured).
+    if kasway_api::chain_observer::enabled_from_env() {
+        kasway_api::chain_observer::spawn(state.clone());
+    } else {
+        tracing::info!("chain observer disabled (CHAIN_OBSERVER_ENABLED / KASPA_NODE_URL unset)");
+    }
+
     let app = kasway_api::build_router(state);
 
     let addr = std::env::var("HOST_PORT").unwrap_or_else(|_| "0.0.0.0:3333".to_string());

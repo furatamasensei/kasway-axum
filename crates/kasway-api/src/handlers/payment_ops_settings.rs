@@ -331,6 +331,31 @@ fn resolve_policy(policy: &Value, network: &str, asset_id: &str, currency: &str,
     })
 }
 
+/// Required confirmations for one payment per the tenant's stored confirmation
+/// policy (platform default when unset). Used by the chain observer to decide
+/// when a matched observation may settle the invoice.
+pub(crate) async fn required_confirmations_for(
+    state: &AppState,
+    user_id: i64,
+    network: &str,
+    asset_id: &str,
+    currency: &str,
+    invoice_amount: i128,
+) -> Result<i64, sqlx::Error> {
+    let raw: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT confirmation_policy FROM payment_tenant_settings WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&state.db.pool)
+    .await?;
+    let policy = normalize_policy(raw.flatten().as_deref());
+    let resolved = resolve_policy(&policy, network, asset_id, currency, invoice_amount);
+    Ok(resolved
+        .get("requiredConfirmations")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(PLATFORM_MIN_CONFIRMATIONS))
+}
+
 /// `GET /api/payments/ops/confirmation-policy`
 pub async fn confirmation_policy(
     auth: AuthMerchant,

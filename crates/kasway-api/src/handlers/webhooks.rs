@@ -457,7 +457,7 @@ pub async fn endpoints_test_send(
     }))))
 }
 
-async fn create_delivery(state: &AppState, event_id: i64, endpoint_id: i64, is_replay: bool, now: &str) -> AppResult<i64> {
+async fn create_delivery(state: &AppState, event_id: i64, endpoint_id: i64, is_replay: bool, now: &str) -> Result<i64, sqlx::Error> {
     let r: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, is_replay, created_at, updated_at) \
          VALUES ($1, $2, 'pending', 0, $3, $4, $5) RETURNING id",
@@ -466,6 +466,46 @@ async fn create_delivery(state: &AppState, event_id: i64, endpoint_id: i64, is_r
     .fetch_one(&state.db.pool).await?;
     // Picked up by the background delivery worker (crate::webhook_worker).
     Ok(r)
+}
+
+/// Emit a webhook event: insert the `webhook_events` row and fan out pending
+/// deliveries to every active, non-paused endpoint subscribed to `event_type`
+/// (same store scoping as `events_replay`: the event's store, or endpoints
+/// with no store when the event has none). Deliveries are picked up by the
+/// background worker. Returns the event id.
+pub(crate) async fn emit_event(
+    state: &AppState,
+    user_id: i64,
+    store_id: Option<i64>,
+    event_type: &str,
+    resource_type: &str,
+    resource_id: &str,
+    payload: &Value,
+) -> Result<i64, sqlx::Error> {
+    let now = now_iso();
+    let event_id: i64 = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO webhook_events (user_id, store_id, event_type, resource_type, resource_id, payload, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+    )
+    .bind(user_id).bind(store_id).bind(event_type).bind(resource_type).bind(resource_id)
+    .bind(payload.to_string()).bind(&now).bind(&now)
+    .fetch_one(&state.db.pool).await?;
+
+    let mut sql = format!(
+        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = $1 AND is_active = 1 AND paused_at IS NULL"
+    );
+    if store_id.is_some() { sql.push_str(" AND store_id = $2"); } else { sql.push_str(" AND store_id IS NULL"); }
+    let mut q = sqlx::query_as::<_, EndpointRow>(&sql).bind(user_id);
+    if let Some(s) = store_id { q = q.bind(s); }
+    let endpoints = q.fetch_all(&state.db.pool).await?;
+
+    for ep in &endpoints {
+        let events: Vec<String> = serde_json::from_str(&ep.events).unwrap_or_default();
+        if events.iter().any(|e| e == event_type) {
+            create_delivery(state, event_id, ep.id, false, &now).await?;
+        }
+    }
+    Ok(event_id)
 }
 
 // ---------- delivery controls (pause/resume/rotate) ----------

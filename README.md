@@ -48,6 +48,35 @@ URL is ignored; the admin connection uses the `postgres` maintenance DB).
 The webhook delivery worker runs in-process at startup; disable it with
 `WEBHOOK_WORKER_ENABLED=0` (default on).
 
+## Chain observer (KPR-1 on-chain verification)
+
+The chain observer (`crates/kasway-api/src/chain_observer.rs`) closes the loop
+for wallet-submitted KPR-1 payments: txid submitted at checkout → observed on
+chain → confirmations tracked → invoice `paid` + `invoice.paid` webhook event
+(delivered by the webhook worker).
+
+- `KASPA_NODE_URL` — websocket URL of a Kaspa node's **wRPC JSON** endpoint,
+  e.g. `ws://<ip>:17210` for a TN10 node serving the JSON encoding on that
+  port (rusty-kaspa's stock JSON ports are 18110 mainnet / 18210 TN10, Borsh
+  17110/17210 — always point this at the JSON listener; see
+  `crates/kasway-api/src/kaspa_wrpc.rs`).
+- `CHAIN_OBSERVER_ENABLED` — gate override (`0`/`false`/`off` disable).
+  Default: on only when `KASPA_NODE_URL` is set; off otherwise.
+
+What this slice does: every ~5s it picks up intents whose wallet submitted a
+txid, verifies the transaction's outputs against the intent's required
+outputs (exact address + amount — mismatches fail closed: intent
+`verification_status = failed` + a `payment_anomaly_signals` row, the invoice
+is never marked paid), records/updates the `payment_observations` row, and
+settles (confirmed payment row, invoice `paid`, `invoice.paid` event) once
+confirmations (virtual DAA − accepting DAA) meet the tenant's confirmation
+policy (`payment_tenant_settings`, platform default 10). Progress is
+checkpointed in `payment_indexer_checkpoints` (source `chain_observer`).
+
+What it does NOT do yet: no address watching — payments are only observed for
+transactions whose txid a wallet submitted; unsolicited/unknown transfers to
+merchant addresses arrive with the address-watching phase.
+
 ## Status
 
 Foundation + internal-token tier proven (health + payment-indexer). See `ENDPOINTS.md`.

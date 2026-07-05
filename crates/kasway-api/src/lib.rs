@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod auth_token;
+pub mod chain_observer;
 pub mod chain_source;
 pub mod error;
 pub mod handlers;

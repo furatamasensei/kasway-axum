@@ -1,0 +1,509 @@
+//! Background Kaspa chain observer — first slice of on-chain verification for
+//! wallet-submitted KPR-1 payments, closing the loop: payment submitted →
+//! observed on chain → confirmations tracked → invoice paid.
+//!
+//! Txid-driven only: each tick picks up KPR-1 intents in a submitted-but-not-
+//! final state (`submitted`/`verified` with a wallet-provided `tx_id`, invoice
+//! still `open`), asks the [`ChainSource`] for that transaction's outputs to
+//! the intent's required addresses, and:
+//!
+//! - creates/updates the `payment_observations` row (observed amount/outputs,
+//!   accepted DAA score, confirmations),
+//! - verifies the observed outputs against the intent's `required_outputs`
+//!   (`crate::kpr1::verify_required_outputs` — exact address + amount, every
+//!   output present). On mismatch it FAILS CLOSED: the intent is marked
+//!   `failed` with a stable `failure_reason` and a `payment_anomaly_signals`
+//!   row records the discrepancy — the invoice is never marked paid,
+//! - once confirmations (`virtual DAA score - accepting DAA score`) meet the
+//!   tenant's confirmation policy (`payment_tenant_settings`, platform
+//!   default 10), settles: `payments` row `confirmed` (the same signal
+//!   `derivePaymentStatus` treats as applied), observation + intent →
+//!   `settled`, invoice → `paid`, and an `invoice.paid` webhook event is
+//!   emitted through the standard fan-out (deliveries are then sent by the
+//!   existing webhook worker).
+//!
+//! Observer progress is checkpointed per (network, asset) in
+//! `payment_indexer_checkpoints` (source `chain_observer`, checkpoint = last
+//! seen virtual DAA score).
+//!
+//! Env: `KASPA_NODE_URL` selects the node (see `crate::kaspa_wrpc`);
+//! `CHAIN_OBSERVER_ENABLED` overrides the gate (default: on only when
+//! `KASPA_NODE_URL` is set). Single-process by design — observation is
+//! idempotent (settlement runs in one DB transaction), so no row claiming is
+//! needed. The tick is a standalone function so tests can drive it with a
+//! mock [`ChainSource`] and no polling loop.
+
+use crate::chain_source::{ChainSource, ObservedTransaction};
+use crate::handlers::payment_ops_settings::required_confirmations_for;
+use crate::handlers::{invoices, webhooks};
+use crate::kpr1::{parse_required_outputs, verify_required_outputs, RequiredOutput};
+use crate::state::AppState;
+use crate::util::now_iso;
+use serde_json::{json, Value};
+
+/// Idle sleep between polls.
+const POLL_INTERVAL_SECS: u64 = 5;
+/// Max intents examined per tick.
+const CLAIM_BATCH: i64 = 25;
+
+/// `CHAIN_OBSERVER_ENABLED` gate. When unset, the observer defaults to on
+/// only when `KASPA_NODE_URL` is configured; `0`/`false`/`off` force-disable,
+/// anything else force-enables.
+pub fn enabled_from_env() -> bool {
+    match std::env::var("CHAIN_OBSERVER_ENABLED") {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"),
+        Err(_) => std::env::var("KASPA_NODE_URL")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false),
+    }
+}
+
+/// Spawn the polling loop as a tokio background task (called at startup).
+/// Returns `None` when `KASPA_NODE_URL` is not configured.
+pub fn spawn(state: AppState) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(client) = crate::kaspa_wrpc::KaspaWrpcClient::from_env() else {
+        tracing::warn!("chain observer enabled but KASPA_NODE_URL is not set; observer not started");
+        return None;
+    };
+    Some(tokio::spawn(async move {
+        tracing::info!("chain observer started");
+        loop {
+            if let Err(err) = run_tick(&state, &client).await {
+                tracing::error!("chain observer tick failed: {err}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        }
+    }))
+}
+
+/// A KPR-1 intent awaiting chain observation, joined with its invoice.
+#[derive(sqlx::FromRow)]
+struct Candidate {
+    intent_pk: i64,
+    invoice_id: i64,
+    user_id: i64,
+    intent_id: String,
+    tx_id: String,
+    network: String,
+    asset_id: String,
+    amount_sompi: i64,
+    script_hash: String,
+    required_outputs: String,
+    store_id: Option<i64>,
+    public_id: String,
+    currency: String,
+    total_amount: i64,
+}
+
+/// One observer tick: examine every submitted-but-not-final intent against the
+/// chain source. Returns how many intents made progress (observed, settled,
+/// or failed verification). Chain-source errors are logged and skipped so a
+/// flaky node never wedges the loop.
+pub async fn run_tick<S: ChainSource>(state: &AppState, source: &S) -> Result<usize, sqlx::Error> {
+    let candidates = sqlx::query_as::<_, Candidate>(
+        "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, i.intent_id, \
+                i.tx_id, i.network, i.asset_id, i.amount_sompi, i.script_hash, i.required_outputs, \
+                inv.store_id, inv.public_id, inv.currency, inv.total_amount \
+         FROM kpr1_payment_intents i \
+         JOIN invoices inv ON inv.id = i.invoice_id \
+         WHERE i.tx_id IS NOT NULL AND i.status IN ('submitted', 'verified') \
+           AND inv.status = 'open' \
+         ORDER BY i.id \
+         LIMIT $1",
+    )
+    .bind(CLAIM_BATCH)
+    .fetch_all(&state.db.pool)
+    .await?;
+
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+
+    let virtual_daa = match source.virtual_daa_score().await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!("chain observer: virtual DAA score unavailable: {err}");
+            return Ok(0);
+        }
+    };
+
+    let mut progressed = 0usize;
+    let mut touched: Vec<(String, String)> = Vec::new();
+    for candidate in &candidates {
+        match observe_candidate(state, source, candidate, virtual_daa).await? {
+            Progress::None => {}
+            Progress::Advanced => {
+                progressed += 1;
+                let key = (candidate.network.clone(), candidate.asset_id.clone());
+                if !touched.contains(&key) {
+                    touched.push(key);
+                }
+            }
+        }
+    }
+
+    for (network, asset_id) in &touched {
+        update_checkpoint(state, network, asset_id, virtual_daa).await?;
+    }
+    Ok(progressed)
+}
+
+enum Progress {
+    /// Not yet visible on chain (or chain source error) — try again next tick.
+    None,
+    /// Observation row written (matched, settled, or failed verification).
+    Advanced,
+}
+
+async fn observe_candidate<S: ChainSource>(
+    state: &AppState,
+    source: &S,
+    c: &Candidate,
+    virtual_daa: u64,
+) -> Result<Progress, sqlx::Error> {
+    let required = parse_required_outputs(&c.required_outputs);
+    if required.is_empty() {
+        tracing::warn!("chain observer: intent {} has no required outputs; skipping", c.intent_id);
+        return Ok(Progress::None);
+    }
+    let mut addresses: Vec<String> = Vec::new();
+    for r in &required {
+        if !addresses.contains(&r.address) {
+            addresses.push(r.address.clone());
+        }
+    }
+
+    let tx = match source.transaction_outputs(&c.tx_id, &addresses).await {
+        Ok(Some(tx)) => tx,
+        Ok(None) => return Ok(Progress::None), // not observed yet
+        Err(err) => {
+            tracing::warn!("chain observer: lookup of tx {} failed: {err}", c.tx_id);
+            return Ok(Progress::None);
+        }
+    };
+
+    let confirmations: i64 = tx
+        .accepting_daa_score
+        .map(|acc| virtual_daa.saturating_sub(acc) as i64)
+        .unwrap_or(0);
+    let observed: Vec<(String, i128)> = tx
+        .outputs
+        .iter()
+        .map(|o| (o.address.clone(), o.amount_sompi as i128))
+        .collect();
+    let observed_total: i64 = tx.outputs.iter().map(|o| o.amount_sompi as i64).sum();
+    let metadata = observation_metadata(c, &required, &tx);
+    let now = now_iso();
+
+    match verify_required_outputs(&required, &observed) {
+        Err(reason) => {
+            // Fail closed: record the discrepancy, never mark paid.
+            upsert_observation(state, c, "mismatched", observed_total, confirmations, &tx, &metadata, &now).await?;
+            fail_intent(state, c, &reason, &now).await?;
+            tracing::warn!(
+                "chain observer: intent {} tx {} failed verification: {reason}",
+                c.intent_id,
+                c.tx_id
+            );
+            Ok(Progress::Advanced)
+        }
+        Ok(()) => {
+            let required_confirmations = required_confirmations_for(
+                state,
+                c.user_id,
+                &c.network,
+                &c.asset_id,
+                &c.currency,
+                c.total_amount as i128,
+            )
+            .await?;
+
+            if confirmations >= required_confirmations {
+                settle(state, c, observed_total, confirmations, &tx, &metadata, &now).await?;
+            } else {
+                upsert_observation(state, c, "matched", observed_total, confirmations, &tx, &metadata, &now)
+                    .await?;
+                mark_verified(state, c, &now).await?;
+            }
+            Ok(Progress::Advanced)
+        }
+    }
+}
+
+/// Observation metadata in the shape the KPR-1 explorer reads
+/// (`kpr1.intentId` / `kpr1.scriptHash` / `kpr1.outputs` with role +
+/// address + amountSompi for outputs that match a required output).
+fn observation_metadata(c: &Candidate, required: &[RequiredOutput], tx: &ObservedTransaction) -> String {
+    let outputs: Vec<Value> = tx
+        .outputs
+        .iter()
+        .map(|o| {
+            let role = required
+                .iter()
+                .find(|r| r.address == o.address && r.amount_sompi == o.amount_sompi as i128)
+                .map(|r| r.role.clone());
+            let mut out = json!({
+                "address": o.address,
+                "amountSompi": o.amount_sompi.to_string(),
+            });
+            if let Some(role) = role {
+                out["role"] = json!(role);
+            }
+            out
+        })
+        .collect();
+    json!({
+        "kpr1": {
+            "intentId": c.intent_id,
+            "scriptHash": c.script_hash,
+            "txId": tx.tx_id,
+            "outputs": outputs,
+        }
+    })
+    .to_string()
+}
+
+/// Create or update the observation row for (invoice, tx). Returns its id.
+#[allow(clippy::too_many_arguments)]
+async fn upsert_observation(
+    state: &AppState,
+    c: &Candidate,
+    status: &str,
+    amount: i64,
+    confirmations: i64,
+    tx: &ObservedTransaction,
+    metadata: &str,
+    now: &str,
+) -> Result<i64, sqlx::Error> {
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM payment_observations WHERE invoice_id = $1 AND tx_id = $2 ORDER BY id LIMIT 1",
+    )
+    .bind(c.invoice_id)
+    .bind(&c.tx_id)
+    .fetch_optional(&state.db.pool)
+    .await?;
+
+    let accepted_at = tx.accepting_daa_score.map(|_| now.to_string());
+    let block_daa_score = tx.accepting_daa_score.map(|v| v as i64);
+    let matched_at = (status == "matched" || status == "settled").then(|| now.to_string());
+
+    if let Some(id) = existing {
+        sqlx::query(
+            "UPDATE payment_observations SET status = $1, amount = $2, confirmations = $3, \
+             accepted_at = COALESCE(accepted_at, $4), block_daa_score = $5, \
+             matched_at = COALESCE(matched_at, $6), metadata = $7, updated_at = $8 WHERE id = $9",
+        )
+        .bind(status)
+        .bind(amount)
+        .bind(confirmations)
+        .bind(&accepted_at)
+        .bind(block_daa_score)
+        .bind(&matched_at)
+        .bind(metadata)
+        .bind(now)
+        .bind(id)
+        .execute(&state.db.pool)
+        .await?;
+        Ok(id)
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO payment_observations \
+             (invoice_id, status, amount, confirmations, accepted_at, network, asset_id, tx_id, \
+              block_daa_score, matched_at, metadata, created_at, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
+        )
+        .bind(c.invoice_id)
+        .bind(status)
+        .bind(amount)
+        .bind(confirmations)
+        .bind(&accepted_at)
+        .bind(&c.network)
+        .bind(&c.asset_id)
+        .bind(&c.tx_id)
+        .bind(block_daa_score)
+        .bind(&matched_at)
+        .bind(metadata)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&state.db.pool)
+        .await
+    }
+}
+
+/// Outputs matched but confirmations are still short of the policy: record
+/// the intent as observed + verified and keep waiting.
+async fn mark_verified(state: &AppState, c: &Candidate, now: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET status = 'verified', verification_status = 'verified', \
+         observed_at = COALESCE(observed_at, $1), verified_at = COALESCE(verified_at, $1), \
+         updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(c.intent_pk)
+    .execute(&state.db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Observed outputs do not satisfy the intent: mark the intent failed with a
+/// stable reason and record a critical anomaly signal. The invoice stays open.
+async fn fail_intent(state: &AppState, c: &Candidate, reason: &str, now: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET status = 'failed', verification_status = 'failed', \
+         failure_reason = $1, observed_at = COALESCE(observed_at, $2), updated_at = $2 WHERE id = $3",
+    )
+    .bind(reason)
+    .bind(now)
+    .bind(c.intent_pk)
+    .execute(&state.db.pool)
+    .await?;
+
+    let metadata = json!({
+        "txId": c.tx_id,
+        "invoiceId": c.invoice_id,
+        "invoicePublicId": c.public_id,
+        "reasonCode": reason,
+        "source": "chain_observer",
+    });
+    sqlx::query(
+        "INSERT INTO payment_anomaly_signals \
+         (user_id, signal_type, severity, status, resource_type, resource_id, detected_at, \
+          window_start, window_end, reason, metadata, created_at, updated_at) \
+         VALUES ($1, 'kpr1_output_mismatch', 'critical', 'open', 'kpr1_payment_intent', $2, $3, $3, $3, $4, $5, $3, $3)",
+    )
+    .bind(c.user_id)
+    .bind(&c.intent_id)
+    .bind(now)
+    .bind(reason)
+    .bind(metadata.to_string())
+    .execute(&state.db.pool)
+    .await?;
+    Ok(())
+}
+
+/// Confirmations met the tenant policy: settle in one transaction — confirmed
+/// payment row, observation + intent `settled`, invoice `paid` — then emit
+/// the `invoice.paid` webhook event through the standard fan-out.
+#[allow(clippy::too_many_arguments)]
+async fn settle(
+    state: &AppState,
+    c: &Candidate,
+    observed_total: i64,
+    confirmations: i64,
+    tx: &ObservedTransaction,
+    metadata: &str,
+    now: &str,
+) -> Result<(), sqlx::Error> {
+    let obs_id = upsert_observation(state, c, "matched", observed_total, confirmations, tx, metadata, now).await?;
+
+    let mut dbtx = state.db.pool.begin().await?;
+
+    // Re-check the invoice is still open inside the transaction (idempotency
+    // across crashes/concurrent settles); bail out silently otherwise.
+    let still_open: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE id = $1 AND status = 'open' FOR UPDATE")
+            .bind(c.invoice_id)
+            .fetch_optional(&mut *dbtx)
+            .await?;
+    if still_open.is_none() {
+        dbtx.rollback().await?;
+        return Ok(());
+    }
+
+    let payment_meta = json!({
+        "source": "chain_observer",
+        "txId": c.tx_id,
+        "intentId": c.intent_id,
+        "confirmations": confirmations,
+    });
+    sqlx::query(
+        "INSERT INTO payments (invoice_id, status, amount, metadata, created_at, updated_at) \
+         VALUES ($1, 'confirmed', $2, $3, $4, $4)",
+    )
+    .bind(c.invoice_id)
+    .bind(c.amount_sompi)
+    .bind(payment_meta.to_string())
+    .bind(now)
+    .execute(&mut *dbtx)
+    .await?;
+
+    sqlx::query("UPDATE payment_observations SET status = 'settled', settled_at = $1, updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(obs_id)
+        .execute(&mut *dbtx)
+        .await?;
+
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET status = 'settled', verification_status = 'verified', \
+         observed_at = COALESCE(observed_at, $1), verified_at = COALESCE(verified_at, $1), \
+         settled_at = $1, updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(c.intent_pk)
+    .execute(&mut *dbtx)
+    .await?;
+
+    sqlx::query("UPDATE invoices SET status = 'paid', paid_at = $1, updated_at = $1 WHERE id = $2")
+        .bind(now)
+        .bind(c.invoice_id)
+        .execute(&mut *dbtx)
+        .await?;
+
+    dbtx.commit().await?;
+
+    // Emit invoice.paid exactly like the existing flow: event row + pending
+    // deliveries for subscribed endpoints; the webhook worker sends them.
+    if let Some(payload) = invoice_paid_payload(state, c.invoice_id).await? {
+        webhooks::emit_event(
+            state,
+            c.user_id,
+            c.store_id,
+            "invoice.paid",
+            "invoice",
+            &c.public_id,
+            &payload,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Serialized invoice (post-update, so `status`/`paidAt` are final) as the
+/// `invoice.paid` event payload. `None` when the invoice vanished mid-tick.
+async fn invoice_paid_payload(state: &AppState, invoice_id: i64) -> Result<Option<Value>, sqlx::Error> {
+    let inv = match invoices::load_by_id(state, invoice_id).await {
+        Ok(inv) => inv,
+        Err(crate::error::AppError::Database(e)) => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    match invoices::load_relations(state, invoice_id).await {
+        Ok((items, intent)) => Ok(Some(invoices::serialize_invoice(&inv, &items, intent.as_ref()))),
+        Err(crate::error::AppError::Database(e)) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Track observer progress per (network, asset): last seen virtual DAA score.
+async fn update_checkpoint(
+    state: &AppState,
+    network: &str,
+    asset_id: &str,
+    virtual_daa: u64,
+) -> Result<(), sqlx::Error> {
+    let now = now_iso();
+    let metadata = json!({ "virtualDaaScore": virtual_daa.to_string(), "lastTickAt": now });
+    sqlx::query(
+        "INSERT INTO payment_indexer_checkpoints (network, asset_id, source, checkpoint, metadata, created_at, updated_at) \
+         VALUES ($1, $2, 'chain_observer', $3, $4, $5, $5) \
+         ON CONFLICT (network, asset_id, source) DO UPDATE SET \
+         checkpoint = excluded.checkpoint, metadata = excluded.metadata, updated_at = excluded.updated_at",
+    )
+    .bind(network)
+    .bind(asset_id)
+    .bind(virtual_daa.to_string())
+    .bind(metadata.to_string())
+    .bind(&now)
+    .execute(&state.db.pool)
+    .await?;
+    Ok(())
+}
