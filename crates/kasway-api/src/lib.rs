@@ -20,12 +20,23 @@ pub mod store_context;
 pub mod util;
 pub mod webhook_worker;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{HeaderValue, Method};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use state::AppState;
 use tower_http::cors::CorsLayer;
+use tower_http::timeout::TimeoutLayer;
+
+/// Global request timeout applied to every route.
+const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Global request body cap (2 MB). The media upload route raises this to its
+/// own larger limit so `medias.rs`'s streaming `MAX_SIZE` check governs uploads.
+const GLOBAL_BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// Body cap for the media upload route (above `medias::MAX_SIZE` so the
+/// handler's own streaming size check is what rejects oversized uploads).
+const MEDIA_BODY_LIMIT: usize = 110 * 1024 * 1024;
 
 /// Build the application router. Shared by the binary and the integration tests.
 pub fn build_router(state: AppState) -> Router {
@@ -71,16 +82,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/kpr1/invoices/:publicId/refund-arbitrated/prepare", post(handlers::internal_kpr1_ops::refund_arbitrated_prepare))
         .route("/internal/payment-ops/kpr1/invoices/:publicId/refund-arbitrated", post(handlers::internal_kpr1_ops::refund_arbitrated_submit))
         // --- Media (merchant) ---
-        .route("/api/media", post(handlers::medias::store))
+        // The upload route raises the global body cap so `medias.rs`'s own
+        // streaming size check governs (rejecting oversize without buffering).
+        .route(
+            "/api/media",
+            post(handlers::medias::store).layer(DefaultBodyLimit::max(MEDIA_BODY_LIMIT)),
+        )
         .route("/api/media/:id", delete(handlers::medias::destroy))
         // --- OpenAPI spec (static) ---
         .route("/openapi.json", get(handlers::docs::openapi))
         // --- Public misc (price) ---
         .route("/api/price", get(handlers::public_misc::price))
-        // --- Transmit (SSE) ---
-        .route("/__transmit/events", get(handlers::transmit::events))
-        .route("/__transmit/subscribe", post(handlers::transmit::subscribe))
-        .route("/__transmit/unsubscribe", post(handlers::transmit::unsubscribe))
+        // Transmit (SSE) routes are added AFTER the global timeout layer below so
+        // the long-lived event stream is exempt from the request timeout.
         // --- Public KPR-1 explorer ---
         .route("/api/explorer/kpr1/intents/:intentId", get(handlers::explorer_kpr1::show_intent))
         .route("/api/explorer/kpr1/intents/:intentId/wallet-verification", get(handlers::explorer_kpr1::wallet_verification))
@@ -236,6 +250,23 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/webhook-events", get(handlers::webhooks::events_index))
         .route("/api/webhook-events/:id", get(handlers::webhooks::events_show))
         .route("/api/webhook-events/:id/replay", post(handlers::webhooks::events_replay))
+        // Global request timeout + body size cap. Applied after (outside) the
+        // per-route media limit so that inner override still wins for uploads.
+        .layer(DefaultBodyLimit::max(GLOBAL_BODY_LIMIT))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
+        ))
+        // SSE routes: merged AFTER the timeout layer so the keep-alive event
+        // stream is never cut by the global request timeout. They still get the
+        // body cap and the outer CORS layer.
+        .merge(
+            Router::new()
+                .route("/__transmit/events", get(handlers::transmit::events))
+                .route("/__transmit/subscribe", post(handlers::transmit::subscribe))
+                .route("/__transmit/unsubscribe", post(handlers::transmit::unsubscribe))
+                .layer(DefaultBodyLimit::max(GLOBAL_BODY_LIMIT)),
+        )
         .layer(cors)
         .with_state(state)
 }

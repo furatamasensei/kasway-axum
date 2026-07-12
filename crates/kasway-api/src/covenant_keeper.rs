@@ -192,7 +192,10 @@ async fn settle_one(
         return Err(kerr("covenant funding UTXO not found yet"));
     };
     let keeper_address = keeper.address(prefix).to_string();
-    let fee_utxos = client.fetch_utxos(&keeper_address).await.map_err(|e| kerr(e.to_string()))?;
+    // Deterministic fee-UTXO pick (mirrors gather_release_inputs/gather_refund_inputs)
+    // so concurrent settlements in one batch are less likely to collide on a UTXO.
+    let mut fee_utxos = client.fetch_utxos(&keeper_address).await.map_err(|e| kerr(e.to_string()))?;
+    fee_utxos.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let Some((fee_txid, fee_index, fee_value)) = fee_utxos.into_iter().find(|(_, _, v)| *v > min_fee + 1) else {
         return Err(kerr(format!("no keeper fee UTXO > {min_fee} sompi at {keeper_address}")));
     };

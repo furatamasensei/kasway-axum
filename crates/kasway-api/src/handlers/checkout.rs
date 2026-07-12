@@ -85,9 +85,26 @@ pub async fn submit_kpr1_payment(
         m.insert("walletSubmission".into(), body.get("metadata").cloned().unwrap_or(json!({})));
     }
     let now = now_iso();
-    sqlx::query("UPDATE kpr1_payment_intents SET status = 'submitted', tx_id = $1, submitted_at = COALESCE(submitted_at, $2), metadata = $3, updated_at = $4 WHERE id = $5")
+    // Atomic claim of the tx id: only write when it is still unset (or already the
+    // same tx — idempotent re-submit) and the intent is still accepting payments.
+    // This closes the race where two concurrent submissions both pass the earlier
+    // SELECT-then-check and clobber each other.
+    let res = sqlx::query(
+        "UPDATE kpr1_payment_intents SET status = 'submitted', tx_id = $1, submitted_at = COALESCE(submitted_at, $2), metadata = $3, updated_at = $4 \
+         WHERE id = $5 AND status IN ('created', 'fetched', 'submitted') AND (tx_id IS NULL OR tx_id = $1)")
         .bind(&tx_id).bind(&now).bind(meta.to_string()).bind(&now).bind(intent_id)
         .execute(&state.db.pool).await?;
+    if res.rows_affected() == 0 {
+        // A concurrent submission already claimed a different tx id (or the intent
+        // left the accepting states). Report the tx id now on record.
+        let existing: Option<String> = sqlx::query_scalar("SELECT tx_id FROM kpr1_payment_intents WHERE id = $1")
+            .bind(intent_id).fetch_optional(&state.db.pool).await?.flatten();
+        return Ok(kpr1_err(
+            "KPR1_TX_ID_ALREADY_SUBMITTED",
+            "KPR-1 payment intent already has a submitted tx id",
+            existing.map(|cur| json!({ "currentTxId": cur })),
+        ));
+    }
 
     let (_i, updated) = invoices::load_relations(&state, inv_id).await?;
     let updated = updated.ok_or_else(|| AppError::commerce(500, "intent vanished"))?;

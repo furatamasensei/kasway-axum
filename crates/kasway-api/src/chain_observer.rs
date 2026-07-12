@@ -35,10 +35,9 @@
 
 use crate::chain_source::{ChainSource, ObservedTransaction};
 use crate::handlers::payment_ops_settings::required_confirmations_for;
-use crate::handlers::{invoices, webhooks};
 use crate::state::AppState;
 use crate::util::now_iso;
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// Idle sleep between polls.
 const POLL_INTERVAL_SECS: u64 = 5;
@@ -85,12 +84,9 @@ struct Candidate {
     tx_id: String,
     network: String,
     asset_id: String,
-    amount_sompi: i64,
     script_hash: String,
-    required_outputs: String,
     covenant_address: Option<String>,
     gross_amount: Option<i64>,
-    store_id: Option<i64>,
     public_id: String,
     currency: String,
     total_amount: i64,
@@ -103,9 +99,9 @@ struct Candidate {
 pub async fn run_tick<S: ChainSource>(state: &AppState, source: &S) -> Result<usize, sqlx::Error> {
     let candidates = sqlx::query_as::<_, Candidate>(
         "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, i.intent_id, \
-                i.tx_id, i.network, i.asset_id, i.amount_sompi, i.script_hash, i.required_outputs, \
+                i.tx_id, i.network, i.asset_id, i.script_hash, \
                 i.covenant_address, i.gross_amount, \
-                inv.store_id, inv.public_id, inv.currency, inv.total_amount \
+                inv.public_id, inv.currency, inv.total_amount \
          FROM kpr1_payment_intents i \
          JOIN invoices inv ON inv.id = i.invoice_id \
          WHERE i.tx_id IS NOT NULL AND i.covenant_address IS NOT NULL \
@@ -378,108 +374,6 @@ async fn fail_intent(state: &AppState, c: &Candidate, reason: &str, now: &str) -
     .execute(&state.db.pool)
     .await?;
     Ok(())
-}
-
-/// Confirmations met the tenant policy: settle in one transaction — confirmed
-/// payment row, observation + intent `settled`, invoice `paid` — then emit
-/// the `invoice.paid` webhook event through the standard fan-out.
-#[allow(clippy::too_many_arguments)]
-async fn settle(
-    state: &AppState,
-    c: &Candidate,
-    observed_total: i64,
-    confirmations: i64,
-    tx: &ObservedTransaction,
-    metadata: &str,
-    now: &str,
-) -> Result<(), sqlx::Error> {
-    let obs_id = upsert_observation(state, c, "matched", observed_total, confirmations, tx, metadata, now).await?;
-
-    let mut dbtx = state.db.pool.begin().await?;
-
-    // Re-check the invoice is still open inside the transaction (idempotency
-    // across crashes/concurrent settles); bail out silently otherwise.
-    let still_open: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM invoices WHERE id = $1 AND status = 'open' FOR UPDATE")
-            .bind(c.invoice_id)
-            .fetch_optional(&mut *dbtx)
-            .await?;
-    if still_open.is_none() {
-        dbtx.rollback().await?;
-        return Ok(());
-    }
-
-    let payment_meta = json!({
-        "source": "chain_observer",
-        "txId": c.tx_id,
-        "intentId": c.intent_id,
-        "confirmations": confirmations,
-    });
-    sqlx::query(
-        "INSERT INTO payments (invoice_id, status, amount, metadata, created_at, updated_at) \
-         VALUES ($1, 'confirmed', $2, $3, $4, $4)",
-    )
-    .bind(c.invoice_id)
-    .bind(c.amount_sompi)
-    .bind(payment_meta.to_string())
-    .bind(now)
-    .execute(&mut *dbtx)
-    .await?;
-
-    sqlx::query("UPDATE payment_observations SET status = 'settled', settled_at = $1, updated_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(obs_id)
-        .execute(&mut *dbtx)
-        .await?;
-
-    sqlx::query(
-        "UPDATE kpr1_payment_intents SET status = 'settled', verification_status = 'verified', \
-         observed_at = COALESCE(observed_at, $1), verified_at = COALESCE(verified_at, $1), \
-         settled_at = $1, updated_at = $1 WHERE id = $2",
-    )
-    .bind(now)
-    .bind(c.intent_pk)
-    .execute(&mut *dbtx)
-    .await?;
-
-    sqlx::query("UPDATE invoices SET status = 'paid', paid_at = $1, updated_at = $1 WHERE id = $2")
-        .bind(now)
-        .bind(c.invoice_id)
-        .execute(&mut *dbtx)
-        .await?;
-
-    dbtx.commit().await?;
-
-    // Emit invoice.paid exactly like the existing flow: event row + pending
-    // deliveries for subscribed endpoints; the webhook worker sends them.
-    if let Some(payload) = invoice_paid_payload(state, c.invoice_id).await? {
-        webhooks::emit_event(
-            state,
-            c.user_id,
-            c.store_id,
-            "invoice.paid",
-            "invoice",
-            &c.public_id,
-            &payload,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-/// Serialized invoice (post-update, so `status`/`paidAt` are final) as the
-/// `invoice.paid` event payload. `None` when the invoice vanished mid-tick.
-async fn invoice_paid_payload(state: &AppState, invoice_id: i64) -> Result<Option<Value>, sqlx::Error> {
-    let inv = match invoices::load_by_id(state, invoice_id).await {
-        Ok(inv) => inv,
-        Err(crate::error::AppError::Database(e)) => return Err(e),
-        Err(_) => return Ok(None),
-    };
-    match invoices::load_relations(state, invoice_id).await {
-        Ok((items, intent)) => Ok(Some(invoices::serialize_invoice(&inv, &items, intent.as_ref()))),
-        Err(crate::error::AppError::Database(e)) => Err(e),
-        Err(_) => Ok(None),
-    }
 }
 
 /// Track observer progress per (network, asset): last seen virtual DAA score.

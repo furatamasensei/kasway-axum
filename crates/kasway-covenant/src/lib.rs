@@ -61,6 +61,8 @@ pub enum CovenantError {
     Address(String),
     #[error("unsupported address kind (only schnorr P2PK and P2SH are supported): {0}")]
     UnsupportedAddressKind(String),
+    #[error("payout values ({sum}) do not sum to gross_amount ({gross})")]
+    PayoutSumMismatch { sum: u128, gross: u128 },
 }
 
 impl From<CompilerError> for CovenantError {
@@ -133,6 +135,22 @@ pub struct Payout {
 
 fn to_i64(v: u64) -> Result<i64, CovenantError> {
     i64::try_from(v).map_err(|_| CovenantError::AmountOverflow(v))
+}
+
+/// Verify a 64-byte BIP340 schnorr `datasig` over a 32-byte `digest` against an
+/// x-only pubkey. Pure and infallible: returns `false` on any parse error or a
+/// wrong-length signature. Used to authenticate a party (customer/merchant) who
+/// signs a domain-separated request digest off-chain — it commits to `digest`
+/// directly (like [`KeeperKey::sign_datasig`]), not to a transaction sighash.
+pub fn verify_datasig(pubkey_xonly: &[u8; 32], digest: &[u8; 32], sig64: &[u8]) -> bool {
+    let Ok(sig) = secp256k1::schnorr::Signature::from_slice(sig64) else {
+        return false;
+    };
+    let Ok(pubkey) = secp256k1::XOnlyPublicKey::from_slice(pubkey_xonly) else {
+        return false;
+    };
+    let msg = Message::from_digest(*digest);
+    Secp256k1::new().verify_schnorr(&sig, &msg, &pubkey).is_ok()
 }
 
 /// The P2SH scriptPubKey that locks funds into this covenant.

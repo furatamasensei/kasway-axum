@@ -180,10 +180,44 @@ impl AppConfig {
         if let Ok(v) = std::env::var("GOOGLE_CLIENT_SECRET") { google.client_secret = v; }
         if let Ok(v) = std::env::var("APP_URL") { if !v.is_empty() { google.app_url = v; } }
         if let Ok(v) = std::env::var("FRONTEND_URL") { if !v.is_empty() { google.frontend_url = v; } }
+
+        let node_env = std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string());
+
+        // KPR-1 signing seed / key id: override the source-visible defaults from
+        // env. `signing_seed` must be 64-char hex → [u8; 32].
+        let seed_set = match std::env::var("KPR1_SIGNING_SEED").ok().filter(|s| !s.is_empty()) {
+            Some(hex) => match decode_hex32(hex.trim()) {
+                Some(seed) => { kpr1.signing_seed = seed; true }
+                None => false,
+            },
+            None => false,
+        };
+        if let Ok(v) = std::env::var("KPR1_SIGNING_KEY_ID") {
+            if !v.is_empty() { kpr1.signing_key_id = v; }
+        }
+
+        // Fail closed at startup: production must not run with the source-visible
+        // default signing seed or the placeholder platform fee address.
+        if node_env == "production" {
+            if !seed_set {
+                panic!(
+                    "KPR1_SIGNING_SEED must be set to a valid 64-char hex value in production; \
+                     refusing to start with the source-visible default seed"
+                );
+            }
+            let fee_addr = kpr1.platform_fee_address.trim();
+            if fee_addr.is_empty() || fee_addr == "kaspatest:platformfeeaddr00000" {
+                panic!(
+                    "KASWAY_PLATFORM_FEE_ADDRESS must be set to a real address in production; \
+                     refusing to start with the placeholder fee address"
+                );
+            }
+        }
+
         Self {
             internal_api_token: std::env::var("INTERNAL_API_TOKEN").ok().filter(|s| !s.is_empty()),
             turnstile_secret: std::env::var("TURNSTILE_SECRET").ok().filter(|s| !s.is_empty()),
-            node_env: std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
+            node_env,
             kpr1,
             covenant,
             google,
@@ -238,4 +272,17 @@ impl AppConfig {
             Err(_) => false,
         }
     }
+}
+
+/// Decode a 64-char hex string into a fixed 32-byte array (same pattern as
+/// `covenant_keeper::decode_hex32`). Returns `None` on any malformed input.
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }

@@ -75,6 +75,13 @@ impl JuryEscrowParams {
                 self.jury_threshold, n
             )));
         }
+        // Defense-in-depth: the payout values must exactly account for the gross
+        // the covenant holds. A covenant funded with sum < gross would leak the
+        // surplus (permissionless `release_captured` could sweep it).
+        let sum: u128 = self.payouts.iter().map(|p| p.value as u128).sum();
+        if sum != self.gross_amount as u128 {
+            return Err(CovenantError::PayoutSumMismatch { sum, gross: self.gross_amount as u128 });
+        }
 
         let payloads: Vec<Vec<u8>> = self.payouts.iter().map(|p| p.destination.payload32()).collect();
         let kinds: Vec<i64> = self.payouts.iter().map(|p| p.destination.kind()).collect();

@@ -18,9 +18,16 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 
+# Run as a non-root system user.
+RUN useradd --system --uid 10001 --user-group --no-create-home kasway
+
 COPY --from=builder /usr/local/bin/kasway-server /usr/local/bin/kasway-server
+
+RUN chown -R kasway:kasway /app
 
 ENV HOST_PORT=0.0.0.0:8080
 EXPOSE 8080
+
+USER kasway
 
 CMD ["kasway-server"]

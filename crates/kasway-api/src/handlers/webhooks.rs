@@ -231,21 +231,55 @@ pub(crate) fn validate_webhook_url(raw: &str, allow_loopback: bool) -> Result<()
     if allow_loopback && is_loopback {
         return Ok(());
     }
+    // IP-literal host: validate directly against the forbidden-IP rules.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if is_forbidden_ip(&ip) {
             return Err(("forbidden_address", "Webhook URL must not target a private, loopback, link-local, or reserved address"));
+        }
+        return Ok(());
+    }
+    // DNS name host: reject bare "localhost" outright. Then best-effort resolve:
+    // if the name resolves now, reject any forbidden IP; if it does NOT resolve
+    // (NXDOMAIN / offline / DNS not yet propagated) allow it through — delivery
+    // time is the hard SSRF gate, where `webhook_worker` re-resolves, re-checks
+    // every IP against `is_forbidden_ip`, and PINS the connection to those
+    // validated addresses (defeating DNS-rebinding). The loopback dev exception
+    // was already handled above.
+    if host == "localhost" {
+        return Err(("forbidden_address", "Webhook URL must not target localhost"));
+    }
+    use std::net::ToSocketAddrs;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    if let Ok(addrs) = (host.as_str(), port).to_socket_addrs() {
+        for addr in addrs {
+            if is_forbidden_ip(&addr.ip()) {
+                return Err(("forbidden_address", "Webhook URL must not resolve to a private, loopback, link-local, or reserved address"));
+            }
         }
     }
     Ok(())
 }
 
-fn is_forbidden_ip(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn is_forbidden_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
                 || v4.is_broadcast() || v4.is_documentation()
         }
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            // IPv4-mapped (::ffff:a.b.c.d): fall back to the v4 rules.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ip(&std::net::IpAddr::V4(v4));
+            }
+            let seg = v6.octets();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // unique-local fc00::/7
+                || (seg[0] & 0xfe) == 0xfc
+                // link-local fe80::/10
+                || (seg[0] == 0xfe && (seg[1] & 0xc0) == 0x80)
+        }
     }
 }
 

@@ -22,12 +22,13 @@
 //! `FOR UPDATE SKIP LOCKED`, so concurrent workers won't double-send. The tick
 //! is a standalone function so tests can drive it without the polling loop.
 
-use crate::handlers::webhooks::{allow_loopback, validate_webhook_url};
+use crate::handlers::webhooks::{allow_loopback, is_forbidden_ip, validate_webhook_url};
 use crate::state::AppState;
 use crate::util::now_iso;
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::net::ToSocketAddrs;
 
 /// Payload schema version reported in `X-Kasway-Webhook-Version`.
 const WEBHOOK_VERSION: &str = "1";
@@ -39,6 +40,9 @@ const POLL_INTERVAL_SECS: u64 = 5;
 const CLAIM_BATCH: i64 = 10;
 /// Stored `response_body` is truncated to this many bytes.
 const RESPONSE_BODY_LIMIT: usize = 4096;
+/// Deliveries stuck in `delivering` longer than this (a worker crash between
+/// claiming and recording) are reaped back to `pending` so they retry.
+const DELIVERING_STUCK_SECS: i64 = 300;
 
 struct RetryProfile {
     max_attempts: i64,
@@ -69,6 +73,32 @@ pub fn http_client() -> reqwest::Client {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("webhook http client")
+}
+
+/// Per-delivery client that only connects to the pre-validated IPs for `host`
+/// (DNS-rebind pinning). Mirrors `http_client`'s settings: same timeout,
+/// redirects never followed, no proxy.
+fn pinned_client(host: &str, addrs: &[std::net::SocketAddr]) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve_to_addrs(host, addrs)
+        .build()
+        .expect("webhook pinned http client")
+}
+
+/// Read at most `RESPONSE_BODY_LIMIT` bytes of the response body via a chunked
+/// loop, so a malicious endpoint can't exhaust memory by streaming a huge body.
+async fn read_capped_body(mut resp: reqwest::Response) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    while buf.len() <= RESPONSE_BODY_LIMIT {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => buf.extend_from_slice(&chunk),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    buf.truncate(RESPONSE_BODY_LIMIT);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Spawn the polling loop as a tokio background task (called at startup).
@@ -110,6 +140,23 @@ struct DueDelivery {
 /// active and not paused) and attempt each one. Returns how many were claimed.
 pub async fn run_tick(state: &AppState, client: &reqwest::Client) -> Result<usize, sqlx::Error> {
     let now = now_iso();
+    // Reaper: a crash between claiming (pending → delivering) and recording the
+    // outcome can leave rows stuck in `delivering` forever (the claim query only
+    // selects `pending`). Reset any that have been delivering past the stuck
+    // threshold back to `pending` so they get retried.
+    let stuck_cutoff = (chrono::Utc::now() - chrono::Duration::seconds(DELIVERING_STUCK_SECS))
+        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+        .to_string();
+    sqlx::query(
+        "UPDATE webhook_deliveries SET status = 'pending', updated_at = $1 \
+         WHERE status = 'delivering' \
+           AND (last_attempted_at IS NULL OR last_attempted_at < $2) \
+           AND updated_at < $2",
+    )
+    .bind(&now)
+    .bind(&stuck_cutoff)
+    .execute(&state.db.pool)
+    .await?;
     // Claim pending → delivering; SKIP LOCKED keeps concurrent workers from
     // double-sending the same row.
     let ids: Vec<i64> = sqlx::query_scalar(
@@ -164,7 +211,7 @@ pub fn sign_payload(signing_secret: &str, timestamp: &str, raw_body: &str) -> St
 /// Attempt one claimed delivery and record the outcome.
 async fn attempt_delivery(
     state: &AppState,
-    client: &reqwest::Client,
+    _base_client: &reqwest::Client,
     d: &DueDelivery,
 ) -> Result<(), sqlx::Error> {
     // SSRF policy re-check at delivery time (URLs are validated on
@@ -172,6 +219,37 @@ async fn attempt_delivery(
     if let Err((code, reason)) = validate_webhook_url(&d.url, allow_loopback(state)) {
         return record_failure(state, d, None, None, &format!("{code}: {reason}")).await;
     }
+
+    // Resolve the host ourselves and PIN the connection to the validated IPs so a
+    // DNS rebind between validate and connect can't redirect us at a forbidden
+    // address (validate→connect TOCTOU).
+    let parsed = match url::Url::parse(&d.url) {
+        Ok(u) => u,
+        Err(_) => return record_failure(state, d, None, None, "invalid_url").await,
+    };
+    let host = parsed
+        .host_str()
+        .unwrap_or("")
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let allow_lb = allow_loopback(state);
+    let addrs: Vec<std::net::SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
+        Ok(it) => it.collect(),
+        Err(_) => return record_failure(state, d, None, None, "forbidden_address: host could not be resolved").await,
+    };
+    if addrs.is_empty() {
+        return record_failure(state, d, None, None, "forbidden_address: host could not be resolved").await;
+    }
+    for addr in &addrs {
+        let ip = addr.ip();
+        // Mirror validate_webhook_url's loopback dev exception.
+        let loopback_ok = allow_lb && ip.is_loopback();
+        if !loopback_ok && is_forbidden_ip(&ip) {
+            return record_failure(state, d, None, None, "forbidden_address: resolved to a forbidden IP").await;
+        }
+    }
+    let client = pinned_client(&host, &addrs);
 
     let data: Value = serde_json::from_str(&d.payload).unwrap_or_else(|_| json!({}));
     let body = json!({
@@ -203,8 +281,7 @@ async fn attempt_delivery(
     match response {
         Ok(resp) => {
             let status = resp.status().as_u16() as i64;
-            let mut body = resp.text().await.unwrap_or_default();
-            body.truncate(RESPONSE_BODY_LIMIT);
+            let body = read_capped_body(resp).await;
             if (200..300).contains(&status) {
                 record_success(state, d, status, &body).await
             } else {

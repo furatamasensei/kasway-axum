@@ -73,8 +73,17 @@ pub async fn store(
                     .and_then(|f| f.rsplit('.').next())
                     .map(|e| e.to_ascii_lowercase());
                 file_ext = ext;
-                let data = field.bytes().await.map_err(|_| vfail("file", "file", "Could not read uploaded file"))?;
-                file_bytes = Some(data.to_vec());
+                // Stream chunks, rejecting early once the running size exceeds
+                // MAX_SIZE so an oversized upload is never fully buffered.
+                let mut field = field;
+                let mut buf: Vec<u8> = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(|_| vfail("file", "file", "Could not read uploaded file"))? {
+                    if buf.len() + chunk.len() > MAX_SIZE {
+                        return Err(vfail("file", "size", "The file size must be under 100mb"));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                file_bytes = Some(buf);
             }
             Some("width") => width = field.text().await.ok().and_then(|t| t.trim().parse().ok()),
             Some("height") => height = field.text().await.ok().and_then(|t| t.trim().parse().ok()),

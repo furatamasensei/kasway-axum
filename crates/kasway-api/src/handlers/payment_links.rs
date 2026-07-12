@@ -107,8 +107,9 @@ pub async fn index(
     Query(q): Query<LinkQuery>,
 ) -> AppResult<Json<Value>> {
     let store_id = resolve_request_store(&state, auth.user_id, q.store_id).await?;
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    // Clamp pagination params before multiplying so `offset` can't overflow i64.
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
     let total: i64 = sqlx::query_scalar(
@@ -155,6 +156,9 @@ pub async fn store(
     if amount <= 0 {
         return Err(AppError::commerce(422, "Payment link amount must be greater than zero"));
     }
+    // Bound to i64 before the DB cast so a value like 2^63 can't wrap negative.
+    let amount_i64 = i64::try_from(amount)
+        .map_err(|_| AppError::commerce(422, "Payment link amount exceeds maximum"))?;
 
     let network = input
         .payment_network
@@ -177,7 +181,7 @@ pub async fn store(
     .bind(store_id)
     .bind(&public_id)
     .bind(&input.title)
-    .bind(amount as i64)
+    .bind(amount_i64)
     .bind(&asset)
     .bind(&network)
     .bind(&asset)

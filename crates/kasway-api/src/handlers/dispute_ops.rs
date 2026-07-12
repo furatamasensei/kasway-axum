@@ -69,7 +69,15 @@ async fn load_pool(state: &AppState) -> AppResult<Vec<[u8; 32]>> {
 }
 
 /// `POST /api/checkout/invoices/:publicId/dispute/open`
-/// Body: `{ customerEvidenceHash, merchantEvidenceHash }` (32-byte sha256 hex).
+/// Body: `{ customerEvidenceHash, merchantEvidenceHash, party, signature }`.
+///
+/// Opening a dispute FREEZES a funded escrow, so it is NOT a public endpoint: the
+/// caller must prove they are a party to the escrow (customer or merchant). They
+/// pick `party` (`"customer"`|`"merchant"`) and supply a 64-byte schnorr
+/// `signature` (hex) by that party's key over the domain-separated request digest
+/// `sha256("KASWAY/dispute/open" || public_id || customerEvidenceHash ||
+/// merchantEvidenceHash)`. The party pubkeys are the intent's
+/// `customer_refund_address` (customer) and its `merchant_net` payout (merchant).
 pub async fn open_dispute(
     State(state): State<AppState>,
     Path(public_id): Path<String>,
@@ -80,7 +88,52 @@ pub async fn open_dispute(
     let (Some(ch), Some(mh)) = (ch, mh) else {
         return Err(derr("customerEvidenceHash and merchantEvidenceHash (32-byte hex) are required"));
     };
+    let party = body.get("party").and_then(|v| v.as_str()).unwrap_or_default();
+    if party != "customer" && party != "merchant" {
+        return Err(derr("party must be 'customer' or 'merchant'"));
+    }
+    let signature = body
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .and_then(|s| (0..s.len() / 2).map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()).collect::<Option<Vec<u8>>>())
+        .filter(|s| s.len() == 64)
+        .ok_or_else(|| derr("signature must be a 64-byte hex Schnorr signature"))?;
+
     let intent = load_intent(&state, &public_id).await?;
+
+    // The escrow is funded/finalized by this point, so both party pubkeys exist:
+    // the customer (refund address) and the merchant (merchant_net payout).
+    let refund_addr = intent
+        .customer_refund_address
+        .as_deref()
+        .ok_or_else(|| derr("customer refund address missing (escrow not funded)"))?;
+    let customer_pk = Destination::parse(refund_addr)
+        .ok()
+        .and_then(|d| pk32(&d))
+        .ok_or_else(|| derr("customer refund address is not a schnorr P2PK address"))?;
+    let outs = parse_required_outputs(&intent.required_outputs);
+    let merchant_pk = outs
+        .iter()
+        .find(|o| o.role == "merchant_net")
+        .and_then(|o| Destination::parse(&o.address).ok())
+        .and_then(|d| pk32(&d))
+        .ok_or_else(|| derr("merchant payout address missing or not a schnorr P2PK address"))?;
+
+    // Domain-separated digest binding this request to the escrow + evidence set.
+    let digest: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"KASWAY/dispute/open");
+        h.update(public_id.as_bytes());
+        h.update(ch);
+        h.update(mh);
+        h.finalize().into()
+    };
+    let signer_pk = if party == "customer" { &customer_pk } else { &merchant_pk };
+    if !kasway_covenant::verify_datasig(signer_pk, &digest, &signature) {
+        return Err(AppError::commerce(403, "dispute open must be signed by the customer or merchant"));
+    }
+
     let dispute_id = dispute::open_dispute(&state, intent.intent_pk, "jury", &ch, &mh).await?;
     Ok(Json(json!({ "disputeId": dispute_id, "state": "open", "evidenceRoot": hex(&dispute::evidence_root(&ch, &mh)) })))
 }

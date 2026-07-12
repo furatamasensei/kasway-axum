@@ -102,8 +102,8 @@ async fn plan_external_id_taken(state: &AppState, user_id: i64, ext: &str, excep
 }
 
 pub async fn plans_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_plans WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
     let rows = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
@@ -114,6 +114,11 @@ pub async fn plans_store(auth: AuthMerchant, State(state): State<AppState>, Json
     let mut errors = Vec::new();
     let name = req_string(&body, "name", 1, 255, &mut errors);
     let amount = atomic_amount(&body, "amount", &mut errors);
+    // Enforce the i64 range in addition to the atomic format.
+    let amount_i64 = amount.as_deref().and_then(parse_atomic_i64);
+    if amount.is_some() && amount_i64.is_none() {
+        errors.push(ValidationFailure { message: "The amount field exceeds the maximum".into(), rule: "max".into(), field: "amount".into() });
+    }
     validate_enum(&body, "intervalUnit", INTERVAL_UNITS, true, &mut errors);
     let interval_count = req_int(&body, "intervalCount", 1, 365, &mut errors);
     if !errors.is_empty() { return Err(AppError::Validation(errors)); }
@@ -135,7 +140,7 @@ pub async fn plans_store(auth: AuthMerchant, State(state): State<AppState>, Json
          VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(auth.user_id).bind(&public_id).bind(&external_id).bind(name.unwrap())
-    .bind(opt_string(&body, "description")).bind(amount.unwrap().parse::<i64>().unwrap_or(0))
+    .bind(opt_string(&body, "description")).bind(amount_i64.unwrap())
     .bind(&currency).bind(&network).bind(&asset)
     .bind(body.get("intervalUnit").and_then(|v| v.as_str()).unwrap())
     .bind(interval_count.unwrap())
@@ -169,11 +174,26 @@ pub async fn plans_update(auth: AuthMerchant, State(state): State<AppState>, Pat
     set_str!("currency", "currency");
     set_str!("paymentNetwork", "payment_network");
     set_str!("paymentAsset", "payment_asset");
-    set_str!("intervalUnit", "interval_unit");
-    if let Some(a) = body.get("amount").and_then(|v| v.as_str()) {
-        sqlx::query("UPDATE subscription_plans SET amount = $1, updated_at = $2 WHERE id = $3").bind(a.parse::<i64>().unwrap_or(0)).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
+    // intervalUnit: apply the same enum check the create path uses.
+    if let Some(v) = body.get("intervalUnit").and_then(|v| v.as_str()) {
+        if !INTERVAL_UNITS.contains(&v) {
+            return Err(AppError::Validation(vec![ValidationFailure { message: "The selected intervalUnit is invalid".into(), rule: "enum".into(), field: "intervalUnit".into() }]));
+        }
+        sqlx::query("UPDATE subscription_plans SET interval_unit = $1, updated_at = $2 WHERE id = $3").bind(v).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
     }
+    // amount: validate atomic format and i64 range instead of silently zeroing.
+    if let Some(a) = body.get("amount").and_then(|v| v.as_str()) {
+        if !is_atomic_str(a) {
+            return Err(AppError::Validation(vec![ValidationFailure { message: "The amount field format is invalid".into(), rule: "regex".into(), field: "amount".into() }]));
+        }
+        let amt = parse_atomic_i64(a).ok_or_else(|| AppError::commerce(422, "amount exceeds maximum"))?;
+        sqlx::query("UPDATE subscription_plans SET amount = $1, updated_at = $2 WHERE id = $3").bind(amt).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
+    }
+    // intervalCount: apply the same 1..=365 range the create path uses.
     if let Some(c) = body.get("intervalCount").and_then(|v| v.as_i64()) {
+        if !(1..=365).contains(&c) {
+            return Err(AppError::Validation(vec![ValidationFailure { message: "The intervalCount field is invalid".into(), rule: "range".into(), field: "intervalCount".into() }]));
+        }
         sqlx::query("UPDATE subscription_plans SET interval_count = $1, updated_at = $2 WHERE id = $3").bind(c).bind(&now).bind(plan.id).execute(&state.db.pool).await?;
     }
     Ok(Json(serialize_plan(&load_plan(&state, auth.user_id, &public_id).await?)))
@@ -235,8 +255,8 @@ async fn customer_external_id_taken(state: &AppState, user_id: i64, ext: &str, e
 }
 
 pub async fn customers_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_customers WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
     let rows = sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
@@ -294,11 +314,21 @@ fn req_string(body: &Value, key: &str, min: usize, max: usize, errors: &mut Vec<
     }
 }
 
+fn is_atomic_str(s: &str) -> bool {
+    s == "0" || (!s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn atomic_amount(body: &Value, key: &str, errors: &mut Vec<ValidationFailure>) -> Option<String> {
     match body.get(key) {
-        Some(Value::String(s)) if s == "0" || (!s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit())) => Some(s.clone()),
+        Some(Value::String(s)) if is_atomic_str(s) => Some(s.clone()),
         _ => { errors.push(ValidationFailure { message: format!("The {key} field format is invalid"), rule: "regex".into(), field: key.into() }); None }
     }
+}
+
+/// Parse an already-format-validated atomic string, enforcing the i64 range so
+/// an over-range value can't silently become a free (0) plan via `as i64`.
+fn parse_atomic_i64(s: &str) -> Option<i64> {
+    s.parse::<i128>().ok().filter(|v| *v <= i64::MAX as i128).map(|v| v as i64)
 }
 
 fn req_int(body: &Value, key: &str, min: i64, max: i64, errors: &mut Vec<ValidationFailure>) -> Option<i64> {
@@ -536,8 +566,8 @@ async fn generate_due_invoice(state: &AppState, sub_id: i64, now: chrono::DateTi
 }
 
 pub async fn subs_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
     let rows = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
@@ -655,8 +685,8 @@ pub async fn subs_cancel(auth: AuthMerchant, State(state): State<AppState>, Path
 
 pub async fn subs_invoices(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
     let sub = load_subscription(&state, auth.user_id, &public_id).await?;
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE user_id = $1 AND subscription_id = $2")
         .bind(auth.user_id).bind(sub.id).fetch_one(&state.db.pool).await?;
     let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = $1 AND subscription_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4")

@@ -657,8 +657,9 @@ pub async fn index(
     Query(q): Query<InvoiceQuery>,
 ) -> AppResult<Json<Value>> {
     let store_id = resolve_request_store(&state, auth.user_id, q.store_id).await?;
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    // Clamp pagination params before multiplying so `offset` can't overflow i64.
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let offset = (page - 1) * per_page;
     let payment_link_only = q.source.as_deref() == Some("payment_link");
 
@@ -772,7 +773,15 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
                     }
                 };
                 let unit_ok = match &unit {
-                    Some(u) if is_atomic_amount(u) => true,
+                    Some(u) if is_atomic_amount(u) => match u.parse::<i128>() {
+                        // Reject amounts that don't fit in i64 up front, so the
+                        // later `as i64` casts can never silently wrap.
+                        Ok(v) if v <= i64::MAX as i128 => true,
+                        _ => {
+                            vpush(&mut errors, &format!("items.{i}.unitAmount"), "max", &format!("The items.{i}.unitAmount field exceeds the maximum"));
+                            false
+                        }
+                    },
                     _ => {
                         vpush(&mut errors, &format!("items.{i}.unitAmount"), "regex", &format!("The items.{i}.unitAmount field format is invalid"));
                         false
@@ -782,7 +791,9 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
                     items.push(ItemInput {
                         name: name.unwrap(),
                         quantity: qty.unwrap(),
-                        unit_amount: unit.unwrap().parse().unwrap_or(0),
+                        // Validated above as atomic and <= i64::MAX, so this parse
+                        // always succeeds — no silent `unwrap_or(0)` free item.
+                        unit_amount: unit.unwrap().parse().expect("unitAmount validated as atomic <= i64::MAX"),
                     });
                 }
             }
@@ -883,14 +894,28 @@ pub(crate) async fn create_for_merchant(
         }
     };
 
-    // amounts
-    let subtotal: i128 = input.items.iter().map(|it| it.unit_amount * it.quantity as i128).sum();
+    // amounts — guard every multiply/add against i128 overflow, then bound the
+    // results to i64 before the DB casts.
+    let too_large = || AppError::commerce(422, "Invoice amount too large");
+    let mut subtotal: i128 = 0;
+    for it in &input.items {
+        let line = it
+            .unit_amount
+            .checked_mul(it.quantity as i128)
+            .ok_or_else(too_large)?;
+        subtotal = subtotal.checked_add(line).ok_or_else(too_large)?;
+    }
     let service_fee: i128 = if fee_delegation == "customer_pays" {
         kpr1::customer_paid_amounts(subtotal, state.config.kpr1.platform_fee_bps, state.config.kpr1.platform_fee_flat_sompi)?.0
     } else {
         0
     };
-    let total = subtotal + service_fee;
+    let total = subtotal.checked_add(service_fee).ok_or_else(too_large)?;
+
+    let to_i64 = |x: i128| i64::try_from(x).map_err(|_| AppError::commerce(422, "amount exceeds maximum"));
+    let subtotal_i64 = to_i64(subtotal)?;
+    let total_i64 = to_i64(total)?;
+    let service_fee_i64 = to_i64(service_fee)?;
 
     let public_id = format!("inv_{}", random_suffix());
     let payment_reference = format!("payref_{}", random_suffix());
@@ -915,10 +940,10 @@ pub(crate) async fn create_for_merchant(
     .bind(&network)
     .bind(&asset)
     .bind(&payment_reference)
-    .bind(subtotal as i64)
-    .bind(total as i64)
+    .bind(subtotal_i64)
+    .bind(total_i64)
     .bind(&fee_delegation)
-    .bind(service_fee as i64)
+    .bind(service_fee_i64)
     .bind(&asset)
     .bind(&input.customer_country_code)
     .bind(&metadata_str)
@@ -929,6 +954,10 @@ pub(crate) async fn create_for_merchant(
     .await?;
 
     for it in &input.items {
+        let line = it
+            .unit_amount
+            .checked_mul(it.quantity as i128)
+            .ok_or_else(too_large)?;
         sqlx::query(
             "INSERT INTO invoice_items (invoice_id, name, quantity, unit_amount, total_amount, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -936,8 +965,8 @@ pub(crate) async fn create_for_merchant(
         .bind(invoice_id)
         .bind(&it.name)
         .bind(it.quantity)
-        .bind(it.unit_amount as i64)
-        .bind((it.unit_amount * it.quantity as i128) as i64)
+        .bind(to_i64(it.unit_amount)?)
+        .bind(to_i64(line)?)
         .bind(&now)
         .bind(&now)
         .execute(&state.db.pool)
@@ -952,7 +981,7 @@ pub(crate) async fn create_for_merchant(
             user_id,
             store_id: Some(store_id),
             public_id: public_id.clone(),
-            total_amount: total as i64,
+            total_amount: total_i64,
             payment_network: network.clone(),
             payment_asset: asset.clone(),
             expires_at: expires_at.clone(),

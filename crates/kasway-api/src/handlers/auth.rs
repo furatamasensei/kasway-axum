@@ -13,9 +13,11 @@ use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::Sha256;
 use url::Url;
 
 /// Serializes an integer-backed boolean flag (Postgres stores booleans as
@@ -230,10 +232,58 @@ fn is_email(value: &str) -> bool {
 
 // ---- Google OAuth (redirect / callback) ------------------------------------
 
+/// Max age (seconds) of a stateless OAuth `state` token before it is rejected.
+const OAUTH_STATE_MAX_AGE_SECS: i64 = 600;
+
+/// Secret used to sign the stateless OAuth `state` token. Prefers the internal
+/// API token, falling back to the Google client secret so a value is always
+/// available in an OAuth-configured deployment.
+fn oauth_state_secret(state: &AppState) -> String {
+    state
+        .config
+        .internal_api_token
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| state.config.google.client_secret.clone())
+}
+
+fn oauth_state_sig(secret: &str, ts: &str) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .expect("hmac accepts any key length");
+    mac.update(ts.as_bytes());
+    mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Build a stateless, tamper-proof OAuth `state`: `<unix_ts>.<hex HMAC-SHA256>`.
+/// Round-tripped by Google and validated in the callback to defeat login CSRF.
+fn make_oauth_state(secret: &str) -> String {
+    let ts = chrono::Utc::now().timestamp().to_string();
+    let sig = oauth_state_sig(secret, &ts);
+    format!("{ts}.{sig}")
+}
+
+/// Validate a stateless OAuth `state`: signature must match (constant-time) and
+/// the token must not be older than `OAUTH_STATE_MAX_AGE_SECS`.
+fn verify_oauth_state(secret: &str, token: &str) -> bool {
+    let Some((ts, sig)) = token.split_once('.') else {
+        return false;
+    };
+    let expected = oauth_state_sig(secret, ts);
+    if !crate::util::constant_time_eq(sig.as_bytes(), expected.as_bytes()) {
+        return false;
+    }
+    let Ok(ts_val) = ts.parse::<i64>() else {
+        return false;
+    };
+    let age = chrono::Utc::now().timestamp() - ts_val;
+    (0..=OAUTH_STATE_MAX_AGE_SECS).contains(&age)
+}
+
 /// `GET /api/auth/google/redirect` — returns the Google authorize URL (stateless).
 pub async fn redirect_google(State(state): State<AppState>) -> AppResult<String> {
     let g = &state.config.google;
     let redirect_uri = format!("{}/auth/google/callback", g.app_url);
+    let csrf_state = make_oauth_state(&oauth_state_secret(&state));
     let url = Url::parse_with_params(
         &g.authorize_url,
         &[
@@ -241,6 +291,7 @@ pub async fn redirect_google(State(state): State<AppState>) -> AppResult<String>
             ("client_id", g.client_id.as_str()),
             ("redirect_uri", redirect_uri.as_str()),
             ("scope", "openid email profile"),
+            ("state", csrf_state.as_str()),
         ],
     )
     .map_err(|_| AppError::commerce(500, "Invalid Google authorize URL"))?;
@@ -251,6 +302,7 @@ pub async fn redirect_google(State(state): State<AppState>) -> AppResult<String>
 pub struct GoogleCallbackQuery {
     code: Option<String>,
     error: Option<String>,
+    state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -280,6 +332,17 @@ pub async fn callback_google(
     let Some(code) = q.code.filter(|c| !c.is_empty()) else {
         return Ok("We are unable to verify the request. Please try again".into_response());
     };
+
+    // CSRF: require a valid, unexpired stateless `state` round-tripped by Google.
+    let secret = oauth_state_secret(&state);
+    let state_ok = q
+        .state
+        .as_deref()
+        .map(|s| verify_oauth_state(&secret, s))
+        .unwrap_or(false);
+    if !state_ok {
+        return Err(AppError::Unauthorized("Invalid or missing OAuth state"));
+    }
 
     let g = &state.config.google;
     let redirect_uri = format!("{}/auth/google/callback", g.app_url);
