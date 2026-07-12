@@ -8,7 +8,7 @@ use crate::auth_token;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::password::{hash_password, verify_password};
 use crate::state::AppState;
-use crate::util::now_iso;
+use crate::util::{encode_hex, now_iso};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -61,22 +61,21 @@ pub async fn login(
     let password = password.unwrap();
 
     // merchant (User) path
-    if let Some((id, stored)) = sqlx::query_as::<_, (i64, String)>(
-        "SELECT id, password FROM users WHERE LOWER(email) = LOWER($1)",
+    if let Some((id, stored, onboarded)) = sqlx::query_as::<_, (i64, String, i64)>(
+        "SELECT id, password, onboarded FROM users WHERE LOWER(email) = LOWER($1)",
     )
     .bind(&email)
     .fetch_optional(&state.db.pool)
     .await?
     {
-        if !verify_password(&password, &stored) {
+        // scrypt verification is CPU-heavy; keep it off the async runtime.
+        let password_ok = tokio::task::spawn_blocking(move || verify_password(&password, &stored))
+            .await
+            .map_err(|_| AppError::Internal("password verification task failed".into()))?;
+        if !password_ok {
             return Err(AppError::bad_credentials());
         }
         let token = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, id).await?;
-        let onboarded: i64 =
-            sqlx::query_scalar("SELECT onboarded FROM users WHERE id = $1")
-                .bind(id)
-                .fetch_one(&state.db.pool)
-                .await?;
         return Ok(Json(json!({
             "token": token,
             "role": "merchant",
@@ -125,13 +124,18 @@ pub async fn register(
     }
 
     let now = now_iso();
+    // scrypt hashing is CPU-heavy; keep it off the async runtime.
+    let password = password.unwrap();
+    let password_hash = tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|_| AppError::Internal("password hashing task failed".into()))?;
     let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO users (full_name, email, password, onboarded, created_at, updated_at) \
          VALUES ($1, $2, $3, 0, $4, $5) RETURNING id",
     )
     .bind(full_name.unwrap())
     .bind(email.unwrap())
-    .bind(hash_password(&password.unwrap()))
+    .bind(password_hash)
     .bind(&now)
     .bind(&now)
     .fetch_one(&state.db.pool)
@@ -251,7 +255,7 @@ fn oauth_state_sig(secret: &str, ts: &str) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .expect("hmac accepts any key length");
     mac.update(ts.as_bytes());
-    mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect()
+    encode_hex(&mac.finalize().into_bytes())
 }
 
 /// Build a stateless, tamper-proof OAuth `state`: `<unix_ts>.<hex HMAC-SHA256>`.
@@ -346,7 +350,7 @@ pub async fn callback_google(
 
     let g = &state.config.google;
     let redirect_uri = format!("{}/auth/google/callback", g.app_url);
-    let client = reqwest::Client::new();
+    let client = crate::util::http_client();
 
     let token: GoogleToken = client
         .post(&g.token_url)
@@ -385,6 +389,10 @@ pub async fn callback_google(
         Some((id, ob)) => (id, ob),
         None => {
             let random_pw: String = (0..16).map(|_| rand::thread_rng().gen_range(b'a'..=b'z') as char).collect();
+            // scrypt hashing is CPU-heavy; keep it off the async runtime.
+            let password_hash = tokio::task::spawn_blocking(move || hash_password(&random_pw))
+                .await
+                .map_err(|_| AppError::Internal("password hashing task failed".into()))?;
             let now = now_iso();
             let id = sqlx::query_scalar::<_, i64>(
                 "INSERT INTO users (full_name, email, password, avatar_url, onboarded, created_at, updated_at) \
@@ -392,7 +400,7 @@ pub async fn callback_google(
             )
             .bind(info.name)
             .bind(&email)
-            .bind(hash_password(&random_pw))
+            .bind(password_hash)
             .bind(info.picture)
             .bind(&now)
             .bind(&now)

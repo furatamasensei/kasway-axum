@@ -74,11 +74,6 @@ pub async fn evidence(
 
 const CONFORMANCE_FIXTURE: &str = include_str!("assets/kpr1-conformance.json");
 
-const STABLE_REASONS: &[&str] = &[
-    "intent_expired", "network_or_asset_mismatch", "tx_id_mismatch", "amount_mismatch",
-    "script_hash_mismatch", "missing_full_output_data",
-];
-
 fn check(key: &str, result: Result<&str, String>) -> Value {
     match result {
         Ok(msg) => json!({ "key": key, "status": "pass", "message": msg }),
@@ -229,10 +224,6 @@ pub(crate) fn conformance_report() -> AppResult<Value> {
     })()));
 
     // 6. output examples
-    let safe_reason = |r: Option<String>| -> Option<String> {
-        r.map(|s| if STABLE_REASONS.contains(&s.as_str()) || (s.starts_with("missing_required_") && s.ends_with("_output")) { s } else { "verification_failed".into() })
-    };
-    let _ = &safe_reason;
     for ex in f["validOutputExamples"].as_array().cloned().unwrap_or_default() {
         let name = ex["name"].as_str().unwrap_or("").to_string();
         checks.push(check(&format!("kpr1.conformance.outputs.{name}"), {

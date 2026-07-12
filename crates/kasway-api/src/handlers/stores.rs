@@ -4,11 +4,10 @@ use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::state::AppState;
 use crate::store_context::{assert_can_create_new_payments, ensure_default_store};
-use crate::util::now_iso;
+use crate::util::{json_or_null, now_iso, random_hex};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use rand::RngCore;
 use serde_json::{json, Value};
 
 #[derive(sqlx::FromRow)]
@@ -32,10 +31,6 @@ const STORE_COLS: &str = "id, user_id, public_id, name, slug, status, is_include
     metadata, disabled_at, archived_at, created_at, updated_at";
 
 fn serialize_store(s: &StoreRow) -> Value {
-    let metadata = match &s.metadata {
-        None => Value::Null,
-        Some(m) => serde_json::from_str(m).unwrap_or(Value::Null),
-    };
     json!({
         "id": s.id,
         "userId": s.user_id,
@@ -45,7 +40,7 @@ fn serialize_store(s: &StoreRow) -> Value {
         "status": s.status,
         "isIncluded": s.is_included != 0,
         "isDefault": s.is_default != 0,
-        "metadata": metadata,
+        "metadata": json_or_null(&s.metadata),
         "disabledAt": s.disabled_at,
         "archivedAt": s.archived_at,
         "createdAt": s.created_at,
@@ -262,8 +257,3 @@ fn validate_store(
     Ok((name, slug, metadata))
 }
 
-fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{:02x}", x)).collect()
-}

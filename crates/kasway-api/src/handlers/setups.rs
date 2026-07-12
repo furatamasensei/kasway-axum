@@ -7,16 +7,14 @@
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
+use crate::kpr1::{is_kaspa_address, MAX_BPS, MAX_SPLIT_ADDRESSES};
 use crate::state::AppState;
 use crate::store_context::{ensure_default_store, resolve_owned_store};
-use crate::util::now_iso;
+use crate::util::{json_or_null, now_iso};
 use axum::extract::{Path, State};
 use axum::Json;
 use serde_json::{json, Value};
 
-const KASPA_ADDR_MIN: usize = 12;
-const MAX_BPS: i64 = 10_000;
-const MAX_SPLIT_ADDRESSES: usize = 5;
 const SETUP_SECTIONS: &[&str] = &["payout", "tax", "split", "redirects", "webhook"];
 
 #[derive(sqlx::FromRow, Clone)]
@@ -56,13 +54,6 @@ const SETUP_COLS: &str = "id, user_id, store_id, tos_agreed, kaspa_main_address,
     kasplex_tax_percentage, kasplex_split_enabled, kasplex_split_addresses, redirect_url, \
     webhook_url, created_at, updated_at";
 
-fn json_or_null(raw: &Option<String>) -> Value {
-    match raw {
-        None => Value::Null,
-        Some(s) => serde_json::from_str(s).unwrap_or(Value::Null),
-    }
-}
-
 fn serialize_setup(s: &SetupRow) -> Value {
     json!({
         "id": s.id,
@@ -94,30 +85,6 @@ fn serialize_setup(s: &SetupRow) -> Value {
     })
 }
 
-fn is_kaspa_address(value: &str) -> bool {
-    let v = value.trim();
-    let rest = v
-        .strip_prefix("kaspatest:")
-        .or_else(|| v.strip_prefix("kaspa:"));
-    match rest {
-        Some(r) => {
-            r.len() >= KASPA_ADDR_MIN
-                && r.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-'))
-        }
-        None => false,
-    }
-}
-
-fn fmt_pct(p: f64) -> String {
-    if p.fract() == 0.0 {
-        format!("{}", p as i64)
-    } else {
-        // strip trailing zeros
-        let s = format!("{}", p);
-        s
-    }
-}
-
 // --- input parsing ---
 
 struct KaspaInput {
@@ -138,7 +105,7 @@ fn validate_tax(state: &AppState, tax_enabled: bool, tax_address: &Option<String
         Some(a) if is_kaspa_address(a) => {}
         _ => return Err(AppError::commerce(422, "Kaspa tax address is required when tax is enabled")),
     }
-    let max_tax = (MAX_BPS - state.config.kpr1.platform_fee_bps) as f64 / 100.0;
+    let max_tax = (MAX_BPS - state.config.kpr1.platform_fee_bps as i128) as f64 / 100.0;
     let p = tax_percentage.unwrap_or(0.0);
     if tax_percentage.is_none() || p <= 0.0 || p > max_tax {
         return Err(AppError::commerce(
@@ -277,7 +244,7 @@ async fn upsert_kaspa_setup(
 ) -> AppResult<SetupRow> {
     let existing = find_setup(state, user_id, store_id, store_is_default).await?;
     let now = now_iso();
-    let tax_pct = kaspa.tax_percentage.map(fmt_pct);
+    let tax_pct = kaspa.tax_percentage.map(|p| p.to_string());
 
     if let Some(row) = existing {
         sqlx::query(
@@ -482,7 +449,7 @@ async fn update_setup_for_store(
         let split_json = normalize_splits(split_enabled, split_value.as_ref())?;
         validate_tax(state, tax_enabled, &tax_address, tax_percentage)?;
 
-        let tax_pct = if tax_enabled { tax_percentage.map(fmt_pct) } else { None };
+        let tax_pct = if tax_enabled { tax_percentage.map(|p| p.to_string()) } else { None };
         sqlx::query(
             "UPDATE setups SET kaspa_main_address = $1, kaspa_tax_enabled = $2, kaspa_tax_address = $3, \
              kaspa_tax_percentage = $4, kaspa_split_enabled = $5, kaspa_split_addresses = $6, updated_at = $7 WHERE id = $8",

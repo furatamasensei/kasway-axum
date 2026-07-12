@@ -38,6 +38,7 @@
 //! seconds; connection reuse is not worth the reconnect bookkeeping yet).
 
 use crate::chain_source::{ChainSource, ChainSourceError, ObservedOutput, ObservedTransaction};
+use crate::util::decode_hex32;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -139,7 +140,7 @@ impl KaspaWrpcClient {
             let txid_hex = outpoint.and_then(|o| o.get("transactionId")).and_then(Value::as_str).unwrap_or("");
             let index = outpoint.and_then(|o| o.get("index")).and_then(as_u64_lenient).unwrap_or(0) as u32;
             let amount = entry.get("utxoEntry").and_then(|u| u.get("amount")).and_then(as_u64_lenient).unwrap_or(0);
-            let Some(txid) = hex32(txid_hex) else { continue };
+            let Some(txid) = decode_hex32(txid_hex) else { continue };
             if amount == 0 {
                 continue;
             }
@@ -163,18 +164,6 @@ impl KaspaWrpcClient {
             .map(str::to_string)
             .ok_or_else(|| ChainSourceError::Protocol(format!("submitTransaction response missing transactionId: {response}")))
     }
-}
-
-/// Decode a 64-char hex string into 32 bytes.
-fn hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 /// u64 that may arrive as a JSON number or a decimal string.

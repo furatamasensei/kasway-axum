@@ -3,17 +3,15 @@
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
-use crate::handlers::invoices;
+use crate::handlers::invoices::{self, FEE_DELEGATIONS};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
-use crate::util::{now_iso, paginator_meta};
+use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex};
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
-
-const FEE_DELEGATIONS: &[&str] = &["merchant_subsidized", "customer_pays"];
+use std::collections::HashMap;
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct LinkRow {
@@ -48,10 +46,7 @@ pub struct LinkQuery {
 }
 
 fn serialize_link(link: &LinkRow, payments_count: Option<i64>) -> Value {
-    let metadata = match &link.metadata {
-        None => Value::Null,
-        Some(s) => serde_json::from_str(s).unwrap_or(Value::Null),
-    };
+    let metadata = json_or_null(&link.metadata);
     let mut obj = json!({
         "id": link.id,
         "userId": link.user_id,
@@ -131,11 +126,22 @@ pub async fn index(
     .fetch_all(&state.db.pool)
     .await?;
 
-    let mut data = Vec::with_capacity(links.len());
-    for link in &links {
-        let count = invoices_count(&state, link.id).await?;
-        data.push(serialize_link(link, Some(count)));
-    }
+    // withCount('invoices') for the whole page in one grouped query.
+    let ids: Vec<i64> = links.iter().map(|l| l.id).collect();
+    let counts: HashMap<i64, i64> = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT payment_link_id, COUNT(*) FROM invoices WHERE payment_link_id = ANY($1) \
+         GROUP BY payment_link_id",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db.pool)
+    .await?
+    .into_iter()
+    .collect();
+
+    let data: Vec<Value> = links
+        .iter()
+        .map(|link| serialize_link(link, Some(counts.get(&link.id).copied().unwrap_or(0))))
+        .collect();
 
     Ok(Json(json!({
         "meta": paginator_meta(total, per_page, page),
@@ -168,7 +174,7 @@ pub async fn store(
         .unwrap_or_else(|| state.config.kpr1.default_asset.clone());
     let fee_delegation = input.fee_delegation.unwrap_or_else(|| "merchant_subsidized".to_string());
     let now = now_iso();
-    let public_id = format!("plink_{}", random_suffix());
+    let public_id = format!("plink_{}", random_hex(16));
     let metadata_str = input.metadata.as_ref().map(|m| m.to_string());
 
     let id: i64 = sqlx::query_scalar::<_, i64>(
@@ -288,10 +294,7 @@ pub(crate) async fn public_summary(state: &AppState, public_id: &str) -> AppResu
         None => None,
     };
 
-    let metadata = match &link.metadata {
-        None => Value::Null,
-        Some(s) => serde_json::from_str(s).unwrap_or(Value::Null),
-    };
+    let metadata = json_or_null(&link.metadata);
 
     Ok(json!({
         "publicId": link.public_id,
@@ -372,15 +375,7 @@ struct CreateLinkInput {
 }
 
 fn vpush(errors: &mut Vec<ValidationFailure>, field: &str, rule: &str, message: &str) {
-    errors.push(ValidationFailure {
-        message: message.to_string(),
-        rule: rule.to_string(),
-        field: field.to_string(),
-    });
-}
-
-fn is_atomic_amount(s: &str) -> bool {
-    s == "0" || (!s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()))
+    errors.push(ValidationFailure::new(field, rule, message));
 }
 
 fn validate_create(body: &Value) -> AppResult<CreateLinkInput> {
@@ -424,10 +419,4 @@ fn validate_create(body: &Value) -> AppResult<CreateLinkInput> {
         store_id: body.get("storeId").and_then(|v| v.as_i64()),
         customer_country_code: opt_string("customerCountryCode").map(|s| s.to_uppercase()),
     })
-}
-
-fn random_suffix() -> String {
-    let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{:02x}", x)).collect()
 }

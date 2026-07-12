@@ -14,8 +14,8 @@
 //! then; at mint `covenant_state = 'pending'`.
 
 use crate::error::{AppError, AppResult};
-use crate::state::{AppState, Kpr1Config};
-use crate::util::{now_iso, sha256_hex};
+use crate::state::AppState;
+use crate::util::{decode_hex32, encode_hex, now_iso, sha256_hex, to_iso};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use serde_json::{json, Value};
@@ -24,8 +24,8 @@ const KPR1_VERSION: &str = "kpr-1";
 const TEMPLATE_ID: &str = "split_settlement";
 const TEMPLATE_VERSION: &str = "v1";
 const SIGNATURE_ALGORITHM: &str = "ed25519";
-const MAX_BPS: i128 = 10_000;
-const MAX_SPLIT_ADDRESSES: usize = 5;
+pub(crate) const MAX_BPS: i128 = 10_000;
+pub(crate) const MAX_SPLIT_ADDRESSES: usize = 5;
 
 /// Invoice fields the minter needs.
 pub struct IntentInvoiceCtx {
@@ -44,7 +44,7 @@ fn err(msg: &str) -> AppError {
     AppError::commerce(422, msg)
 }
 
-fn is_kaspa_address(value: &str) -> bool {
+pub(crate) fn is_kaspa_address(value: &str) -> bool {
     let v = value.trim();
     let rest = if let Some(r) = v.strip_prefix("kaspatest:") {
         r
@@ -251,7 +251,7 @@ fn resolve_split_config(setup: &SetupRow) -> AppResult<(i64, Vec<SplitOut>)> {
     Ok((total_bps, splits))
 }
 
-// --- required-output verification (used by the chain observer) ---
+// --- required outputs (parsed at finalize and by the covenant keeper / dispute ops) ---
 
 /// One required output of a KPR-1 intent (parsed from `required_outputs`).
 pub struct RequiredOutput {
@@ -277,38 +277,6 @@ pub fn parse_required_outputs(raw: &str) -> Vec<RequiredOutput> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Verify observed on-chain outputs against the intent's required outputs:
-/// every required output must appear with the exact address AND amount.
-/// Fails closed with the first stable reason code (the same vocabulary the
-/// explorer treats as safe): `amount_mismatch` when the address is paid a
-/// different amount, `missing_required_<role>_output` when it is absent.
-pub fn verify_required_outputs(
-    required: &[RequiredOutput],
-    observed: &[(String, i128)],
-) -> Result<(), String> {
-    let mut used = vec![false; observed.len()];
-    for req in required {
-        let exact = observed
-            .iter()
-            .enumerate()
-            .position(|(i, (addr, amt))| !used[i] && *addr == req.address && *amt == req.amount_sompi);
-        if let Some(i) = exact {
-            used[i] = true;
-            continue;
-        }
-        let address_seen = observed
-            .iter()
-            .enumerate()
-            .any(|(i, (addr, _))| !used[i] && *addr == req.address);
-        return Err(if address_seen {
-            "amount_mismatch".to_string()
-        } else {
-            format!("missing_required_{}_output", req.role)
-        });
-    }
-    Ok(())
 }
 
 /// KIP-9 storage-mass parameter (sompi·mass), measured against a live TN10 node:
@@ -362,9 +330,14 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         .await?;
     }
 
+    let Some(setup) = setup else {
+        return Err(err(
+            "Merchant-owned Kaspa payout address is required before creating KPR-1 invoices",
+        ));
+    };
     let merchant_address = setup
-        .as_ref()
-        .and_then(|s| s.kaspa_main_address.as_deref())
+        .kaspa_main_address
+        .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let merchant_address = match merchant_address {
@@ -381,9 +354,8 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         return Err(err("KPR-1 platform fee address must be a Kaspa address"));
     }
 
-    let setup_ref = setup.as_ref().unwrap();
-    let tax = resolve_tax_config(setup_ref)?;
-    let (split_total_bps, split_outs) = resolve_split_config(setup_ref)?;
+    let tax = resolve_tax_config(&setup)?;
+    let (split_total_bps, split_outs) = resolve_split_config(&setup)?;
 
     let amount = ctx.total_amount as i128;
     let platform_fee = platform_fee_total(amount, cfg.platform_fee_bps, cfg.platform_fee_flat_sompi)?;
@@ -435,12 +407,12 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     // intentId: kpr1_<16 random bytes hex>
     let mut id_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id_bytes);
-    let intent_id: String = format!("kpr1_{}", id_bytes.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    let intent_id: String = format!("kpr1_{}", encode_hex(&id_bytes));
 
     let expires_at = ctx
         .expires_at
         .clone()
-        .unwrap_or_else(|| (chrono::Utc::now() + chrono::Duration::minutes(30)).format("%Y-%m-%dT%H:%M:%S%.3f+00:00").to_string());
+        .unwrap_or_else(|| to_iso(chrono::Utc::now() + chrono::Duration::minutes(30)));
 
     // outputs: merchant_net, [tax], splits..., kasway_fee
     let mut outputs: Vec<Value> = vec![json!({
@@ -504,7 +476,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     let unsigned_payload = canonicalize(&intent_unsigned);
     let signature_value = sign(&unsigned_payload, &cfg.signing_seed);
 
-    let mut signed_intent = intent_unsigned.clone();
+    let mut signed_intent = intent_unsigned;
     signed_intent["signature"] = json!({
         "alg": SIGNATURE_ALGORITHM,
         "keyId": cfg.signing_key_id,
@@ -537,8 +509,6 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     });
 
     let now = now_iso();
-    let tax_bps_val: Option<i64> = if tax.enabled { Some(tax.bps) } else { Some(0) };
-    let tax_amount_val: Option<i64> = Some(tax_amount as i64);
     let script_hash: Option<String> = None; // covenant script hash is set at finalize
 
     sqlx::query(
@@ -558,8 +528,8 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     .bind(amount as i64)
     .bind(cfg.platform_fee_bps)
     .bind(platform_fee as i64)
-    .bind(tax_bps_val)
-    .bind(tax_amount_val)
+    .bind(tax.bps)
+    .bind(tax_amount as i64)
     .bind(&tax.address)
     .bind(&merchant_address)
     .bind(&platform_fee_address)
@@ -671,12 +641,12 @@ pub async fn finalize_covenant_for_invoice(
     let address = kasway_covenant::covenant_address(&compiled, prefix)
         .map_err(|e| err(&e.to_string()))?
         .to_string();
-    let script_hash: String = kasway_covenant::covenant_script_hash(&compiled).iter().map(|b| format!("{:02x}", b)).collect();
+    let script_hash: String = encode_hex(&kasway_covenant::covenant_script_hash(&compiled));
 
     // Snapshot the arbiter panel so settlement rebuilds this exact covenant even
     // if the configured panel later changes.
     let panel_hex: Vec<String> =
-        params.arbiter_panel.iter().map(|k| k.iter().map(|b| format!("{:02x}", b)).collect::<String>()).collect();
+        params.arbiter_panel.iter().map(|k| encode_hex(k)).collect();
     let panel_json = serde_json::to_string(&panel_hex).unwrap_or_else(|_| "[]".to_string());
     let arbiter_threshold_i = params.arbiter_threshold as i32;
 
@@ -737,17 +707,6 @@ pub(crate) fn escrow_arbiter_panel(state: &AppState) -> AppResult<(Vec<[u8; 32]>
     Ok((panel, threshold))
 }
 
-fn decode_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
 fn finalize_response(address: &str, gross: u64, expiry: u64, state: &str) -> Value {
     json!({
         "covenantAddress": address,
@@ -756,6 +715,3 @@ fn finalize_response(address: &str, gross: u64, expiry: u64, state: &str) -> Val
         "covenantState": state,
     })
 }
-
-#[allow(unused)]
-fn _config_marker(_c: &Kpr1Config) {}

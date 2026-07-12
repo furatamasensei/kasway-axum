@@ -7,7 +7,7 @@
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::state::AppState;
-use crate::util::{now_iso, paginator_meta, sha256_hex};
+use crate::util::{encode_hex, now_iso, paginator_meta, sha256_hex};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -72,7 +72,7 @@ fn serialize_row(row: &ApiKeyRow) -> Value {
 fn generate_key_material() -> (String, String, String) {
     let mut prefix_bytes = [0u8; 6];
     rand::thread_rng().fill_bytes(&mut prefix_bytes);
-    let prefix: String = prefix_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let prefix = encode_hex(&prefix_bytes);
 
     let mut secret_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut secret_bytes);
@@ -115,8 +115,8 @@ pub async fn index(
     State(state): State<AppState>,
     Query(params): Query<PageParams>,
 ) -> AppResult<Json<Value>> {
-    let page = params.page.unwrap_or(1).max(1);
-    let per_page = params.per_page.unwrap_or(10).max(1);
+    let page = params.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = params.per_page.unwrap_or(10).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
@@ -338,9 +338,5 @@ fn validate_future_date(s: &str) -> Result<String, (&'static str, String)> {
 }
 
 fn push(errors: &mut Vec<ValidationFailure>, field: &str, rule: &str, message: &str) {
-    errors.push(ValidationFailure {
-        message: message.to_string(),
-        rule: rule.to_string(),
-        field: field.to_string(),
-    });
+    errors.push(ValidationFailure::new(field, rule, message));
 }

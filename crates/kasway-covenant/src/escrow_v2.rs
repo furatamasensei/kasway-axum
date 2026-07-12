@@ -9,21 +9,19 @@
 //! Every covenant script byte still comes from the SilverScript compiler; the
 //! shared transaction-assembly helpers are reused from the crate root.
 
-use kaspa_consensus_core::tx::{ScriptPublicKey, Transaction, TransactionOutput, UtxoEntry};
+use kaspa_consensus_core::tx::{Transaction, TransactionOutput, UtxoEntry};
 use kaspa_txscript::pay_to_address_script;
-use kaspa_txscript::script_builder::ScriptBuilder;
 use silverscript_lang::ast::Expr;
 use silverscript_lang::compiler::{compile_contract, CompileOptions, CompiledContract};
 
 use crate::{
-    assemble_unsigned, build_fee_signed_tx, covenant_signature_script, push_change, to_i64, CovenantError,
-    Destination, KeeperKey, Payout, Prefix, SignedSpend, Utxo, MAX_PAYOUTS,
+    assemble_unsigned, build_fee_signed_tx, covenant_signature_script, customer_refund_outputs, fee_signature_script,
+    merchant_split_outputs, push_change, to_i64, CovenantError, Destination, KeeperKey, Payout, Prefix, SignedSpend,
+    Utxo, KIND_P2PK, MAX_PAYOUTS,
 };
 
 /// EscrowV2 covenant source.
 pub const ESCROW_V2_SRC: &str = include_str!("../contracts/escrow_v2.sil");
-
-const KIND_P2PK: i64 = 0;
 
 /// Covenant entrypoints (see `contracts/escrow_v2.sil`).
 pub const EP_RELEASE_CONFIRMED: &str = "release_confirmed";
@@ -123,36 +121,6 @@ pub fn compile_escrow_v2(params: &EscrowV2Params) -> Result<CompiledContract<'st
 // Output builders
 // ---------------------------------------------------------------------------
 
-fn merchant_split_outputs(
-    params: &EscrowV2Params,
-    fee_utxo: &Utxo,
-    miner_fee: u64,
-    fee_payer_address: &kaspa_addresses::Address,
-) -> Vec<TransactionOutput> {
-    let mut outputs: Vec<TransactionOutput> = params
-        .payouts
-        .iter()
-        .map(|p| TransactionOutput { value: p.value, script_public_key: p.destination.script_public_key(), covenant: None })
-        .collect();
-    push_change(&mut outputs, fee_utxo, miner_fee, fee_payer_address);
-    outputs
-}
-
-fn customer_refund_outputs(
-    params: &EscrowV2Params,
-    fee_utxo: &Utxo,
-    miner_fee: u64,
-    fee_payer_address: &kaspa_addresses::Address,
-) -> Vec<TransactionOutput> {
-    let mut outputs = vec![TransactionOutput {
-        value: params.gross_amount,
-        script_public_key: params.customer_refund.script_public_key(),
-        covenant: None,
-    }];
-    push_change(&mut outputs, fee_utxo, miner_fee, fee_payer_address);
-    outputs
-}
-
 /// The mutual-settlement outputs: the caller-supplied split (any destinations /
 /// amounts summing to `gross_amount`) plus the fee payer's change. The covenant
 /// does not constrain these — both parties' SIG_HASH_ALL signatures do.
@@ -232,10 +200,7 @@ pub fn complete_settlement(
     let entrypoint_sig = compiled
         .build_sig_script(EP_RELEASE_SETTLED, vec![customer_sig.to_vec().into(), merchant_sig.to_vec().into()])?;
     draft.transaction.inputs[0].signature_script = covenant_signature_script(&compiled.script, entrypoint_sig)?;
-    draft.transaction.inputs[1].signature_script = ScriptBuilder::new()
-        .add_data(fee_sig)
-        .map_err(|e| CovenantError::Compile(format!("fee sigscript: {e}")))?
-        .drain();
+    draft.transaction.inputs[1].signature_script = fee_signature_script(fee_sig)?;
     Ok(SignedSpend { transaction: draft.transaction, entries: draft.entries })
 }
 
@@ -261,10 +226,7 @@ pub fn prepare_release_arbitrated(
     keeper: &KeeperKey,
     prefix: Prefix,
 ) -> Result<ArbiterReleaseDraft, CovenantError> {
-    let outputs = merchant_split_outputs(params, fee_utxo, miner_fee, &keeper.address(prefix));
-    let (transaction, entries, covenant_sighash) =
-        build_fee_signed_tx(&compiled.script, outputs, 0, covenant_utxo, fee_utxo, keeper, prefix)?;
-    Ok(ArbiterReleaseDraft { transaction, entries, covenant_sighash })
+    prepare_release(compiled, params, covenant_utxo, fee_utxo, miner_fee, keeper, prefix, 0)
 }
 
 /// Complete an arbiter release with `signer_idx`-labelled panel signatures.
@@ -302,7 +264,7 @@ pub fn prepare_refund_by_arbiter(
     miner_fee: u64,
     fee_payer_address: &kaspa_addresses::Address,
 ) -> Result<ArbiterRefundDraft, CovenantError> {
-    let outputs = customer_refund_outputs(params, fee_utxo, miner_fee, fee_payer_address);
+    let outputs = customer_refund_outputs(&params.customer_refund, params.gross_amount, fee_utxo, miner_fee, fee_payer_address);
     let fee_spk = pay_to_address_script(fee_payer_address);
     let (transaction, entries, covenant_sighash, fee_sighash) =
         assemble_unsigned(&compiled.script, outputs, 0, covenant_utxo, fee_utxo, fee_spk);
@@ -320,10 +282,7 @@ pub fn complete_refund_by_arbiter(
 ) -> Result<SignedSpend, CovenantError> {
     let entrypoint_sig = arbiter_sigscript(compiled, EP_REFUND_BY_ARBITER, sigs, signer_idx)?;
     draft.transaction.inputs[0].signature_script = covenant_signature_script(&compiled.script, entrypoint_sig)?;
-    draft.transaction.inputs[1].signature_script = ScriptBuilder::new()
-        .add_data(fee_sig)
-        .map_err(|e| CovenantError::Compile(format!("fee sigscript: {e}")))?
-        .drain();
+    draft.transaction.inputs[1].signature_script = fee_signature_script(fee_sig)?;
     Ok(SignedSpend { transaction: draft.transaction, entries: draft.entries })
 }
 
@@ -343,7 +302,7 @@ pub fn prepare_release(
     prefix: Prefix,
     lock_time: u64,
 ) -> Result<ArbiterReleaseDraft, CovenantError> {
-    let outputs = merchant_split_outputs(params, fee_utxo, miner_fee, &keeper.address(prefix));
+    let outputs = merchant_split_outputs(&params.payouts, fee_utxo, miner_fee, &keeper.address(prefix));
     let (transaction, entries, covenant_sighash) =
         build_fee_signed_tx(&compiled.script, outputs, lock_time, covenant_utxo, fee_utxo, keeper, prefix)?;
     Ok(ArbiterReleaseDraft { transaction, entries, covenant_sighash })
@@ -376,11 +335,7 @@ pub fn prepare_refund_by_merchant(
     miner_fee: u64,
     fee_payer_address: &kaspa_addresses::Address,
 ) -> Result<ArbiterRefundDraft, CovenantError> {
-    let outputs = customer_refund_outputs(params, fee_utxo, miner_fee, fee_payer_address);
-    let fee_spk = pay_to_address_script(fee_payer_address);
-    let (transaction, entries, covenant_sighash, fee_sighash) =
-        assemble_unsigned(&compiled.script, outputs, 0, covenant_utxo, fee_utxo, fee_spk);
-    Ok(ArbiterRefundDraft { transaction, entries, covenant_sighash, fee_sighash })
+    prepare_refund_by_arbiter(compiled, params, covenant_utxo, fee_utxo, miner_fee, fee_payer_address)
 }
 
 /// Complete a merchant refund: merchant sig on the covenant input, fee-payer sig
@@ -393,17 +348,8 @@ pub fn complete_refund_by_merchant(
 ) -> Result<SignedSpend, CovenantError> {
     let entrypoint_sig = compiled.build_sig_script(EP_REFUND_BY_MERCHANT, vec![merchant_sig.to_vec().into()])?;
     draft.transaction.inputs[0].signature_script = covenant_signature_script(&compiled.script, entrypoint_sig)?;
-    draft.transaction.inputs[1].signature_script = ScriptBuilder::new()
-        .add_data(fee_sig)
-        .map_err(|e| CovenantError::Compile(format!("fee sigscript: {e}")))?
-        .drain();
+    draft.transaction.inputs[1].signature_script = fee_signature_script(fee_sig)?;
     Ok(SignedSpend { transaction: draft.transaction, entries: draft.entries })
-}
-
-/// The P2SH scriptPubKey that locks funds into this covenant (re-exported for
-/// callers that build on EscrowV2 without importing the crate root).
-pub fn covenant_script_public_key(compiled: &CompiledContract<'_>) -> ScriptPublicKey {
-    crate::covenant_script_public_key(compiled)
 }
 
 #[cfg(test)]
