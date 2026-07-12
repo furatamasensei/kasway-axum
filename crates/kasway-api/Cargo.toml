@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 kasway-db = { path = "../kasway-db" }
+kasway-covenant = { path = "../kasway-covenant" }
 axum.workspace = true
 tokio.workspace = true
 tower.workspace = true

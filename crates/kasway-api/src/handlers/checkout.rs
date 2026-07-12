@@ -99,6 +99,174 @@ pub async fn submit_kpr1_payment(
     Ok((StatusCode::OK, Json(out)).into_response())
 }
 
+/// `POST /api/checkout/invoices/:publicId/kpr1-finalize`
+///
+/// The payer supplies their refund address; we derive and persist the covenant
+/// P2SH address the payer must fund. Covenant is the only settlement path.
+pub async fn finalize_kpr1_covenant(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult<Response> {
+    let refund_address = body
+        .get("refundAddress")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(refund_address) = refund_address else {
+        return Ok(kpr1_err(
+            "KPR1_REFUND_ADDRESS_REQUIRED",
+            "A customer refund address is required to finalize the covenant",
+            None,
+        ));
+    };
+    let out = crate::kpr1::finalize_covenant_for_invoice(&state, &public_id, refund_address).await?;
+    Ok((StatusCode::OK, Json(out)).into_response())
+}
+
+/// `POST /api/checkout/invoices/:publicId/kpr1-release/prepare`
+///
+/// Step 1 of customer-confirmed release: returns the covenant sighash the
+/// customer signs (with their refund key) to authorize paying the merchant.
+pub async fn prepare_kpr1_release(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let out = crate::covenant_keeper::customer_release_prepare(&state, &public_id).await?;
+    Ok(Json(out))
+}
+
+/// `POST /api/checkout/invoices/:publicId/kpr1-release`
+///
+/// Step 2: the customer submits their signature; the server attaches it,
+/// broadcasts the release, and marks the invoice paid.
+pub async fn submit_kpr1_release(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult<Response> {
+    let signature = body
+        .get("signature")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(signature) = signature else {
+        return Ok(kpr1_err(
+            "KPR1_RELEASE_SIGNATURE_REQUIRED",
+            "A customer signature is required to release funds to the merchant",
+            None,
+        ));
+    };
+    let out = crate::covenant_keeper::customer_release_submit(&state, &public_id, signature).await?;
+    Ok((StatusCode::OK, Json(out)).into_response())
+}
+
+/// `POST /api/checkout/invoices/:publicId/kpr1-refund/prepare`
+///
+/// Merchant-initiated refund, step 1. The merchant refunds the customer the full
+/// gross; they authorize the covenant spend AND pay the gas, so this returns BOTH
+/// sighashes for the merchant to sign. The customer can never trigger this — only
+/// a valid merchant signature spends the covenant on the refund branch.
+pub async fn prepare_kpr1_refund(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let out = crate::covenant_keeper::merchant_refund_prepare(&state, &public_id).await?;
+    Ok(Json(out))
+}
+
+/// `POST /api/checkout/invoices/:publicId/kpr1-refund`
+///
+/// Merchant-initiated refund, step 2. Body: `{ covenantSignature, feeSignature }`
+/// (both signed by the merchant key). The server attaches them, broadcasts, and
+/// marks the invoice refunded.
+pub async fn submit_kpr1_refund(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult<Response> {
+    let covenant_sig = body.get("covenantSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let fee_sig = body.get("feeSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let (Some(covenant_sig), Some(fee_sig)) = (covenant_sig, fee_sig) else {
+        return Ok(kpr1_err(
+            "KPR1_REFUND_SIGNATURES_REQUIRED",
+            "A merchant covenant signature and fee signature are both required to refund",
+            None,
+        ));
+    };
+    let out = crate::covenant_keeper::merchant_refund_submit(&state, &public_id, covenant_sig, fee_sig).await?;
+    Ok((StatusCode::OK, Json(out)).into_response())
+}
+
+/// Parse `{ split: [{address, amount}], feePayer }` shared by the settle endpoints.
+fn parse_settle_body(body: &Value) -> Result<(Vec<(String, u64)>, crate::covenant_keeper::FeePayer), Response> {
+    let split = body.get("split").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|o| {
+                let addr = o.get("address").and_then(|v| v.as_str())?.trim().to_string();
+                let amount = o.get("amount").and_then(|v| v.as_u64())?;
+                Some((addr, amount))
+            })
+            .collect::<Vec<_>>()
+    });
+    let Some(split) = split.filter(|s| !s.is_empty()) else {
+        return Err(kpr1_err("KPR1_SETTLE_SPLIT_REQUIRED", "A non-empty settlement split [{address, amount}] is required", None));
+    };
+    let fee_payer = match body.get("feePayer").and_then(|v| v.as_str()) {
+        Some("merchant") => crate::covenant_keeper::FeePayer::Merchant,
+        Some("customer") | None => crate::covenant_keeper::FeePayer::Customer,
+        Some(other) => {
+            return Err(kpr1_err("KPR1_SETTLE_FEEPAYER_INVALID", &format!("feePayer must be 'customer' or 'merchant' (got '{other}')"), None));
+        }
+    };
+    Ok((split, fee_payer))
+}
+
+/// `POST /api/checkout/invoices/:publicId/kpr1-settle/prepare`
+///
+/// Tier 1 bilateral mutual settlement, step 1. Both parties agree an arbitrary
+/// split of the gross. Body: `{ split: [{address, amount}], feePayer }`. Returns
+/// the covenant sighash BOTH sign and the fee sighash the fee payer signs.
+pub async fn prepare_kpr1_settle(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult<Response> {
+    let (split, fee_payer) = match parse_settle_body(&body) {
+        Ok(v) => v,
+        Err(resp) => return Ok(resp),
+    };
+    let out = crate::covenant_keeper::mutual_settle_prepare(&state, &public_id, &split, fee_payer).await?;
+    Ok((StatusCode::OK, Json(out)).into_response())
+}
+
+/// `POST /api/checkout/invoices/:publicId/kpr1-settle`
+///
+/// Tier 1 mutual settlement, step 2. Body: `{ split, feePayer, customerSignature,
+/// merchantSignature, feeSignature }`. Broadcasts the co-signed split.
+pub async fn submit_kpr1_settle(
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult<Response> {
+    let (split, fee_payer) = match parse_settle_body(&body) {
+        Ok(v) => v,
+        Err(resp) => return Ok(resp),
+    };
+    let customer_sig = body.get("customerSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let merchant_sig = body.get("merchantSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let fee_sig = body.get("feeSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let (Some(customer_sig), Some(merchant_sig), Some(fee_sig)) = (customer_sig, merchant_sig, fee_sig) else {
+        return Ok(kpr1_err(
+            "KPR1_SETTLE_SIGNATURES_REQUIRED",
+            "customerSignature, merchantSignature and feeSignature are all required to settle",
+            None,
+        ));
+    };
+    let out = crate::covenant_keeper::mutual_settle_submit(&state, &public_id, &split, fee_payer, customer_sig, merchant_sig, fee_sig).await?;
+    Ok((StatusCode::OK, Json(out)).into_response())
+}
+
 /// `GET /api/checkout/invoices/:publicId`
 pub async fn show(
     State(state): State<AppState>,

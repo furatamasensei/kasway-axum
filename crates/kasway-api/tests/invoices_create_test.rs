@@ -90,8 +90,8 @@ async fn create_success_merchant_subsidized() {
         .bearer_auth(&token)
         .json(&json!({
             "items": [
-                { "name": "Widget", "quantity": 2, "unitAmount": "500" },
-                { "name": "Gizmo", "quantity": 1, "unitAmount": "1000" }
+                { "name": "Widget", "quantity": 2, "unitAmount": "200000000" },
+                { "name": "Gizmo", "quantity": 1, "unitAmount": "100000000" }
             ]
         }))
         .send()
@@ -102,9 +102,9 @@ async fn create_success_merchant_subsidized() {
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["status"], "open");
     assert!(body["publicId"].as_str().unwrap().starts_with("inv_"));
-    // subtotal = 2*500 + 1000 = 2000; merchant_subsidized => total == subtotal
-    assert_eq!(body["subtotalAmount"], "2000");
-    assert_eq!(body["totalAmount"], "2000");
+    // subtotal = 2*200000000 + 100000000 = 500000000; merchant_subsidized => total == subtotal
+    assert_eq!(body["subtotalAmount"], "500000000");
+    assert_eq!(body["totalAmount"], "500000000");
     assert_eq!(body["serviceFeeAmount"], "0");
     assert_eq!(body["feeDelegation"], "merchant_subsidized");
     assert_eq!(body["items"].as_array().unwrap().len(), 2);
@@ -114,17 +114,17 @@ async fn create_success_merchant_subsidized() {
     assert!(body.get("paymentAddress").is_none());
     let intent = &body["kpr1PaymentIntent"];
     assert!(intent["intentId"].as_str().unwrap().starts_with("kpr1_"));
-    assert_eq!(intent["amountSompi"], "2000");
-    // platform fee = 1% of 2000 = 20
+    assert_eq!(intent["amountSompi"], "500000000");
+    // platform fee = 1% of 500000000 = 5000000
     assert_eq!(body["platformFee"]["bps"], 100);
-    assert_eq!(body["platformFee"]["amountSompi"], "20");
-    // requiredOutputs: merchant_net (1980) + kasway_fee (20)
+    assert_eq!(body["platformFee"]["amountSompi"], "5000000");
+    // requiredOutputs: merchant_net (495000000) + kasway_fee (5000000)
     let outs = body["requiredOutputs"].as_array().unwrap();
     assert_eq!(outs.len(), 2);
     let net = outs.iter().find(|o| o["role"] == "merchant_net").unwrap();
-    assert_eq!(net["amountSompi"], "1980");
+    assert_eq!(net["amountSompi"], "495000000");
     let fee = outs.iter().find(|o| o["role"] == "kasway_fee").unwrap();
-    assert_eq!(fee["amountSompi"], "20");
+    assert_eq!(fee["amountSompi"], "5000000");
     // canonical hash + request uri present
     assert!(intent["canonicalHash"].as_str().unwrap().len() == 64);
     assert!(intent["paymentRequestUri"].as_str().unwrap().starts_with("kaspa-payment:v1?request="));
@@ -145,7 +145,7 @@ async fn create_customer_pays_grosses_up() {
         .bearer_auth(&token)
         .json(&json!({
             "feeDelegation": "customer_pays",
-            "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "10000" }]
+            "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }]
         }))
         .send()
         .await
@@ -153,12 +153,12 @@ async fn create_customer_pays_grosses_up() {
 
     assert_eq!(res.status(), 200);
     let body: Value = res.json().await.unwrap();
-    assert_eq!(body["subtotalAmount"], "10000");
-    // total grossed up so that total - 1% fee >= 10000 => total = 10102 (fee 101), net 10001? check >= subtotal
+    assert_eq!(body["subtotalAmount"], "500000000");
+    // total grossed up so that total - 1% fee >= 500000000; net must cover the full subtotal
     let total: i64 = body["totalAmount"].as_str().unwrap().parse().unwrap();
-    assert!(total > 10000, "total grossed up above subtotal");
+    assert!(total > 500000000, "total grossed up above subtotal");
     let service_fee: i64 = body["serviceFeeAmount"].as_str().unwrap().parse().unwrap();
-    assert_eq!(service_fee, total - 10000);
+    assert_eq!(service_fee, total - 500000000);
     // merchant_net must be >= the requested subtotal
     let outs = body["requiredOutputs"].as_array().unwrap();
     let net: i64 = outs
@@ -169,7 +169,7 @@ async fn create_customer_pays_grosses_up() {
         .unwrap()
         .parse()
         .unwrap();
-    assert!(net >= 10000, "merchant nets at least the subtotal");
+    assert!(net >= 500000000, "merchant nets at least the subtotal");
 }
 
 #[tokio::test]
@@ -182,7 +182,7 @@ async fn create_duplicate_external_id_422() {
 
     let payload = json!({
         "externalId": "ext-123",
-        "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "1000" }]
+        "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }]
     });
 
     let first = app
@@ -223,7 +223,7 @@ async fn create_then_show_roundtrip() {
         .client
         .post(app.url("/api/invoices"))
         .bearer_auth(&token)
-        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "1000" }] }))
+        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }] }))
         .send()
         .await
         .unwrap()

@@ -8,6 +8,8 @@ pub mod auth;
 pub mod auth_token;
 pub mod chain_observer;
 pub mod chain_source;
+pub mod covenant_keeper;
+pub mod dispute;
 pub mod error;
 pub mod handlers;
 pub mod kaspa_wrpc;
@@ -104,6 +106,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/kpr1/intents/:intentId/evidence", get(handlers::internal_kpr1_ops::evidence))
         .route("/internal/payment-ops/kpr1/conformance", get(handlers::internal_kpr1_ops::conformance))
         .route("/internal/payment-ops/kpr1/status", get(handlers::internal_kpr1_ops::status))
+        // --- Internal KPR-1 dispute resolution (arbiter; internal token) ---
+        .route("/internal/payment-ops/kpr1/invoices/:publicId/release-arbitrated", post(handlers::internal_kpr1_ops::release_arbitrated))
+        .route("/internal/payment-ops/kpr1/invoices/:publicId/refund-arbitrated/prepare", post(handlers::internal_kpr1_ops::refund_arbitrated_prepare))
+        .route("/internal/payment-ops/kpr1/invoices/:publicId/refund-arbitrated", post(handlers::internal_kpr1_ops::refund_arbitrated_submit))
         // --- Media (merchant) ---
         .route("/api/media", post(handlers::medias::store))
         .route("/api/media/:id", delete(handlers::medias::destroy))
@@ -335,6 +341,20 @@ pub fn build_router(state: AppState) -> Router {
             "/api/checkout/invoices/:publicId/kpr1-intent",
             get(handlers::checkout::kpr1_intent),
         )
+        .route("/api/checkout/invoices/:publicId/kpr1-finalize", post(handlers::checkout::finalize_kpr1_covenant))
+        .route("/api/checkout/invoices/:publicId/kpr1-release/prepare", post(handlers::checkout::prepare_kpr1_release))
+        .route("/api/checkout/invoices/:publicId/kpr1-release", post(handlers::checkout::submit_kpr1_release))
+        .route("/api/checkout/invoices/:publicId/kpr1-refund/prepare", post(handlers::checkout::prepare_kpr1_refund))
+        .route("/api/checkout/invoices/:publicId/kpr1-refund", post(handlers::checkout::submit_kpr1_refund))
+        // Tier 1 bilateral mutual settlement (customer + merchant co-sign a split).
+        .route("/api/checkout/invoices/:publicId/kpr1-settle/prepare", post(handlers::checkout::prepare_kpr1_settle))
+        .route("/api/checkout/invoices/:publicId/kpr1-settle", post(handlers::checkout::submit_kpr1_settle))
+        // Tier 3 community-jury dispute flow: open (public) + committee/vote/settle (operator).
+        .route("/api/checkout/invoices/:publicId/dispute/open", post(handlers::dispute_ops::open_dispute))
+        .route("/internal/payment-ops/kpr1/disputes/:disputeId/committee", post(handlers::dispute_ops::draw_committee))
+        .route("/internal/payment-ops/kpr1/disputes/:disputeId/votes", post(handlers::dispute_ops::cast_vote))
+        .route("/internal/payment-ops/kpr1/disputes/:disputeId/settle-jury", post(handlers::dispute_ops::settle_jury))
+        .route("/internal/payment-ops/kpr1/disputes/:disputeId", get(handlers::dispute_ops::dispute_status))
         .route("/api/checkout/invoices/:publicId/kpr1-payments", post(handlers::checkout::submit_kpr1_payment))
         .route("/api/checkout/links/:publicId", get(handlers::checkout::link_show))
         .route(

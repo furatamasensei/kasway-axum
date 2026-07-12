@@ -36,7 +36,6 @@
 use crate::chain_source::{ChainSource, ObservedTransaction};
 use crate::handlers::payment_ops_settings::required_confirmations_for;
 use crate::handlers::{invoices, webhooks};
-use crate::kpr1::{parse_required_outputs, verify_required_outputs, RequiredOutput};
 use crate::state::AppState;
 use crate::util::now_iso;
 use serde_json::{json, Value};
@@ -89,6 +88,8 @@ struct Candidate {
     amount_sompi: i64,
     script_hash: String,
     required_outputs: String,
+    covenant_address: Option<String>,
+    gross_amount: Option<i64>,
     store_id: Option<i64>,
     public_id: String,
     currency: String,
@@ -103,10 +104,12 @@ pub async fn run_tick<S: ChainSource>(state: &AppState, source: &S) -> Result<us
     let candidates = sqlx::query_as::<_, Candidate>(
         "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, i.intent_id, \
                 i.tx_id, i.network, i.asset_id, i.amount_sompi, i.script_hash, i.required_outputs, \
+                i.covenant_address, i.gross_amount, \
                 inv.store_id, inv.public_id, inv.currency, inv.total_amount \
          FROM kpr1_payment_intents i \
          JOIN invoices inv ON inv.id = i.invoice_id \
-         WHERE i.tx_id IS NOT NULL AND i.status IN ('submitted', 'verified') \
+         WHERE i.tx_id IS NOT NULL AND i.covenant_address IS NOT NULL \
+           AND i.covenant_state = 'awaiting_funding' \
            AND inv.status = 'open' \
          ORDER BY i.id \
          LIMIT $1",
@@ -161,21 +164,17 @@ async fn observe_candidate<S: ChainSource>(
     c: &Candidate,
     virtual_daa: u64,
 ) -> Result<Progress, sqlx::Error> {
-    let required = parse_required_outputs(&c.required_outputs);
-    if required.is_empty() {
-        tracing::warn!("chain observer: intent {} has no required outputs; skipping", c.intent_id);
+    // Covenant funding detection: the payer funds ONE output to the covenant
+    // P2SH address with EXACTLY the gross amount. Under- or overfunding fails
+    // closed (the covenant script would reject any spend of a wrong-valued UTXO).
+    let (Some(covenant_address), Some(gross)) = (c.covenant_address.clone(), c.gross_amount) else {
+        tracing::warn!("chain observer: covenant intent {} not finalized; skipping", c.intent_id);
         return Ok(Progress::None);
-    }
-    let mut addresses: Vec<String> = Vec::new();
-    for r in &required {
-        if !addresses.contains(&r.address) {
-            addresses.push(r.address.clone());
-        }
-    }
+    };
 
-    let tx = match source.transaction_outputs(&c.tx_id, &addresses).await {
+    let tx = match source.transaction_outputs(&c.tx_id, &[covenant_address.clone()]).await {
         Ok(Some(tx)) => tx,
-        Ok(None) => return Ok(Progress::None), // not observed yet
+        Ok(None) => return Ok(Progress::None), // funding not visible yet
         Err(err) => {
             tracing::warn!("chain observer: lookup of tx {} failed: {err}", c.tx_id);
             return Ok(Progress::None);
@@ -186,78 +185,58 @@ async fn observe_candidate<S: ChainSource>(
         .accepting_daa_score
         .map(|acc| virtual_daa.saturating_sub(acc) as i64)
         .unwrap_or(0);
-    let observed: Vec<(String, i128)> = tx
+    let funded: i64 = tx
         .outputs
         .iter()
-        .map(|o| (o.address.clone(), o.amount_sompi as i128))
-        .collect();
-    let observed_total: i64 = tx.outputs.iter().map(|o| o.amount_sompi as i64).sum();
-    let metadata = observation_metadata(c, &required, &tx);
+        .filter(|o| o.address == covenant_address)
+        .map(|o| o.amount_sompi as i64)
+        .sum();
+    let metadata = covenant_observation_metadata(c, &covenant_address, funded, &tx);
     let now = now_iso();
 
-    match verify_required_outputs(&required, &observed) {
-        Err(reason) => {
-            // Fail closed: record the discrepancy, never mark paid.
-            upsert_observation(state, c, "mismatched", observed_total, confirmations, &tx, &metadata, &now).await?;
-            fail_intent(state, c, &reason, &now).await?;
-            tracing::warn!(
-                "chain observer: intent {} tx {} failed verification: {reason}",
-                c.intent_id,
-                c.tx_id
-            );
-            Ok(Progress::Advanced)
-        }
-        Ok(()) => {
-            let required_confirmations = required_confirmations_for(
-                state,
-                c.user_id,
-                &c.network,
-                &c.asset_id,
-                &c.currency,
-                c.total_amount as i128,
-            )
-            .await?;
-
-            if confirmations >= required_confirmations {
-                settle(state, c, observed_total, confirmations, &tx, &metadata, &now).await?;
-            } else {
-                upsert_observation(state, c, "matched", observed_total, confirmations, &tx, &metadata, &now)
-                    .await?;
-                mark_verified(state, c, &now).await?;
-            }
-            Ok(Progress::Advanced)
-        }
+    if funded != gross {
+        // Wrong-valued funding: fail closed with a stable reason + anomaly signal.
+        let reason = if funded < gross { "covenant_underfunded" } else { "covenant_overfunded" };
+        upsert_observation(state, c, "mismatched", funded, confirmations, &tx, &metadata, &now).await?;
+        fail_intent(state, c, reason, &now).await?;
+        tracing::warn!(
+            "chain observer: covenant intent {} tx {} funded {funded} != gross {gross} ({reason})",
+            c.intent_id,
+            c.tx_id
+        );
+        return Ok(Progress::Advanced);
     }
+
+    let required_confirmations =
+        required_confirmations_for(state, c.user_id, &c.network, &c.asset_id, &c.currency, c.total_amount as i128).await?;
+
+    if confirmations >= required_confirmations {
+        // Covenant is funded and confirmed. The invoice stays OPEN — the keeper
+        // releases the split (or auto-refunds after expiry) and only then marks
+        // the invoice paid/refunded.
+        upsert_observation(state, c, "settled", funded, confirmations, &tx, &metadata, &now).await?;
+        mark_funded(state, c, &now).await?;
+    } else {
+        upsert_observation(state, c, "matched", funded, confirmations, &tx, &metadata, &now).await?;
+        mark_verified(state, c, &now).await?;
+    }
+    Ok(Progress::Advanced)
 }
 
-/// Observation metadata in the shape the KPR-1 explorer reads
-/// (`kpr1.intentId` / `kpr1.scriptHash` / `kpr1.outputs` with role +
-/// address + amountSompi for outputs that match a required output).
-fn observation_metadata(c: &Candidate, required: &[RequiredOutput], tx: &ObservedTransaction) -> String {
-    let outputs: Vec<Value> = tx
-        .outputs
-        .iter()
-        .map(|o| {
-            let role = required
-                .iter()
-                .find(|r| r.address == o.address && r.amount_sompi == o.amount_sompi as i128)
-                .map(|r| r.role.clone());
-            let mut out = json!({
-                "address": o.address,
-                "amountSompi": o.amount_sompi.to_string(),
-            });
-            if let Some(role) = role {
-                out["role"] = json!(role);
-            }
-            out
-        })
-        .collect();
+/// Observation metadata in the shape the KPR-1 explorer reads. For covenant
+/// settlement the single relevant output is the funding of the covenant address.
+fn covenant_observation_metadata(c: &Candidate, covenant_address: &str, funded: i64, tx: &ObservedTransaction) -> String {
     json!({
         "kpr1": {
             "intentId": c.intent_id,
             "scriptHash": c.script_hash,
             "txId": tx.tx_id,
-            "outputs": outputs,
+            "covenantAddress": covenant_address,
+            "outputs": [{
+                "role": "covenant",
+                "address": covenant_address,
+                "amountSompi": funded.to_string(),
+            }],
         }
     })
     .to_string()
@@ -345,12 +324,32 @@ async fn mark_verified(state: &AppState, c: &Candidate, now: &str) -> Result<(),
     Ok(())
 }
 
+/// Covenant funded and confirmed: mark it `funded` + verified. The invoice stays
+/// OPEN — the covenant keeper releases the split (or auto-refunds after expiry)
+/// and only then closes the invoice.
+async fn mark_funded(state: &AppState, c: &Candidate, now: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET covenant_state = 'funded', status = 'verified', \
+         verification_status = 'verified', observed_at = COALESCE(observed_at, $1), \
+         verified_at = COALESCE(verified_at, $1), updated_at = $1 WHERE id = $2",
+    )
+    .bind(now)
+    .bind(c.intent_pk)
+    .execute(&state.db.pool)
+    .await?;
+    Ok(())
+}
+
 /// Observed outputs do not satisfy the intent: mark the intent failed with a
 /// stable reason and record a critical anomaly signal. The invoice stays open.
 async fn fail_intent(state: &AppState, c: &Candidate, reason: &str, now: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
+        // `covenant_state = 'failed'` makes this terminal for the observer: the
+        // candidate query only picks `awaiting_funding` rows, so a failed intent
+        // is never re-observed (no duplicate anomaly signals).
         "UPDATE kpr1_payment_intents SET status = 'failed', verification_status = 'failed', \
-         failure_reason = $1, observed_at = COALESCE(observed_at, $2), updated_at = $2 WHERE id = $3",
+         covenant_state = 'failed', failure_reason = $1, observed_at = COALESCE(observed_at, $2), \
+         updated_at = $2 WHERE id = $3",
     )
     .bind(reason)
     .bind(now)

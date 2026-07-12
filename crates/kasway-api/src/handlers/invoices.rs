@@ -17,7 +17,6 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 const FEE_DELEGATIONS: &[&str] = &["merchant_subsidized", "customer_pays"];
-const PAYMENT_MODES: &[&str] = &["address", "covenant"];
 
 #[derive(Deserialize, Default)]
 pub struct InvoiceQuery {
@@ -47,7 +46,6 @@ pub(crate) struct InvoiceRow {
     subtotal_amount: i64,
     total_amount: i64,
     fee_delegation: Option<String>,
-    payment_mode: Option<String>,
     service_fee_amount: i64,
     currency: String,
     pricing_country_code: Option<String>,
@@ -68,7 +66,7 @@ impl InvoiceRow {
 const INVOICE_COLS: &str = "id, user_id, store_id, public_id, external_id, subscription_id, \
     subscription_cycle_id, payment_link_id, status, payment_address, payment_network, \
     payment_asset, payment_reference, subtotal_amount, total_amount, fee_delegation, \
-    payment_mode, service_fee_amount, currency, pricing_country_code, metadata, expires_at, \
+    service_fee_amount, currency, pricing_country_code, metadata, expires_at, \
     paid_at, cancelled_at, created_at, updated_at";
 
 #[derive(sqlx::FromRow)]
@@ -106,7 +104,10 @@ pub(crate) struct IntentRow {
     platform_fee_address: String,
     template_id: String,
     template_version: String,
-    script_hash: String,
+    // NULL until the covenant is finalized (the P2SH script hash is only known
+    // once the payer supplies a refund address). Was `String`, which made every
+    // freshly-minted intent 500 on decode.
+    script_hash: Option<String>,
     canonical_hash: String,
     payment_request_uri: String,
     payment_intent_url: String,
@@ -227,7 +228,6 @@ pub(crate) fn serialize_invoice(inv: &InvoiceRow, items: &[ItemRow], intent: Opt
     obj.insert("subtotalAmount".into(), amount_str(inv.subtotal_amount));
     obj.insert("totalAmount".into(), amount_str(inv.total_amount));
     obj.insert("feeDelegation".into(), json!(inv.fee_delegation));
-    obj.insert("paymentMode".into(), json!(inv.payment_mode));
     obj.insert("serviceFeeAmount".into(), amount_str(inv.service_fee_amount));
     obj.insert("currency".into(), json!(inv.currency));
     obj.insert("pricingCountryCode".into(), json!(inv.pricing_country_code));
@@ -525,6 +525,9 @@ fn resolve_status(
     if inv.status == "cancelled" {
         return "cancelled";
     }
+    if inv.status == "refunded" {
+        return "refunded";
+    }
     if inv.status == "expired" || is_expired_now(inv) {
         return "expired";
     }
@@ -560,6 +563,7 @@ pub(crate) fn checkout_state(summary: &Value) -> Value {
         "paid" | "overpaid" => ("paid", "show_receipt", true),
         "expired" => ("expired", "contact_merchant", true),
         "cancelled" => ("cancelled", "contact_merchant", true),
+        "refunded" => ("refunded", "show_refund", true),
         "unapplied_receipt" => ("confirming_payment", "contact_merchant", false),
         _ => ("unavailable", "none", true),
     };
@@ -707,7 +711,6 @@ struct CreateInput {
     payment_network: Option<String>,
     payment_asset: Option<String>,
     fee_delegation: Option<String>,
-    payment_mode: Option<String>,
     store_id: Option<i64>,
     customer_country_code: Option<String>,
     items: Vec<ItemInput>,
@@ -739,15 +742,6 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
             None
         }
     };
-    let payment_mode = match body.get("paymentMode") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) if PAYMENT_MODES.contains(&s.as_str()) => Some(s.clone()),
-        Some(_) => {
-            vpush(&mut errors, "paymentMode", "enum", "The selected paymentMode is invalid");
-            None
-        }
-    };
-
     // items: array, minLength 1, each {name 1..255, quantity +int, unitAmount atomic}
     let mut items = Vec::new();
     match body.get("items") {
@@ -809,7 +803,6 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
         payment_network: opt_string("paymentNetwork").filter(|s| !s.is_empty()),
         payment_asset: opt_string("paymentAsset").filter(|s| !s.is_empty()),
         fee_delegation,
-        payment_mode,
         store_id: body.get("storeId").and_then(|v| v.as_i64()),
         customer_country_code: opt_string("customerCountryCode")
             .filter(|s| !s.is_empty())
@@ -907,9 +900,9 @@ pub(crate) async fn create_for_merchant(
     let invoice_id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO invoices \
          (user_id, store_id, public_id, external_id, payment_link_id, subscription_id, subscription_cycle_id, status, payment_address, payment_network, \
-          payment_asset, payment_reference, subtotal_amount, total_amount, fee_delegation, payment_mode, \
+          payment_asset, payment_reference, subtotal_amount, total_amount, fee_delegation, \
           service_fee_amount, currency, pricing_country_code, metadata, expires_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22) RETURNING id",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING id",
     )
     .bind(user_id)
     .bind(store_id)
@@ -925,7 +918,6 @@ pub(crate) async fn create_for_merchant(
     .bind(subtotal as i64)
     .bind(total as i64)
     .bind(&fee_delegation)
-    .bind(&input.payment_mode)
     .bind(service_fee as i64)
     .bind(&asset)
     .bind(&input.customer_country_code)
@@ -963,7 +955,6 @@ pub(crate) async fn create_for_merchant(
             total_amount: total as i64,
             payment_network: network.clone(),
             payment_asset: asset.clone(),
-            payment_mode: input.payment_mode.clone(),
             expires_at: expires_at.clone(),
         },
     )

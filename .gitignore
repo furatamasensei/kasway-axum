@@ -3,3 +3,6 @@ target/
 # Claude Code / worktree tooling
 .claude/
 .worktreeinclude
+
+# Code-intelligence tool cache (understand)
+.ua/

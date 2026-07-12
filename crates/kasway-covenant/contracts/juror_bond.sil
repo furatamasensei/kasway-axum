@@ -1,0 +1,82 @@
+pragma silverscript ^0.1.0;
+
+// Kasway Tier-3 juror bond — commit-reveal + slashing, WITHOUT on-chain state.
+//
+// A juror "commits" their vote by FUNDING one instance of this covenant whose
+// `commit_hash = blake2b(chosen_verdict_digest || salt)` is baked in. The bond
+// UTXO's block DAA score (read in-script via OpTxInputDaaScore) is the consensus
+// record of WHEN the juror committed, so a commit that lands after
+// `commit_deadline` can never be claimed honest — no state transition needed.
+//
+//   claim_honest — the juror reclaims their bond by revealing `salt` for the
+//                  WINNING verdict (proven by a K-of-N committee datasig set).
+//                  Only possible if they committed to the winner, in time.
+//   slash        — after `claim_deadline`, permissionless: anyone spends an
+//                  unclaimed bond to the treasury. Dissenters (who committed to
+//                  the loser) and no-shows cannot claim, so their bond is slashed.
+//
+// The bond holds exactly `bond_amount`; the honest reward (a share of slashed
+// bonds + service fee) is paid off-chain by the keeper in this version.
+contract JurorBond(
+    byte[32][] committee_pubkeys,
+    int committee_count,
+    int jury_threshold,
+    byte[32] verdict_digest_merchant,
+    byte[32] verdict_digest_customer,
+    byte[32] commit_hash,
+    int commit_deadline,
+    int reveal_open,
+    int claim_deadline,
+    int bond_amount,
+    byte[32] payout_pubkey,
+    byte[32] slash_pubkey
+) {
+    // Verify a threshold of DISTINCT committee datasigs over `digest`. This is the
+    // same proof the escrow uses to settle the principal, so it establishes THE
+    // winning verdict (K > N/2 => unique).
+    function assert_jury_threshold(datasig[] sigs, int[] signer_idx, byte[32] digest) {
+        require(sigs.length == jury_threshold);
+        require(signer_idx.length == jury_threshold);
+        int prev = 0 - 1;
+        for (k, 0, jury_threshold, committee_count) {
+            int si = signer_idx[k];
+            require(si > prev);
+            require(si < committee_count);
+            require(checkSigFromStack(sigs[k], digest, pubkey(committee_pubkeys[si])));
+            prev = si;
+        }
+    }
+
+    // `winner_digest` must be one of the two real verdicts.
+    function require_real_verdict(byte[32] winner_digest) {
+        require(winner_digest == verdict_digest_merchant || winner_digest == verdict_digest_customer);
+    }
+
+    // Honest juror reclaims their bond.
+    entrypoint function claim_honest(datasig[] committee_sigs, int[] signer_idx, byte[32] winner_digest, byte[32] salt) {
+        require_real_verdict(winner_digest);
+        // The bond must have been funded (committed) before the commit deadline.
+        require(OpTxInputDaaScore(this.activeInputIndex) <= commit_deadline);
+        // The reveal window must be open.
+        require(tx.time >= reveal_open);
+        // This must be THE winning verdict (K-of-N committee attestation).
+        assert_jury_threshold(committee_sigs, signer_idx, winner_digest);
+        // The juror committed to the winner: reveal opens the baked commitment.
+        require(commit_hash == blake2b(byte[](winner_digest) + byte[](salt)));
+        // Return the full bond to the juror's payout.
+        require(tx.inputs[this.activeInputIndex].value == bond_amount);
+        require(tx.outputs[0].scriptPubKey == byte[](new ScriptPubKeyP2PK(pubkey(payout_pubkey))));
+        require(tx.outputs[0].value == bond_amount);
+    }
+
+    // Permissionless slash of an unclaimed bond after the claim window closes.
+    entrypoint function slash(datasig[] committee_sigs, int[] signer_idx, byte[32] winner_digest) {
+        require_real_verdict(winner_digest);
+        require(tx.time >= claim_deadline);
+        // A real verdict must exist (so we never slash a dispute that never resolved).
+        assert_jury_threshold(committee_sigs, signer_idx, winner_digest);
+        require(tx.inputs[this.activeInputIndex].value == bond_amount);
+        require(tx.outputs[0].scriptPubKey == byte[](new ScriptPubKeyP2PK(pubkey(slash_pubkey))));
+        require(tx.outputs[0].value == bond_amount);
+    }
+}

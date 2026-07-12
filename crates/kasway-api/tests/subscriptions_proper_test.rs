@@ -12,7 +12,7 @@ async fn merchant_with_setup(app: &common::TestApp, email: &str) -> String {
 
 async fn create_plan(app: &common::TestApp, token: &str) -> String {
     let p: Value = app.client.post(app.url("/api/commerce/subscription-plans")).bearer_auth(token)
-        .json(&json!({ "name": "Monthly", "amount": "5000", "intervalUnit": "month", "intervalCount": 1 }))
+        .json(&json!({ "name": "Monthly", "amount": "500000000", "intervalUnit": "month", "intervalCount": 1 }))
         .send().await.unwrap().json().await.unwrap();
     p["publicId"].as_str().unwrap().to_string()
 }
@@ -36,14 +36,14 @@ async fn subscription_create_spawns_first_invoice() {
     assert_eq!(sub["status"], "active");
     assert_eq!(sub["paymentMode"], "recurring_invoice");
     assert!(sub["publicId"].as_str().unwrap().starts_with("sub_"));
-    assert_eq!(sub["planSnapshot"]["amount"], "5000");
+    assert_eq!(sub["planSnapshot"]["amount"], "500000000");
     assert_eq!(sub["customer"]["email"], "buyer@x.com");
     assert_eq!(sub["plan"]["publicId"], plan);
     let cycles = sub["cycles"].as_array().unwrap();
     assert_eq!(cycles.len(), 1);
     assert_eq!(cycles[0]["status"], "invoiced");
     assert_eq!(cycles[0]["invoice"]["paymentRail"], "kpr1_covenant");
-    assert_eq!(cycles[0]["invoice"]["subtotalAmount"], "5000");
+    assert_eq!(cycles[0]["invoice"]["subtotalAmount"], "500000000");
 }
 
 #[tokio::test]

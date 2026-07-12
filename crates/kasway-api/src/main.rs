@@ -35,6 +35,15 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("chain observer disabled (CHAIN_OBSERVER_ENABLED / KASPA_NODE_URL unset)");
     }
 
+    // Background covenant keeper (COVENANT_KEEPER_ENABLED; default on only when a
+    // keeper fee key and KASPA_NODE_URL are configured). Releases funded covenants
+    // before expiry and auto-refunds after.
+    if kasway_api::covenant_keeper::enabled_from_env() {
+        kasway_api::covenant_keeper::spawn(state.clone());
+    } else {
+        tracing::info!("covenant keeper disabled (COVENANT_KEEPER_ENABLED / fee key / KASPA_NODE_URL unset)");
+    }
+
     let app = kasway_api::build_router(state);
 
     let addr = std::env::var("HOST_PORT").unwrap_or_else(|_| "0.0.0.0:3333".to_string());

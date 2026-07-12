@@ -6,12 +6,12 @@
 //! ed25519 signing, payment-request URI, all validation/error contracts
 //! (every `Kpr1PaymentIntentError` surfaces as CommerceError 422).
 //!
-//! STUBBED (deferred external crypto): the SilverScript compiler artifact and
-//! Kaspa-WASM covenant P2SH derivation. We default to `address` mode (no WASM)
-//! and synthesise the compiled artifact's script/source hashes deterministically
-//! from the intent inputs. These specific hashes therefore do NOT byte-match a
-//! production Adonis instance, but everything is internally consistent and
-//! deterministic. Covenant mode falls back to the same address-mode plan.
+//! SETTLEMENT: covenant is the sole path (zero legacy). The minter records the
+//! ordered payout split (merchant_net, tax, splits, kasway_fee) in
+//! `required_outputs` and the gross/expiry the covenant will enforce. The
+//! covenant P2SH address depends on the payer's refund address and is derived at
+//! finalize (`kpr1_finalize`), so `script_hash`/`covenant_address` are filled in
+//! then; at mint `covenant_state = 'pending'`.
 
 use crate::error::{AppError, AppResult};
 use crate::state::{AppState, Kpr1Config};
@@ -36,7 +36,6 @@ pub struct IntentInvoiceCtx {
     pub total_amount: i64,
     pub payment_network: String,
     pub payment_asset: String,
-    pub payment_mode: Option<String>,
     pub expires_at: Option<String>,
 }
 
@@ -312,6 +311,28 @@ pub fn verify_required_outputs(
     Ok(())
 }
 
+/// KIP-9 storage-mass parameter (sompi·mass), measured against a live TN10 node:
+/// a release paying an output of value `v` contributes ~`STORAGE_MASS_PARAM / v`
+/// storage mass. Consensus caps a transaction's storage mass at 500_000.
+const STORAGE_MASS_PARAM: u128 = 1_000_000_000_000;
+/// Safe ceiling for a covenant release's storage mass. Below the 500_000
+/// consensus cap, leaving margin for the keeper's (large, negligible-mass)
+/// fee-change output.
+const MAX_SETTLEMENT_STORAGE_MASS: u128 = 450_000;
+
+/// Estimated storage mass of a covenant release paying these payout values (the
+/// dominant term; the large fee-change output is negligible). A covenant release
+/// creates one output per payout plus a change output, so with >1 payout it has
+/// more outputs than inputs and the node charges ~`STORAGE_MASS_PARAM/value` per
+/// output — tiny payouts blow the cap and make the covenant unspendable.
+fn settlement_storage_mass(payout_values: &[i128]) -> u128 {
+    payout_values
+        .iter()
+        .filter(|v| **v > 0)
+        .map(|v| STORAGE_MASS_PARAM / (*v as u128))
+        .sum()
+}
+
 /// Mint and persist a KPR-1 intent for an invoice; returns the intentId.
 pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> AppResult<String> {
     let cfg = &state.config.kpr1;
@@ -393,6 +414,24 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         ));
     }
 
+    // Storage-mass guard (KIP-9): the covenant release pays each of these outputs,
+    // and the node charges ~STORAGE_MASS_PARAM/value of storage mass per output
+    // (capped at 500_000). A too-small payout (e.g. a tiny fee/split slice on a
+    // small invoice) would make the covenant unspendable, so reject up front.
+    let mut payout_values: Vec<i128> = vec![merchant_net];
+    if tax.enabled && tax_amount > 0 {
+        payout_values.push(tax_amount);
+    }
+    payout_values.extend(split_amounts.iter().copied());
+    payout_values.push(platform_fee);
+    let storage_mass = settlement_storage_mass(&payout_values);
+    if storage_mass > MAX_SETTLEMENT_STORAGE_MASS {
+        let min_payout = payout_values.iter().filter(|v| **v > 0).min().copied().unwrap_or(0);
+        return Err(err(&format!(
+            "KPR-1 covenant settlement storage mass (~{storage_mass}) would exceed the safe limit ({MAX_SETTLEMENT_STORAGE_MASS}; consensus cap 500000): the smallest payout ({min_payout} sompi) is too small to settle on-chain. Increase the invoice amount or remove tiny tax/split/fee slices."
+        )));
+    }
+
     // intentId: kpr1_<16 random bytes hex>
     let mut id_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id_bytes);
@@ -429,25 +468,20 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         "amountSompi": platform_fee.to_string(),
     }));
 
-    // Stubbed compiled artifact (deterministic) + address-mode script hash.
-    let source_hash = sha256_hex(
-        format!(
-            "{TEMPLATE_ID}:{TEMPLATE_VERSION}:{}:{}:{}:{}",
-            ctx.payment_network, merchant_address, platform_fee_address, amount
-        )
-        .as_bytes(),
-    );
-    let script_hash = sha256_hex(format!("script:{source_hash}").as_bytes());
+    // Covenant settlement (the only path). The covenant P2SH address is derived
+    // at finalize once the payer supplies a refund address, so it and the real
+    // script hash are unknown here. The signed intent commits to the economic
+    // terms (ordered payouts, gross, expiry); the covenant address is a
+    // deterministic function of those plus the refund address.
+    let capture_window = state.config.covenant.capture_window_secs;
+    let expiry_ts = chrono::Utc::now().timestamp() + capture_window;
+    let gross_amount = amount; // the covenant holds the full invoice amount
 
-    // canonical intent (unsigned)
     let template = json!({
         "id": TEMPLATE_ID,
         "version": TEMPLATE_VERSION,
-        "scriptHash": script_hash,
-        "status": "approved",
-        "sourceHash": source_hash,
-        "approvedSourceHash": source_hash,
-        "productionApproved": true,
+        "kind": "refund_window_covenant",
+        "status": "pending_finalize",
     });
     let intent_unsigned = json!({
         "version": KPR1_VERSION,
@@ -456,10 +490,13 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         "intentId": intent_id,
         "invoiceId": ctx.public_id,
         "amountSompi": amount.to_string(),
+        "grossSompi": gross_amount.to_string(),
         "expiresAt": expires_at,
+        "expiryTs": expiry_ts,
         "template": template,
         "outputs": outputs,
-        "refund": { "addressRequiredFromWallet": true, "timeoutSeconds": 1800 },
+        "settlement": { "mode": "covenant", "addressRequiredFromWallet": true, "captureWindowSeconds": capture_window },
+        "refund": { "addressRequiredFromWallet": true, "captureWindowSeconds": capture_window },
         "merchant": { "name": cfg.app_name, "domain": url_host(&cfg.app_url) },
         "display": { "memo": format!("Invoice {}", ctx.public_id), "currencyCode": ctx.payment_asset },
     });
@@ -491,26 +528,18 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         expires_epoch
     );
 
-    let payment_mode = ctx.payment_mode.clone().unwrap_or_else(|| cfg.payment_mode.clone());
     let metadata = json!({
         "nonCustodial": true,
         "noKaswaySigning": true,
         "walletLocalSigningRequired": true,
-        "walletSignedRelaySupported": true,
-        "paymentMode": payment_mode,
-        "compiledCovenant": {
-            "templateId": TEMPLATE_ID,
-            "templateVersion": TEMPLATE_VERSION,
-            "sourceHash": source_hash,
-            "approvedSourceHash": source_hash,
-            "productionApproved": true,
-            "networkTarget": ctx.payment_network,
-        },
+        "settlementMode": "covenant",
+        "covenantTemplate": { "id": TEMPLATE_ID, "version": TEMPLATE_VERSION, "kind": "refund_window" },
     });
 
     let now = now_iso();
     let tax_bps_val: Option<i64> = if tax.enabled { Some(tax.bps) } else { Some(0) };
     let tax_amount_val: Option<i64> = Some(tax_amount as i64);
+    let script_hash: Option<String> = None; // covenant script hash is set at finalize
 
     sqlx::query(
         "INSERT INTO kpr1_payment_intents \
@@ -518,8 +547,8 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
           platform_fee_amount, tax_bps, tax_amount, tax_address, merchant_address, platform_fee_address, \
           template_id, template_version, script_hash, canonical_hash, payment_request_uri, payment_intent_url, \
           signature_algorithm, signature_key_id, signature_value, required_outputs, canonical_intent, metadata, \
-          expires_at, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'created', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28)",
+          gross_amount, expiry_ts, covenant_state, expires_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'created', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, 'pending', $28, $29, $30)",
     )
     .bind(ctx.invoice_id)
     .bind(ctx.user_id)
@@ -536,7 +565,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     .bind(&platform_fee_address)
     .bind(TEMPLATE_ID)
     .bind(TEMPLATE_VERSION)
-    .bind(&script_hash)
+    .bind(script_hash)
     .bind(&canonical_hash)
     .bind(&payment_request_uri)
     .bind(&payment_intent_url)
@@ -546,6 +575,8 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     .bind(Value::Array(outputs).to_string())
     .bind(signed_intent.to_string())
     .bind(metadata.to_string())
+    .bind(gross_amount as i64)
+    .bind(expiry_ts)
     .bind(&expires_at)
     .bind(&now)
     .bind(&now)
@@ -553,6 +584,177 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     .await?;
 
     Ok(intent_id)
+}
+
+/// Finalize a covenant intent: the payer supplies their refund address, we derive
+/// the covenant P2SH address (deterministically, from the signed payouts + gross +
+/// expiry + this refund address), persist it, and point the invoice at it so the
+/// payer funds the covenant. Idempotent: re-finalizing returns the same address.
+pub async fn finalize_covenant_for_invoice(
+    state: &AppState,
+    public_id: &str,
+    refund_address: &str,
+) -> AppResult<Value> {
+    let invoice = sqlx::query_as::<_, (i64, String)>("SELECT id, status FROM invoices WHERE public_id = $1")
+        .bind(public_id)
+        .fetch_optional(&state.db.pool)
+        .await?;
+    let Some((inv_id, inv_status)) = invoice else {
+        return Err(err("KPR-1 payment intent not found"));
+    };
+
+    let row = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>, String, Option<String>)>(
+        "SELECT id, network, required_outputs, gross_amount, expiry_ts, covenant_state, covenant_address \
+         FROM kpr1_payment_intents WHERE invoice_id = $1",
+    )
+    .bind(inv_id)
+    .fetch_optional(&state.db.pool)
+    .await?;
+    let Some((intent_pk, network, required_outputs, gross_opt, expiry_opt, covenant_state, existing_address)) = row else {
+        return Err(err("KPR-1 payment intent not found"));
+    };
+
+    let gross = gross_opt.ok_or_else(|| err("KPR-1 covenant gross amount is missing"))? as u64;
+    let expiry = expiry_opt.ok_or_else(|| err("KPR-1 covenant expiry is missing"))? as u64;
+
+    // Idempotent: already finalized -> return the existing address.
+    if covenant_state != "pending" {
+        if let Some(addr) = existing_address {
+            return Ok(finalize_response(&addr, gross, expiry, &covenant_state));
+        }
+    }
+    if inv_status != "open" {
+        return Err(err("KPR-1 covenant can only be finalized for open invoices"));
+    }
+
+    let prefix = kasway_covenant::network_prefix(&network).map_err(|e| err(&e.to_string()))?;
+    let customer_refund = kasway_covenant::Destination::parse(refund_address)
+        .map_err(|e| err(&format!("KPR-1 refund address is not a supported Kaspa address: {e}")))?;
+
+    // EscrowV2 M-of-N arbiter panel (consented at funding). Falls back to a
+    // 1-of-1 panel of the configured Kasway arbiter during migration.
+    let (arbiter_panel, arbiter_threshold) = escrow_arbiter_panel(state)?;
+
+    let outs = parse_required_outputs(&required_outputs);
+    // The merchant's signing identity is the merchant_net payout address (schnorr P2PK).
+    let merchant_addr = outs
+        .iter()
+        .find(|o| o.role == "merchant_net")
+        .map(|o| o.address.clone())
+        .ok_or_else(|| err("KPR-1 intent has no merchant_net payout"))?;
+    let merchant = kasway_covenant::Destination::parse(&merchant_addr)
+        .map_err(|e| err(&format!("KPR-1 merchant address must be a schnorr P2PK address: {e}")))?;
+
+    let mut payouts = Vec::new();
+    for out in &outs {
+        let destination = kasway_covenant::Destination::parse(&out.address)
+            .map_err(|e| err(&format!("KPR-1 {} payout address is not covenant-compatible: {e}", out.role)))?;
+        let value = u64::try_from(out.amount_sompi).map_err(|_| err("KPR-1 payout amount is invalid"))?;
+        payouts.push(kasway_covenant::Payout { destination, value });
+    }
+
+    let params = kasway_covenant::escrow_v2::EscrowV2Params {
+        payouts,
+        customer_refund,
+        merchant,
+        arbiter_panel,
+        arbiter_threshold,
+        gross_amount: gross,
+        // `capture_time` is an on-chain lock_time. Kaspa treats lock_time values
+        // >= 500e9 as millisecond wall-clock timestamps and smaller values as DAA
+        // scores; `expiry` is Unix SECONDS, so scale to milliseconds to get a
+        // correct wall-clock auto-capture deadline (not a far-future DAA score).
+        capture_time: expiry.saturating_mul(1000),
+    };
+    let compiled = kasway_covenant::escrow_v2::compile_escrow_v2(&params)
+        .map_err(|e| err(&format!("KPR-1 covenant compilation failed: {e}")))?;
+    let address = kasway_covenant::covenant_address(&compiled, prefix)
+        .map_err(|e| err(&e.to_string()))?
+        .to_string();
+    let script_hash: String = kasway_covenant::covenant_script_hash(&compiled).iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Snapshot the arbiter panel so settlement rebuilds this exact covenant even
+    // if the configured panel later changes.
+    let panel_hex: Vec<String> =
+        params.arbiter_panel.iter().map(|k| k.iter().map(|b| format!("{:02x}", b)).collect::<String>()).collect();
+    let panel_json = serde_json::to_string(&panel_hex).unwrap_or_else(|_| "[]".to_string());
+    let arbiter_threshold_i = params.arbiter_threshold as i32;
+
+    let now = now_iso();
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET covenant_address = $1, customer_refund_address = $2, script_hash = $3, \
+         arbiter_panel_json = $4, arbiter_threshold = $5, covenant_state = 'awaiting_funding', updated_at = $6 WHERE id = $7",
+    )
+    .bind(&address)
+    .bind(refund_address)
+    .bind(&script_hash)
+    .bind(&panel_json)
+    .bind(arbiter_threshold_i)
+    .bind(&now)
+    .bind(intent_pk)
+    .execute(&state.db.pool)
+    .await?;
+    sqlx::query("UPDATE invoices SET payment_address = $1, updated_at = $2 WHERE id = $3")
+        .bind(&address)
+        .bind(&now)
+        .bind(inv_id)
+        .execute(&state.db.pool)
+        .await?;
+
+    Ok(finalize_response(&address, gross, expiry, "awaiting_funding"))
+}
+
+/// The Kasway arbiter public key baked into every covenant, derived from the
+/// configured arbiter secret.
+fn arbiter_pubkey(state: &AppState) -> AppResult<[u8; 32]> {
+    let hex = state
+        .config
+        .covenant
+        .arbiter_secret_hex
+        .as_deref()
+        .ok_or_else(|| err("KPR-1 covenant arbiter key is not configured (COVENANT_ARBITER_SECRET)"))?;
+    let bytes = decode_hex32(hex.trim()).ok_or_else(|| err("KPR-1 arbiter secret must be 32-byte hex"))?;
+    let key = kasway_covenant::KeeperKey::from_secret_bytes(&bytes).map_err(|e| err(&e.to_string()))?;
+    Ok(key.x_only_pubkey())
+}
+
+/// The EscrowV2 arbiter panel `(pubkeys, threshold)` baked into every covenant.
+/// If `COVENANT_ARBITER_PANEL` is configured, uses that independent panel;
+/// otherwise falls back to a 1-of-1 panel of the configured Kasway arbiter
+/// (behaviour-preserving migration). `threshold` is clamped to `1..=panel.len()`.
+pub(crate) fn escrow_arbiter_panel(state: &AppState) -> AppResult<(Vec<[u8; 32]>, u32)> {
+    let cfg = &state.config.covenant;
+    if cfg.arbiter_panel_hex.is_empty() {
+        let panel = vec![arbiter_pubkey(state)?];
+        return Ok((panel, 1));
+    }
+    let mut panel = Vec::with_capacity(cfg.arbiter_panel_hex.len());
+    for hex in &cfg.arbiter_panel_hex {
+        let pk = decode_hex32(hex.trim()).ok_or_else(|| err("KPR-1 arbiter panel entry must be 32-byte hex"))?;
+        panel.push(pk);
+    }
+    let threshold = cfg.arbiter_threshold.clamp(1, panel.len() as u32);
+    Ok((panel, threshold))
+}
+
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn finalize_response(address: &str, gross: u64, expiry: u64, state: &str) -> Value {
+    json!({
+        "covenantAddress": address,
+        "amountSompi": gross.to_string(),
+        "expiryTs": expiry,
+        "covenantState": state,
+    })
 }
 
 #[allow(unused)]

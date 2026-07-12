@@ -43,8 +43,9 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio_tungstenite::tungstenite::Message;
 
-/// Per-request timeout (dial + roundtrip), seconds.
-const REQUEST_TIMEOUT_SECS: u64 = 10;
+/// Per-request timeout (dial + roundtrip), seconds. Generous to tolerate an
+/// intermittently slow public TN10 node.
+const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 pub struct KaspaWrpcClient {
     url: String,
@@ -122,6 +123,58 @@ impl KaspaWrpcClient {
             .await
             .map_err(|_| ChainSourceError::Transport(format!("{method} timed out")))?
     }
+
+    /// Fetch spendable UTXOs for one address as `(transaction_id, index, amount)`.
+    /// Used by the covenant keeper to locate the covenant funding UTXO and a
+    /// keeper-owned fee UTXO.
+    pub async fn fetch_utxos(&self, address: &str) -> Result<Vec<([u8; 32], u32, u64)>, ChainSourceError> {
+        let response = self.call("getUtxosByAddresses", json!({ "addresses": [address] })).await?;
+        let entries = response
+            .get("entries")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ChainSourceError::Protocol("getUtxosByAddresses response missing entries".into()))?;
+        let mut utxos = Vec::new();
+        for entry in entries {
+            let outpoint = entry.get("outpoint");
+            let txid_hex = outpoint.and_then(|o| o.get("transactionId")).and_then(Value::as_str).unwrap_or("");
+            let index = outpoint.and_then(|o| o.get("index")).and_then(as_u64_lenient).unwrap_or(0) as u32;
+            let amount = entry.get("utxoEntry").and_then(|u| u.get("amount")).and_then(as_u64_lenient).unwrap_or(0);
+            let Some(txid) = hex32(txid_hex) else { continue };
+            if amount == 0 {
+                continue;
+            }
+            utxos.push((txid, index, amount));
+        }
+        Ok(utxos)
+    }
+
+    /// Raw wRPC call (debug/calibration): returns the method's `params` payload.
+    pub async fn raw_call(&self, method: &str, params: Value) -> Result<Value, ChainSourceError> {
+        self.call(method, params).await
+    }
+
+    /// Submit a fully-signed transaction (params already in kaspad's
+    /// `submitTransaction` shape); returns its transaction id.
+    pub async fn submit_transaction(&self, params: Value) -> Result<String, ChainSourceError> {
+        let response = self.call("submitTransaction", params).await?;
+        response
+            .get("transactionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| ChainSourceError::Protocol(format!("submitTransaction response missing transactionId: {response}")))
+    }
+}
+
+/// Decode a 64-char hex string into 32 bytes.
+fn hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 /// u64 that may arrive as a JSON number or a decimal string.

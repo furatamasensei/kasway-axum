@@ -3,6 +3,7 @@ pub mod api_keys;
 pub mod auth;
 pub mod bug_reports;
 pub mod checkout;
+pub mod dispute_ops;
 pub mod commerce;
 pub mod currencies;
 pub mod docs;

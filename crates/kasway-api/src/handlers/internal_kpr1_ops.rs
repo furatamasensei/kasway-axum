@@ -358,3 +358,56 @@ pub async fn status(_token: InternalToken, State(state): State<AppState>) -> App
         },
     })))
 }
+
+// ---------------------------------------------------------------------------
+// Dispute resolution (arbiter). These apply Kasway's arbiter key server-side, so
+// they MUST be operator-gated (internal token) — otherwise anyone could trigger
+// a dispute ruling. The merchant-signed refund path is a public checkout endpoint
+// instead, since it is safe by construction (nothing spends without the merchant's
+// own signature).
+// ---------------------------------------------------------------------------
+
+/// `POST /internal/payment-ops/kpr1/invoices/:publicId/release-arbitrated`
+///
+/// Kasway rules a dispute FOR the merchant: release the covenant to the merchant
+/// split. Single call — the server holds both the arbiter and keeper fee keys.
+pub async fn release_arbitrated(
+    _token: InternalToken,
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let out = crate::covenant_keeper::arbiter_release(&state, &public_id).await?;
+    Ok(Json(out))
+}
+
+/// `POST /internal/payment-ops/kpr1/invoices/:publicId/refund-arbitrated/prepare`
+///
+/// Kasway rules a dispute FOR the customer, step 1. Returns the fee sighash the
+/// CUSTOMER signs (they pay the refund gas); the covenant is arbiter-signed on submit.
+pub async fn refund_arbitrated_prepare(
+    _token: InternalToken,
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let out = crate::covenant_keeper::arbiter_refund_prepare(&state, &public_id).await?;
+    Ok(Json(out))
+}
+
+/// `POST /internal/payment-ops/kpr1/invoices/:publicId/refund-arbitrated`
+///
+/// Step 2. Body: `{ feeSignature }` (the customer's gas-input signature). The
+/// server signs the covenant with the arbiter key, attaches the fee signature,
+/// broadcasts, and marks the invoice refunded (full gross to the customer).
+pub async fn refund_arbitrated_submit(
+    _token: InternalToken,
+    State(state): State<AppState>,
+    Path(public_id): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult<Json<Value>> {
+    let fee_sig = body.get("feeSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let Some(fee_sig) = fee_sig else {
+        return Err(AppError::commerce(422, "A customer fee signature is required to refund"));
+    };
+    let out = crate::covenant_keeper::arbiter_refund_submit(&state, &public_id, fee_sig).await?;
+    Ok(Json(out))
+}

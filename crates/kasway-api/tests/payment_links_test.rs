@@ -241,7 +241,9 @@ async fn checkout_link_show_inactive_410_and_missing_404() {
 async fn checkout_link_create_invoice_spawns_and_increments_count() {
     let app = common::spawn_app().await;
     let token = merchant_with_setup(&app, "pl9@example.com").await;
-    let link = create_link(&app, &token, "Subscription", "7000").await;
+    // Settleable amount: a covenant release of this must clear the KIP-9
+    // storage-mass cap (a tiny amount would be rejected by the minter guard).
+    let link = create_link(&app, &token, "Subscription", "500000000").await;
     let id = link["id"].as_i64().unwrap();
     let public_id = link["publicId"].as_str().unwrap();
 
@@ -257,7 +259,7 @@ async fn checkout_link_create_invoice_spawns_and_increments_count() {
     assert_eq!(inv["status"], "open");
     assert_eq!(inv["paymentRail"], "kpr1_covenant");
     assert_eq!(inv["paymentLinkId"], id);
-    assert_eq!(inv["subtotalAmount"], "7000");
+    assert_eq!(inv["subtotalAmount"], "500000000");
     assert!(inv["kpr1PaymentIntent"]["intentId"].as_str().unwrap().starts_with("kpr1_"));
     // metadata carries the payment-link channel markers
     assert_eq!(inv["metadata"]["source"], "payment_link");

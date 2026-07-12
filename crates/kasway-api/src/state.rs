@@ -19,6 +19,7 @@ pub struct AppConfig {
     pub turnstile_secret: Option<String>,
     pub node_env: String,
     pub kpr1: Kpr1Config,
+    pub covenant: CovenantConfig,
     pub google: GoogleConfig,
     /// CoinGecko simple-price base URL (overridable for tests). PricesController.
     pub price_api_url: String,
@@ -61,8 +62,6 @@ pub struct Kpr1Config {
     pub signing_key_id: String,
     /// 32-byte ed25519 seed (hex). Fixed default keeps signatures deterministic.
     pub signing_seed: [u8; 32],
-    /// Global default payment mode: "address" (legacy multi-output) or "covenant".
-    pub payment_mode: String,
     pub default_network: String,
     pub default_asset: String,
     pub app_url: String,
@@ -78,11 +77,55 @@ impl Default for Kpr1Config {
             platform_fee_address: "kaspatest:platformfeeaddr00000".to_string(),
             signing_key_id: "kpr1-key-1".to_string(),
             signing_seed: [7u8; 32],
-            payment_mode: "address".to_string(),
             default_network: "tn10".to_string(),
             default_asset: "KAS".to_string(),
             app_url: "https://app.kasway.test".to_string(),
             app_name: "Kasway Merchant".to_string(),
+        }
+    }
+}
+
+/// Covenant settlement config (env: COVENANT_*). Covenant is the sole settlement
+/// path; these tune the refund window and the keeper that spends covenants.
+#[derive(Clone, Debug)]
+pub struct CovenantConfig {
+    /// Dispute/capture window in seconds from mint. After this, an unresolved
+    /// covenant auto-captures to the merchant (`release_captured`).
+    pub capture_window_secs: i64,
+    /// Miner fee per settlement transaction (sompi), paid from the fee input —
+    /// never from the covenant value. Measured on TN10: a covenant settlement's
+    /// compute mass (~10k, driven by the committed compute budgets) requires
+    /// ~1_034_600 sompi at ~100 sompi/gram, so this defaults well above a plain
+    /// tx's dust fee. Large splits (many payout outputs) add size mass; tune
+    /// `COVENANT_KEEPER_MIN_FEE_SOMPI` up if a big split is ever rejected for fee.
+    pub keeper_min_fee_sompi: u64,
+    /// Keeper fee-source secret key (hex, 32 bytes). Signs ONLY the keeper's fee
+    /// input for merchant captures. `None` disables the auto-capture keeper.
+    pub keeper_fee_secret_hex: Option<String>,
+    /// Kasway ARBITER secret key (hex, 32 bytes). Used only in the transitional
+    /// 1-of-1 panel (see `arbiter_panel_hex`): if no independent panel is
+    /// configured, the covenant's arbiter panel is `[this pubkey]` with threshold
+    /// 1, and the secret signs dispute rulings server-side. Configure a real
+    /// `arbiter_panel_hex` to take Kasway out of the decider seat.
+    pub arbiter_secret_hex: Option<String>,
+    /// EscrowV2 M-of-N arbiter PANEL: independent arbiter x-only pubkeys (32-byte
+    /// hex), consented to at funding. When empty, the covenant falls back to a
+    /// 1-of-1 panel = `[arbiter_secret's pubkey]` (behaviour-preserving during
+    /// migration). Kasway's key SHOULD NOT be in a real panel.
+    pub arbiter_panel_hex: Vec<String>,
+    /// M in the M-of-N arbiter threshold. Clamped to `1..=panel.len()`.
+    pub arbiter_threshold: u32,
+}
+
+impl Default for CovenantConfig {
+    fn default() -> Self {
+        Self {
+            capture_window_secs: 1800,
+            keeper_min_fee_sompi: 2_000_000,
+            keeper_fee_secret_hex: None,
+            arbiter_secret_hex: None,
+            arbiter_panel_hex: Vec::new(),
+            arbiter_threshold: 1,
         }
     }
 }
@@ -105,11 +148,6 @@ impl AppConfig {
                 kpr1.platform_fee_address = v;
             }
         }
-        if let Ok(v) = std::env::var("KPR1_COVENANT_PAYMENT_MODE") {
-            if !v.is_empty() {
-                kpr1.payment_mode = v;
-            }
-        }
         if let Ok(v) = std::env::var("APP_URL") {
             if !v.is_empty() {
                 kpr1.app_url = v;
@@ -119,6 +157,23 @@ impl AppConfig {
             if !v.is_empty() {
                 kpr1.app_name = v;
             }
+        }
+        let mut covenant = CovenantConfig::default();
+        if let Ok(v) = std::env::var("COVENANT_CAPTURE_WINDOW_SECS") {
+            if let Ok(n) = v.parse() { covenant.capture_window_secs = n; }
+        }
+        if let Ok(v) = std::env::var("COVENANT_KEEPER_MIN_FEE_SOMPI") {
+            if let Ok(n) = v.parse() { covenant.keeper_min_fee_sompi = n; }
+        }
+        covenant.keeper_fee_secret_hex = std::env::var("COVENANT_KEEPER_FEE_SECRET").ok().filter(|s| !s.is_empty());
+        covenant.arbiter_secret_hex = std::env::var("COVENANT_ARBITER_SECRET").ok().filter(|s| !s.is_empty());
+        // Comma-separated 32-byte pubkey hex list for the M-of-N arbiter panel.
+        covenant.arbiter_panel_hex = std::env::var("COVENANT_ARBITER_PANEL")
+            .ok()
+            .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+            .unwrap_or_default();
+        if let Ok(v) = std::env::var("COVENANT_ARBITER_THRESHOLD") {
+            if let Ok(n) = v.parse() { covenant.arbiter_threshold = n; }
         }
         let mut google = GoogleConfig::default();
         if let Ok(v) = std::env::var("GOOGLE_CLIENT_ID") { google.client_id = v; }
@@ -130,6 +185,7 @@ impl AppConfig {
             turnstile_secret: std::env::var("TURNSTILE_SECRET").ok().filter(|s| !s.is_empty()),
             node_env: std::env::var("NODE_ENV").unwrap_or_else(|_| "development".to_string()),
             kpr1,
+            covenant,
             google,
             price_api_url: std::env::var("PRICE_API_URL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "https://api.coingecko.com/api/v3/simple/price".to_string()),
         }
@@ -142,6 +198,7 @@ impl AppConfig {
             turnstile_secret: None,
             node_env: "test".to_string(),
             kpr1: Kpr1Config::default(),
+            covenant: CovenantConfig::default(),
             google: GoogleConfig::default(),
             price_api_url: "https://api.coingecko.com/api/v3/simple/price".to_string(),
         }

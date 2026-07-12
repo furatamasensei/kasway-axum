@@ -1,6 +1,15 @@
-//! Chain observer (`kasway_api::chain_observer`): txid-driven on-chain
-//! verification of wallet-submitted KPR-1 payments. Ticks are driven directly
-//! with an in-memory `ChainSource`; no polling loop, no real node.
+//! Chain observer (`kasway_api::chain_observer`): covenant funding verification.
+//! Each tick picks up finalized KPR-1 covenant intents (`covenant_address` set,
+//! `covenant_state = 'awaiting_funding'`, invoice open, wallet `tx_id` recorded),
+//! asks the [`ChainSource`] for that tx's outputs to the covenant address, and:
+//!  - funded `== gross` + enough confirmations -> `covenant_state = 'funded'`
+//!    (the invoice stays OPEN; the keeper releases/settles later),
+//!  - funded `== gross` but too few confirmations -> observed + verified, keeps
+//!    waiting (still `awaiting_funding`),
+//!  - funded `!= gross` (under/overfund) -> FAIL CLOSED: intent `failed` with a
+//!    stable reason + a critical anomaly signal; the invoice is never funded.
+//! Ticks are driven directly with an in-memory `ChainSource`; no polling loop,
+//! no real node.
 
 mod common;
 
@@ -10,10 +19,21 @@ use std::sync::Mutex;
 
 use kasway_api::chain_observer;
 use kasway_api::chain_source::{ChainSource, ChainSourceError, ObservedOutput, ObservedTransaction};
+use kasway_api::state::AppConfig;
 use serde_json::{json, Value};
 
-/// Merchant payout address seeded into the Setup (drives merchant_net output).
-const MERCHANT_ADDR: &str = "kaspatest:merchantpayout00001";
+// Valid schnorr P2PK testnet-10 addresses (covenant `Destination::parse` rejects
+// placeholders). The arbiter pubkey baked into the covenant comes from
+// `ARBITER_SECRET`; the fee/merchant/customer addresses are independent P2PK keys.
+const MERCHANT_ADDR: &str = "kaspatest:qprx6l72u437tjcf5rgcwza4sq6ysprp0pu6zj2feu3zshcm4cljwrzqrunpu";
+const PLATFORM_FEE_ADDR: &str = "kaspatest:qqkqkl8e2vj2qlg98x9jgqt5msxzhezym943tx4xclmmrengdqyeznn0pna8v";
+const CUSTOMER_REFUND: &str = "kaspatest:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc655cyvcmd3";
+const ARBITER_SECRET: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+// A 5-TKAS invoice: with the default 1% platform fee the covenant pays
+// merchant_net 495_000_000 + kasway_fee 5_000_000, keeping the release's KIP-9
+// storage mass (~202k) under the 500_000 consensus cap so it can actually settle.
+const INVOICE_UNIT_AMOUNT: &str = "500000000";
 
 // ---------- mock chain source ----------
 
@@ -64,9 +84,21 @@ impl ChainSource for MockChain {
 
 // ---------- fixtures ----------
 
-/// Register a merchant with a store + Kaspa setup and create an open invoice
-/// via the API (mints a real KPR-1 intent). Returns (token, user_id, invoice).
-async fn setup_invoice(app: &common::TestApp, email: &str) -> (String, i64, Value) {
+/// Spawn a test app whose config has the covenant arbiter key + a valid platform
+/// fee payout address, so `finalize_covenant_for_invoice` can derive a covenant.
+fn covenant_config(cfg: &mut AppConfig) {
+    cfg.covenant.arbiter_secret_hex = Some(ARBITER_SECRET.to_string());
+    cfg.kpr1.platform_fee_address = PLATFORM_FEE_ADDR.to_string();
+}
+
+async fn spawn_covenant_app() -> common::TestApp {
+    common::spawn_with_config(covenant_config, false).await
+}
+
+/// Register a merchant, create an open invoice via the API (mints a covenant
+/// intent), then finalize the covenant (the payer supplies a refund address).
+/// Returns (token, user_id, invoice, covenant_address, gross_sompi).
+async fn setup_finalized_intent(app: &common::TestApp, email: &str) -> (String, i64, Value, String, i64) {
     let token = common::register_merchant(app, email, "secret123").await;
     let user_id = common::merchant_user_id(&app.db, email).await;
     let store_id = common::seed_default_store(&app.db, user_id).await;
@@ -76,31 +108,38 @@ async fn setup_invoice(app: &common::TestApp, email: &str) -> (String, i64, Valu
         .client
         .post(app.url("/api/invoices"))
         .bearer_auth(&token)
-        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "100000000" }] }))
+        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": INVOICE_UNIT_AMOUNT }] }))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), 200, "invoice create should succeed");
     let invoice: Value = res.json().await.unwrap();
-    (token, user_id, invoice)
+    let invoice_id = invoice["id"].as_i64().unwrap();
+    let public_id = invoice["publicId"].as_str().unwrap();
+
+    // Finalize the covenant: derives the P2SH address the payer funds and moves
+    // the intent to `awaiting_funding`.
+    kasway_api::kpr1::finalize_covenant_for_invoice(&app.state, public_id, CUSTOMER_REFUND)
+        .await
+        .expect("covenant finalize should succeed");
+
+    let (cov_addr, gross): (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT covenant_address, gross_amount FROM kpr1_payment_intents WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(&app.db.pool)
+    .await
+    .unwrap();
+    (
+        token,
+        user_id,
+        invoice,
+        cov_addr.expect("covenant address set after finalize"),
+        gross.expect("gross set at mint"),
+    )
 }
 
-/// The intent's required outputs as (address, amount sompi) pairs.
-fn required_outputs(invoice: &Value) -> Vec<(String, u64)> {
-    invoice["requiredOutputs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|o| {
-            (
-                o["address"].as_str().unwrap().to_string(),
-                o["amountSompi"].as_str().unwrap().parse().unwrap(),
-            )
-        })
-        .collect()
-}
-
-/// Wallet submits the tx id for the invoice's intent (public checkout).
+/// Wallet submits the funding tx id for the invoice's intent (public checkout).
 async fn submit_tx(app: &common::TestApp, public_id: &str, tx_id: &str) {
     let res = app
         .client
@@ -136,11 +175,10 @@ async fn invoice_row(app: &common::TestApp, id: i64) -> (String, Option<String>)
         .unwrap()
 }
 
-type IntentRow = (String, Option<String>, Option<String>, Option<String>);
-
-async fn intent_row(app: &common::TestApp, invoice_id: i64) -> IntentRow {
+/// (intent status, verification_status, failure_reason, covenant_state).
+async fn intent_row(app: &common::TestApp, invoice_id: i64) -> (String, Option<String>, Option<String>, String) {
     sqlx::query_as(
-        "SELECT status, verification_status, failure_reason, settled_at \
+        "SELECT status, verification_status, failure_reason, covenant_state \
          FROM kpr1_payment_intents WHERE invoice_id = $1",
     )
     .bind(invoice_id)
@@ -162,105 +200,65 @@ async fn observation_rows(app: &common::TestApp, invoice_id: i64) -> Vec<Observa
     .unwrap()
 }
 
+async fn count(app: &common::TestApp, sql: &str, id: i64) -> i64 {
+    sqlx::query_scalar(sql).bind(id).fetch_one(&app.db.pool).await.unwrap()
+}
+
 // ---------- tests ----------
 
-// Happy path: submitted -> observed with enough confirmations -> settled in
-// one tick: observation row, confirmed payment, invoice paid, invoice.paid
-// event + pending delivery, checkpoint updated. Second tick is a no-op.
+// Covenant funded with EXACTLY gross + enough confirmations: the observer marks
+// it `funded` and records a settled observation, but the invoice stays OPEN and
+// NO payment/`invoice.paid` is produced — that is the keeper's job on release.
+// A second tick is a no-op (funded is terminal for the observer).
 #[tokio::test]
-async fn observed_payment_with_enough_confirmations_pays_invoice() {
-    let app = common::spawn_app().await;
-    let (token, user_id, invoice) = setup_invoice(&app, "chain1@example.com").await;
+async fn covenant_funded_and_confirmed_marks_funded() {
+    let app = spawn_covenant_app().await;
+    let (token, user_id, invoice, cov_addr, gross) =
+        setup_finalized_intent(&app, "chain1@example.com").await;
     let invoice_id = invoice["id"].as_i64().unwrap();
     let public_id = invoice["publicId"].as_str().unwrap();
-    let endpoint_id = subscribe_invoice_paid(&app, &token).await;
+    let _endpoint_id = subscribe_invoice_paid(&app, &token).await;
 
     let tx_id = "ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34ab12cd34";
     submit_tx(&app, public_id, tx_id).await;
 
     let chain = MockChain::default();
-    chain.set_tx(tx_id, required_outputs(&invoice), Some(1_000));
+    chain.set_tx(tx_id, vec![(cov_addr.clone(), gross as u64)], Some(1_000));
     chain.set_virtual_daa(1_015); // 15 confirmations >= platform default 10
 
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
     assert_eq!(progressed, 1);
 
-    // invoice paid
+    // Invoice stays OPEN — the keeper releases the split and only then pays it.
     let (status, paid_at) = invoice_row(&app, invoice_id).await;
-    assert_eq!(status, "paid");
-    assert!(paid_at.is_some());
+    assert_eq!(status, "open");
+    assert!(paid_at.is_none());
 
-    // confirmed payment row for the full amount
-    let payments: Vec<(String, i64, Option<String>)> =
-        sqlx::query_as("SELECT status, amount, metadata FROM payments WHERE invoice_id = $1")
-            .bind(invoice_id)
-            .fetch_all(&app.db.pool)
-            .await
-            .unwrap();
-    assert_eq!(payments.len(), 1);
-    assert_eq!(payments[0].0, "confirmed");
-    assert_eq!(payments[0].1, 100_000_000);
-    let payment_meta: Value = serde_json::from_str(payments[0].2.as_deref().unwrap()).unwrap();
-    assert_eq!(payment_meta["source"], "chain_observer");
-    assert_eq!(payment_meta["txId"], tx_id);
-
-    // observation row settled with the observed facts + kpr1 metadata
-    let observations = observation_rows(&app, invoice_id).await;
-    assert_eq!(observations.len(), 1);
-    let (obs_status, amount, confirmations, obs_tx, block_daa, metadata) = &observations[0];
-    assert_eq!(obs_status, "settled");
-    assert_eq!(*amount, 100_000_000);
-    assert_eq!(*confirmations, 15);
-    assert_eq!(obs_tx.as_deref(), Some(tx_id));
-    assert_eq!(*block_daa, Some(1_000));
-    let meta: Value = serde_json::from_str(metadata.as_deref().unwrap()).unwrap();
-    assert_eq!(meta["kpr1"]["intentId"], invoice["kpr1PaymentIntent"]["intentId"]);
-    let meta_outputs = meta["kpr1"]["outputs"].as_array().unwrap();
-    assert_eq!(meta_outputs.len(), 2);
-    assert!(meta_outputs.iter().any(|o| o["role"] == "merchant_net"));
-    assert!(meta_outputs.iter().any(|o| o["role"] == "kasway_fee"));
-
-    // intent settled + verified
-    let (intent_status, verification_status, failure_reason, settled_at) =
+    // Intent funded + verified; no failure.
+    let (intent_status, verification_status, failure_reason, covenant_state) =
         intent_row(&app, invoice_id).await;
-    assert_eq!(intent_status, "settled");
+    assert_eq!(covenant_state, "funded");
+    assert_eq!(intent_status, "verified");
     assert_eq!(verification_status.as_deref(), Some("verified"));
     assert!(failure_reason.is_none());
-    assert!(settled_at.is_some());
 
-    // invoice.paid event + pending delivery for the subscribed endpoint
-    let events: Vec<(i64, String, String, String)> = sqlx::query_as(
-        "SELECT id, event_type, resource_type, resource_id FROM webhook_events WHERE user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_all(&app.db.pool)
-    .await
-    .unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].1, "invoice.paid");
-    assert_eq!(events[0].2, "invoice");
-    assert_eq!(events[0].3, public_id);
-    let deliveries: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT webhook_endpoint_id, status FROM webhook_deliveries WHERE webhook_event_id = $1",
-    )
-    .bind(events[0].0)
-    .fetch_all(&app.db.pool)
-    .await
-    .unwrap();
-    assert_eq!(deliveries, vec![(endpoint_id, "pending".to_string())]);
+    // Observation settled with the covenant funding output.
+    let observations = observation_rows(&app, invoice_id).await;
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].0, "settled");
+    assert_eq!(observations[0].1, gross);
+    assert_eq!(observations[0].2, 15);
+    let meta: Value = serde_json::from_str(observations[0].5.as_deref().unwrap()).unwrap();
+    let meta_outputs = meta["kpr1"]["outputs"].as_array().unwrap();
+    assert_eq!(meta_outputs.len(), 1);
+    assert_eq!(meta_outputs[0]["role"], "covenant");
+    assert_eq!(meta_outputs[0]["address"], cov_addr);
 
-    // event payload is the serialized paid invoice
-    let payload: String =
-        sqlx::query_scalar("SELECT payload FROM webhook_events WHERE id = $1")
-            .bind(events[0].0)
-            .fetch_one(&app.db.pool)
-            .await
-            .unwrap();
-    let payload: Value = serde_json::from_str(&payload).unwrap();
-    assert_eq!(payload["status"], "paid");
-    assert_eq!(payload["publicId"], public_id);
+    // No payment row, no invoice.paid event yet (keeper produces those on release).
+    assert_eq!(count(&app, "SELECT COUNT(*) FROM payments WHERE invoice_id = $1", invoice_id).await, 0);
+    assert_eq!(count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1", user_id).await, 0);
 
-    // observer checkpoint tracks the virtual DAA score
+    // Checkpoint tracks the virtual DAA score.
     let checkpoint: Option<String> = sqlx::query_scalar(
         "SELECT checkpoint FROM payment_indexer_checkpoints \
          WHERE network = 'tn10' AND asset_id = 'KAS' AND source = 'chain_observer'",
@@ -270,18 +268,19 @@ async fn observed_payment_with_enough_confirmations_pays_invoice() {
     .unwrap();
     assert_eq!(checkpoint.as_deref(), Some("1015"));
 
-    // settled intent is terminal: the next tick has nothing to do
+    // Funded intent is terminal for the observer: next tick does nothing.
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
     assert_eq!(progressed, 0);
 }
 
-// Insufficient confirmations: observation is recorded and the intent is
-// verified, but the invoice stays open until the policy is met — then a later
-// tick settles by updating the same observation row.
+// Funded == gross but too few confirmations: observed + verified, still
+// `awaiting_funding`; when confirmations catch up a later tick marks it funded,
+// updating (not duplicating) the same observation row.
 #[tokio::test]
-async fn insufficient_confirmations_stay_pending_until_policy_met() {
-    let app = common::spawn_app().await;
-    let (_token, user_id, invoice) = setup_invoice(&app, "chain2@example.com").await;
+async fn insufficient_confirmations_stay_awaiting_until_policy_met() {
+    let app = spawn_covenant_app().await;
+    let (_token, user_id, invoice, cov_addr, gross) =
+        setup_finalized_intent(&app, "chain2@example.com").await;
     let invoice_id = invoice["id"].as_i64().unwrap();
     let public_id = invoice["publicId"].as_str().unwrap();
 
@@ -289,68 +288,50 @@ async fn insufficient_confirmations_stay_pending_until_policy_met() {
     submit_tx(&app, public_id, tx_id).await;
 
     let chain = MockChain::default();
-    chain.set_tx(tx_id, required_outputs(&invoice), Some(2_000));
+    chain.set_tx(tx_id, vec![(cov_addr.clone(), gross as u64)], Some(2_000));
     chain.set_virtual_daa(2_003); // 3 confirmations < platform default 10
 
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
     assert_eq!(progressed, 1);
 
-    // invoice still open, no payment yet, no invoice.paid event
-    let (status, paid_at) = invoice_row(&app, invoice_id).await;
+    // Not yet funded; invoice open; no event.
+    let (status, _) = invoice_row(&app, invoice_id).await;
     assert_eq!(status, "open");
-    assert!(paid_at.is_none());
-    let payment_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE invoice_id = $1")
-            .bind(invoice_id)
-            .fetch_one(&app.db.pool)
-            .await
-            .unwrap();
-    assert_eq!(payment_count, 0);
-    let event_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_events WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&app.db.pool)
-            .await
-            .unwrap();
-    assert_eq!(event_count, 0);
+    let (_, verification_status, _, covenant_state) = intent_row(&app, invoice_id).await;
+    assert_eq!(covenant_state, "awaiting_funding");
+    assert_eq!(verification_status.as_deref(), Some("verified"));
+    assert_eq!(count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1", user_id).await, 0);
 
-    // observation matched with 3 confirmations; intent verified, not settled
     let observations = observation_rows(&app, invoice_id).await;
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].0, "matched");
     assert_eq!(observations[0].2, 3);
-    let (intent_status, verification_status, _, settled_at) = intent_row(&app, invoice_id).await;
-    assert_eq!(intent_status, "verified");
-    assert_eq!(verification_status.as_deref(), Some("verified"));
-    assert!(settled_at.is_none());
 
-    // confirmations catch up -> the same observation row settles the invoice
+    // Confirmations catch up -> same observation row settles, covenant funded.
     chain.set_virtual_daa(2_012);
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
     assert_eq!(progressed, 1);
 
-    let (status, _) = invoice_row(&app, invoice_id).await;
-    assert_eq!(status, "paid");
+    let (_, _, _, covenant_state) = intent_row(&app, invoice_id).await;
+    assert_eq!(covenant_state, "funded");
     let observations = observation_rows(&app, invoice_id).await;
     assert_eq!(observations.len(), 1, "observation row is updated, not duplicated");
     assert_eq!(observations[0].0, "settled");
     assert_eq!(observations[0].2, 12);
-    let event_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_events WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&app.db.pool)
-            .await
-            .unwrap();
-    assert_eq!(event_count, 1);
+    // Still the keeper's job to pay: no invoice.paid from the observer.
+    let (status, _) = invoice_row(&app, invoice_id).await;
+    assert_eq!(status, "open");
+    assert_eq!(count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1", user_id).await, 0);
 }
 
-// Wrong amount on a required output: fail closed — intent failed with a
-// stable reason + anomaly signal, invoice NOT paid, no event. The failed
-// intent is terminal for the observer.
+// Underfunded covenant (gross - 1): fail closed — intent failed with
+// `covenant_underfunded`, a critical anomaly signal, invoice never funded. The
+// failed intent is terminal (covenant_state = 'failed'): no re-observation.
 #[tokio::test]
-async fn output_amount_mismatch_fails_closed() {
-    let app = common::spawn_app().await;
-    let (_token, user_id, invoice) = setup_invoice(&app, "chain3@example.com").await;
+async fn underfunded_covenant_fails_closed() {
+    let app = spawn_covenant_app().await;
+    let (_token, user_id, invoice, cov_addr, gross) =
+        setup_finalized_intent(&app, "chain3@example.com").await;
     let invoice_id = invoice["id"].as_i64().unwrap();
     let public_id = invoice["publicId"].as_str().unwrap();
     let intent_id = invoice["kpr1PaymentIntent"]["intentId"].as_str().unwrap();
@@ -358,47 +339,29 @@ async fn output_amount_mismatch_fails_closed() {
     let tx_id = "cc56aa78cc56aa78cc56aa78cc56aa78cc56aa78cc56aa78cc56aa78cc56aa78";
     submit_tx(&app, public_id, tx_id).await;
 
-    // merchant_net output short by 1 sompi; fee output correct
-    let mut outputs = required_outputs(&invoice);
-    let merchant = outputs.iter_mut().find(|(a, _)| a == MERCHANT_ADDR).unwrap();
-    merchant.1 -= 1;
-
     let chain = MockChain::default();
-    chain.set_tx(tx_id, outputs, Some(3_000));
+    chain.set_tx(tx_id, vec![(cov_addr.clone(), gross as u64 - 1)], Some(3_000));
     chain.set_virtual_daa(3_050); // plenty of confirmations — must still fail
 
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
     assert_eq!(progressed, 1);
 
-    // invoice NOT paid, no payment, no invoice.paid event
     let (status, paid_at) = invoice_row(&app, invoice_id).await;
     assert_eq!(status, "open");
     assert!(paid_at.is_none());
-    let payment_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE invoice_id = $1")
-            .bind(invoice_id)
-            .fetch_one(&app.db.pool)
-            .await
-            .unwrap();
-    assert_eq!(payment_count, 0);
-    let event_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM webhook_events WHERE user_id = $1")
-            .bind(user_id)
-            .fetch_one(&app.db.pool)
-            .await
-            .unwrap();
-    assert_eq!(event_count, 0);
+    assert_eq!(count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1", user_id).await, 0);
 
-    // intent failed with the stable reason; discrepancy recorded
-    let (intent_status, verification_status, failure_reason, _) = intent_row(&app, invoice_id).await;
+    let (intent_status, verification_status, failure_reason, covenant_state) =
+        intent_row(&app, invoice_id).await;
     assert_eq!(intent_status, "failed");
     assert_eq!(verification_status.as_deref(), Some("failed"));
-    assert_eq!(failure_reason.as_deref(), Some("amount_mismatch"));
+    assert_eq!(failure_reason.as_deref(), Some("covenant_underfunded"));
+    assert_eq!(covenant_state, "failed");
     let observations = observation_rows(&app, invoice_id).await;
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].0, "mismatched");
 
-    // anomaly signal records the discrepancy against the intent
+    // Critical anomaly signal recorded against the intent.
     let anomalies: Vec<(String, String, String, String, String)> = sqlx::query_as(
         "SELECT signal_type, severity, status, resource_type, resource_id \
          FROM payment_anomaly_signals WHERE user_id = $1",
@@ -413,30 +376,29 @@ async fn output_amount_mismatch_fails_closed() {
     assert_eq!(anomalies[0].3, "kpr1_payment_intent");
     assert_eq!(anomalies[0].4, intent_id);
 
-    // failed intent is terminal: nothing to do next tick
+    // Terminal: next tick does nothing (no duplicate anomaly).
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
     assert_eq!(progressed, 0);
+    assert_eq!(
+        count(&app, "SELECT COUNT(*) FROM payment_anomaly_signals WHERE user_id = $1", user_id).await,
+        1
+    );
 }
 
-// Missing required fee output: fail closed with the role-specific reason.
+// Overfunded covenant (gross + 1): fail closed with `covenant_overfunded`.
 #[tokio::test]
-async fn missing_fee_output_fails_closed() {
-    let app = common::spawn_app().await;
-    let (_token, _user_id, invoice) = setup_invoice(&app, "chain4@example.com").await;
+async fn overfunded_covenant_fails_closed() {
+    let app = spawn_covenant_app().await;
+    let (_token, _user_id, invoice, cov_addr, gross) =
+        setup_finalized_intent(&app, "chain4@example.com").await;
     let invoice_id = invoice["id"].as_i64().unwrap();
     let public_id = invoice["publicId"].as_str().unwrap();
 
     let tx_id = "dd78bb90dd78bb90dd78bb90dd78bb90dd78bb90dd78bb90dd78bb90dd78bb90";
     submit_tx(&app, public_id, tx_id).await;
 
-    // only the merchant output is present — the kasway_fee output is missing
-    let outputs: Vec<(String, u64)> = required_outputs(&invoice)
-        .into_iter()
-        .filter(|(a, _)| a == MERCHANT_ADDR)
-        .collect();
-
     let chain = MockChain::default();
-    chain.set_tx(tx_id, outputs, Some(4_000));
+    chain.set_tx(tx_id, vec![(cov_addr.clone(), gross as u64 + 1)], Some(4_000));
     chain.set_virtual_daa(4_050);
 
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
@@ -444,24 +406,27 @@ async fn missing_fee_output_fails_closed() {
 
     let (status, _) = invoice_row(&app, invoice_id).await;
     assert_eq!(status, "open");
-    let (intent_status, verification_status, failure_reason, _) = intent_row(&app, invoice_id).await;
+    let (intent_status, verification_status, failure_reason, covenant_state) =
+        intent_row(&app, invoice_id).await;
     assert_eq!(intent_status, "failed");
     assert_eq!(verification_status.as_deref(), Some("failed"));
-    assert_eq!(failure_reason.as_deref(), Some("missing_required_kasway_fee_output"));
+    assert_eq!(failure_reason.as_deref(), Some("covenant_overfunded"));
+    assert_eq!(covenant_state, "failed");
 }
 
-// Unobserved tx: nothing changes, the intent keeps waiting.
+// Unobserved tx: nothing on chain yet -> no progress, intent keeps waiting.
 #[tokio::test]
 async fn unobserved_tx_keeps_waiting() {
-    let app = common::spawn_app().await;
-    let (_token, _user_id, invoice) = setup_invoice(&app, "chain5@example.com").await;
+    let app = spawn_covenant_app().await;
+    let (_token, _user_id, invoice, _cov_addr, _gross) =
+        setup_finalized_intent(&app, "chain5@example.com").await;
     let invoice_id = invoice["id"].as_i64().unwrap();
     let public_id = invoice["publicId"].as_str().unwrap();
 
     let tx_id = "ee90cc12ee90cc12ee90cc12ee90cc12ee90cc12ee90cc12ee90cc12ee90cc12";
     submit_tx(&app, public_id, tx_id).await;
 
-    let chain = MockChain::default(); // knows no transactions
+    let chain = MockChain::default(); // tx not registered — not visible on chain
     chain.set_virtual_daa(5_000);
 
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
@@ -469,30 +434,7 @@ async fn unobserved_tx_keeps_waiting() {
 
     let (status, _) = invoice_row(&app, invoice_id).await;
     assert_eq!(status, "open");
-    let (intent_status, verification_status, _, _) = intent_row(&app, invoice_id).await;
-    assert_eq!(intent_status, "submitted");
-    assert!(verification_status.is_none());
+    let (_, _, _, covenant_state) = intent_row(&app, invoice_id).await;
+    assert_eq!(covenant_state, "awaiting_funding");
     assert!(observation_rows(&app, invoice_id).await.is_empty());
-}
-
-// Env gate: default off without KASPA_NODE_URL, on with it, and
-// CHAIN_OBSERVER_ENABLED overrides in both directions.
-#[tokio::test]
-async fn enabled_from_env_gate() {
-    // Only this test touches these env vars, so mutation is race-free.
-    std::env::remove_var("CHAIN_OBSERVER_ENABLED");
-    std::env::remove_var("KASPA_NODE_URL");
-    assert!(!chain_observer::enabled_from_env());
-
-    std::env::set_var("KASPA_NODE_URL", "ws://127.0.0.1:17210");
-    assert!(chain_observer::enabled_from_env());
-
-    std::env::set_var("CHAIN_OBSERVER_ENABLED", "0");
-    assert!(!chain_observer::enabled_from_env());
-
-    std::env::remove_var("KASPA_NODE_URL");
-    std::env::set_var("CHAIN_OBSERVER_ENABLED", "1");
-    assert!(chain_observer::enabled_from_env());
-
-    std::env::remove_var("CHAIN_OBSERVER_ENABLED");
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/kasway-db", "crates/kasway-api"]
+members = ["crates/kasway-db", "crates/kasway-api", "crates/kasway-covenant"]
 
 [workspace.package]
 edition = "2021"

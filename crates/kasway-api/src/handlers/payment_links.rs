@@ -14,7 +14,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 const FEE_DELEGATIONS: &[&str] = &["merchant_subsidized", "customer_pays"];
-const PAYMENT_MODES: &[&str] = &["address", "covenant"];
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct LinkRow {
@@ -29,7 +28,6 @@ pub(crate) struct LinkRow {
     payment_network: String,
     payment_asset: String,
     fee_delegation: String,
-    payment_mode: Option<String>,
     pricing_country_code: Option<String>,
     metadata: Option<String>,
     created_at: Option<String>,
@@ -37,7 +35,7 @@ pub(crate) struct LinkRow {
 }
 
 const LINK_COLS: &str = "id, user_id, store_id, public_id, status, title, amount, currency, \
-    payment_network, payment_asset, fee_delegation, payment_mode, pricing_country_code, \
+    payment_network, payment_asset, fee_delegation, pricing_country_code, \
     metadata, created_at, updated_at";
 
 #[derive(Deserialize, Default)]
@@ -66,7 +64,6 @@ fn serialize_link(link: &LinkRow, payments_count: Option<i64>) -> Value {
         "paymentNetwork": link.payment_network,
         "paymentAsset": link.payment_asset,
         "feeDelegation": link.fee_delegation,
-        "paymentMode": link.payment_mode,
         "pricingCountryCode": link.pricing_country_code,
         "metadata": metadata,
         "createdAt": link.created_at,
@@ -173,8 +170,8 @@ pub async fn store(
     let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO payment_links \
          (user_id, store_id, public_id, status, title, amount, currency, payment_network, \
-          payment_asset, fee_delegation, payment_mode, pricing_country_code, metadata, created_at, updated_at) \
-         VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) RETURNING id",
+          payment_asset, fee_delegation, pricing_country_code, metadata, created_at, updated_at) \
+         VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(store_id)
@@ -185,7 +182,6 @@ pub async fn store(
     .bind(&network)
     .bind(&asset)
     .bind(&fee_delegation)
-    .bind(&input.payment_mode)
     .bind(&input.customer_country_code)
     .bind(&metadata_str)
     .bind(&now)
@@ -347,9 +343,6 @@ pub(crate) async fn spawn_invoice_for_checkout(
         "metadata": metadata,
     });
     if let Value::Object(map) = &mut body {
-        if let Some(mode) = &link.payment_mode {
-            map.insert("paymentMode".into(), json!(mode));
-        }
         if let Some(cc) = &link.pricing_country_code {
             map.insert("customerCountryCode".into(), json!(cc));
         }
@@ -370,7 +363,6 @@ struct CreateLinkInput {
     payment_network: Option<String>,
     payment_asset: Option<String>,
     fee_delegation: Option<String>,
-    payment_mode: Option<String>,
     store_id: Option<i64>,
     customer_country_code: Option<String>,
 }
@@ -412,15 +404,6 @@ fn validate_create(body: &Value) -> AppResult<CreateLinkInput> {
             None
         }
     };
-    let payment_mode = match body.get("paymentMode") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) if PAYMENT_MODES.contains(&s.as_str()) => Some(s.clone()),
-        Some(_) => {
-            vpush(&mut errors, "paymentMode", "enum", "The selected paymentMode is invalid");
-            None
-        }
-    };
-
     if !errors.is_empty() {
         return Err(AppError::Validation(errors));
     }
@@ -434,7 +417,6 @@ fn validate_create(body: &Value) -> AppResult<CreateLinkInput> {
         payment_network: opt_string("paymentNetwork"),
         payment_asset: opt_string("paymentAsset"),
         fee_delegation,
-        payment_mode,
         store_id: body.get("storeId").and_then(|v| v.as_i64()),
         customer_country_code: opt_string("customerCountryCode").map(|s| s.to_uppercase()),
     })

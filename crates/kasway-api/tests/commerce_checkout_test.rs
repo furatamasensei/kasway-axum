@@ -15,7 +15,7 @@ async fn create_invoice(app: &common::TestApp, token: &str) -> Value {
     app.client
         .post(app.url("/api/invoices"))
         .bearer_auth(token)
-        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "1000" }] }))
+        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }] }))
         .send()
         .await
         .unwrap()
@@ -35,7 +35,7 @@ async fn commerce_store_returns_kpr1_contract() {
         .client
         .post(app.url("/api/commerce/invoices"))
         .bearer_auth(&token)
-        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "1000" }] }))
+        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }] }))
         .send()
         .await
         .unwrap();
@@ -101,8 +101,8 @@ async fn checkout_show_returns_status_and_state() {
     assert!(body.get("paymentAddress").is_none());
     // payment status baseline
     assert_eq!(body["paymentStatus"]["status"]["paymentState"], "awaiting_payment");
-    assert_eq!(body["paymentStatus"]["totals"]["invoice"], "1000");
-    assert_eq!(body["paymentStatus"]["totals"]["remaining"], "1000");
+    assert_eq!(body["paymentStatus"]["totals"]["invoice"], "500000000");
+    assert_eq!(body["paymentStatus"]["totals"]["remaining"], "500000000");
     assert_eq!(body["paymentStatus"]["finality"]["confirmationsRequired"], 10);
     // checkout state
     assert_eq!(body["checkoutState"]["state"], "awaiting_payment");

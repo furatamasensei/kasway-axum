@@ -1,0 +1,35 @@
+[package]
+name = "kasway-covenant"
+version = "0.0.0"
+edition = "2021"
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "kasway_covenant"
+path = "src/lib.rs"
+
+[dependencies]
+# SilverScript compiler — the ONLY source of covenant script bytes (no manual
+# opcode assembly anywhere in Kasway). Pinned to a fixed master commit.
+silverscript-lang = { git = "https://github.com/kaspanet/silverscript", rev = "77ebf01a381af79e9708705cf55a2186d5ea7275" }
+
+# Toccata rusty-kaspa (v2.0.1) — same tag SilverScript itself pins, so cargo
+# unifies the kaspa-* packages instead of duplicating them.
+kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }
+kaspa-hashes = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }
+kaspa-txscript = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }
+kaspa-txscript-errors = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }
+
+secp256k1 = { version = "0.29", features = ["global-context", "rand-std"] }
+thiserror = "2"
+serde_json = "1"
+
+[dev-dependencies]
+rand = "0.8"
+faster-hex = "0.10"
+kaspa-addresses = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }
+# Only used to assert `rpc_submit_params` matches kaspad's exact RpcTransaction
+# JSON model (the on-chain wire format), locally, without a live node.
+kaspa-rpc-core = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }

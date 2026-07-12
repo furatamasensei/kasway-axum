@@ -1,0 +1,81 @@
+pragma silverscript ^0.1.0;
+
+// Kasway Tier-3 jury dispute-escrow.
+//
+// When a dispute escalates to the community jury, the disputed principal is
+// re-locked into ONE instance of this covenant, parameterized with the drawn
+// committee and the two verdict digests. The committee's votes are 64-byte
+// BIP340 `datasig`s over the relevant verdict digest, verified in-script with
+// `checkSigFromStack` (they are NOT transaction sighashes). A threshold `K` of
+// the `N` committee members honors a verdict; with `K > N/2` at most one verdict
+// digest can reach `K` signatures, so the outcome is unique.
+//
+// The two verdict digests are baked as parameters (committed in the covenant
+// address). They are computed OFF-CHAIN and publicly:
+//   verdict_digest_merchant = H("KASWAY/escrow/v1/verdict" || dispute_id || 0x02 || evidence_root)
+//   verdict_digest_customer = H("KASWAY/escrow/v1/verdict" || dispute_id || 0x01 || evidence_root)
+// where H is sha256. Anyone can recompute and audit them from the published
+// dispute_id + evidence_root, so a malformed digest is detectable before funding.
+//
+// Kasway holds NONE of the committee keys and is not on the panel: it cannot
+// forge or alter a verdict.
+contract JuryEscrow(
+    byte[32][] payout_payloads,
+    int[] payout_kinds,
+    int[] payout_values,
+    int payout_count,
+    byte[32] customer_pubkey,
+    byte[32][] committee_pubkeys,
+    int committee_count,
+    int jury_threshold,
+    byte[32] verdict_digest_merchant,
+    byte[32] verdict_digest_customer,
+    int gross_amount
+) {
+    // Release to the merchant: exact ordered split, exact input value.
+    function assert_merchant_split() {
+        require(tx.inputs[this.activeInputIndex].value == gross_amount);
+        for (i, 0, payout_count, 8) {
+            byte[] spk = payout_kinds[i] == 0
+                ? byte[](new ScriptPubKeyP2PK(pubkey(payout_payloads[i])))
+                : byte[](new ScriptPubKeyP2SH(payout_payloads[i]));
+            require(tx.outputs[i].scriptPubKey == spk);
+            require(tx.outputs[i].value == payout_values[i]);
+        }
+    }
+
+    // Refund the full gross to the customer's P2PK output.
+    function assert_customer_refund() {
+        require(tx.inputs[this.activeInputIndex].value == gross_amount);
+        require(tx.outputs[0].scriptPubKey == byte[](new ScriptPubKeyP2PK(pubkey(customer_pubkey))));
+        require(tx.outputs[0].value == gross_amount);
+    }
+
+    // Verify a threshold of DISTINCT committee datasigs over `digest`. `signer_idx`
+    // are the committee indices of the signers, STRICTLY INCREASING (so one juror
+    // can never be counted twice), each in range.
+    function assert_jury_threshold(datasig[] sigs, int[] signer_idx, byte[32] digest) {
+        require(sigs.length == jury_threshold);
+        require(signer_idx.length == jury_threshold);
+        int prev = 0 - 1;
+        for (k, 0, jury_threshold, committee_count) {
+            int si = signer_idx[k];
+            require(si > prev);
+            require(si < committee_count);
+            require(checkSigFromStack(sigs[k], digest, pubkey(committee_pubkeys[si])));
+            prev = si;
+        }
+    }
+
+    // Jury rules for the merchant.
+    entrypoint function release_jury(datasig[] sigs, int[] signer_idx) {
+        assert_jury_threshold(sigs, signer_idx, verdict_digest_merchant);
+        assert_merchant_split();
+    }
+
+    // Jury rules for the customer.
+    entrypoint function refund_jury(datasig[] sigs, int[] signer_idx) {
+        assert_jury_threshold(sigs, signer_idx, verdict_digest_customer);
+        assert_customer_refund();
+    }
+}
