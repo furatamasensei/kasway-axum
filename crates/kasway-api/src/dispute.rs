@@ -199,6 +199,13 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Open a dispute for a funded intent: record the tier, evidence hashes and
 /// `evidence_root`, and move the intent to `disputed`. Returns the dispute id.
+///
+/// The `funded -> disputed` transition is guarded and atomic: the intent row is
+/// only moved when it is currently `funded`, and the dispute row is inserted in
+/// the same transaction. This prevents an unauthorized caller from (a) parking a
+/// pre-funding intent in `disputed` (which would blind the chain observer to a
+/// later deposit), (b) re-disputing an already settled/refunded/disputed intent,
+/// or (c) racing two opens into two dispute rows for one escrow.
 pub async fn open_dispute(
     state: &AppState,
     intent_id: i64,
@@ -208,6 +215,28 @@ pub async fn open_dispute(
 ) -> AppResult<i64> {
     let root = evidence_root(customer_hash, merchant_hash);
     let now = now_iso();
+
+    let mut tx = state.db.pool.begin().await.map_err(AppError::Database)?;
+
+    // Guarded, atomic transition. Only a currently-`funded` intent is disputable;
+    // the `WHERE covenant_state = 'funded'` clause both enforces the precondition
+    // and serializes concurrent opens (the loser matches 0 rows).
+    let moved = sqlx::query(
+        "UPDATE kpr1_payment_intents SET covenant_state = 'disputed', updated_at = $1 \
+         WHERE id = $2 AND covenant_state = 'funded'",
+    )
+    .bind(&now)
+    .bind(intent_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::Database)?;
+    if moved.rows_affected() != 1 {
+        return Err(AppError::commerce(
+            409,
+            "a dispute can only be opened on a funded escrow that is not already in dispute",
+        ));
+    }
+
     let rec = sqlx::query_scalar::<_, i64>(
         "INSERT INTO kpr1_disputes (intent_id, tier, state, evidence_customer_hash, evidence_merchant_hash, \
          evidence_root, opened_at, updated_at) VALUES ($1,$2,'open',$3,$4,$5,$6,$6) RETURNING id",
@@ -218,15 +247,11 @@ pub async fn open_dispute(
     .bind(hex(merchant_hash))
     .bind(hex(&root))
     .bind(&now)
-    .fetch_one(&state.db.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(AppError::Database)?;
-    sqlx::query("UPDATE kpr1_payment_intents SET covenant_state = 'disputed', updated_at = $1 WHERE id = $2")
-        .bind(&now)
-        .bind(intent_id)
-        .execute(&state.db.pool)
-        .await
-        .map_err(AppError::Database)?;
+
+    tx.commit().await.map_err(AppError::Database)?;
     Ok(rec)
 }
 
