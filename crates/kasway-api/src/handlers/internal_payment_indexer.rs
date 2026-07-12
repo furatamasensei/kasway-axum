@@ -4,6 +4,7 @@
 use crate::auth::InternalToken;
 use crate::error::AppResult;
 use crate::state::AppState;
+use crate::util::json_or_null;
 use axum::extract::State;
 use axum::Json;
 use serde::Serialize;
@@ -37,10 +38,7 @@ struct CheckpointDto {
 impl From<CheckpointRow> for CheckpointDto {
     fn from(r: CheckpointRow) -> Self {
         // metadata is jsonb in Postgres; Lucid hands back the parsed object.
-        let metadata = match r.metadata {
-            None => Value::Null,
-            Some(raw) => serde_json::from_str(&raw).unwrap_or(Value::Null),
-        };
+        let metadata = json_or_null(&r.metadata);
         CheckpointDto {
             id: r.id,
             network: r.network,

@@ -6,6 +6,7 @@
 use crate::auth_token;
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::util::constant_time_eq;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 
@@ -70,27 +71,11 @@ impl FromRequestParts<AppState> for InternalToken {
 
 /// `Authorization: Bearer <t>` takes precedence, else `x-internal-api-token`.
 fn extract_token(parts: &Parts) -> Option<String> {
-    if let Some(auth) = parts.headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(rest) = auth.strip_prefix("Bearer ") {
-            return Some(rest.trim().to_string());
-        }
-    }
-    parts
-        .headers
-        .get("x-internal-api-token")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_string())
-}
-
-/// Length-aware constant-time comparison, matching the middleware's
-/// `timingSafeEqual` guarded by an equal-length check.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    bearer_token(parts).or_else(|| {
+        parts
+            .headers
+            .get("x-internal-api-token")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+    })
 }

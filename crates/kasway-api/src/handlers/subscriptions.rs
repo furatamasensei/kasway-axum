@@ -6,11 +6,10 @@ use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::handlers::invoices;
 use crate::state::AppState;
-use crate::util::{now_iso, paginator_meta};
+use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, to_iso};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -21,19 +20,6 @@ pub struct PageQuery {
     page: Option<i64>,
     #[serde(rename = "perPage")]
     per_page: Option<i64>,
-}
-
-fn random_hex(n: usize) -> String {
-    let mut b = vec![0u8; n];
-    rand::thread_rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{:02x}", x)).collect()
-}
-
-fn json_or_null(raw: &Option<String>) -> Value {
-    match raw {
-        None => Value::Null,
-        Some(s) => serde_json::from_str(s).unwrap_or(Value::Null),
-    }
 }
 
 // ---------------- plans ----------------
@@ -135,7 +121,7 @@ pub async fn plans_store(auth: AuthMerchant, State(state): State<AppState>, Json
     let now = now_iso();
     let public_id = format!("plan_{}", random_hex(16));
 
-    let r = sqlx::query(
+    sqlx::query(
         "INSERT INTO subscription_plans (user_id, public_id, external_id, status, name, description, amount, currency, payment_network, payment_asset, interval_unit, interval_count, invoice_expires_after_seconds, metadata, created_at, updated_at) \
          VALUES ($1, $2, $3, 'active', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
@@ -150,7 +136,6 @@ pub async fn plans_store(auth: AuthMerchant, State(state): State<AppState>, Json
     .execute(&state.db.pool).await?;
 
     let plan = load_plan(&state, auth.user_id, &public_id).await?;
-    let _ = r;
     Ok((StatusCode::CREATED, Json(serialize_plan(&plan))))
 }
 
@@ -183,7 +168,7 @@ pub async fn plans_update(auth: AuthMerchant, State(state): State<AppState>, Pat
     }
     // amount: validate atomic format and i64 range instead of silently zeroing.
     if let Some(a) = body.get("amount").and_then(|v| v.as_str()) {
-        if !is_atomic_str(a) {
+        if !is_atomic_amount(a) {
             return Err(AppError::Validation(vec![ValidationFailure { message: "The amount field format is invalid".into(), rule: "regex".into(), field: "amount".into() }]));
         }
         let amt = parse_atomic_i64(a).ok_or_else(|| AppError::commerce(422, "amount exceeds maximum"))?;
@@ -314,13 +299,9 @@ fn req_string(body: &Value, key: &str, min: usize, max: usize, errors: &mut Vec<
     }
 }
 
-fn is_atomic_str(s: &str) -> bool {
-    s == "0" || (!s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()))
-}
-
 fn atomic_amount(body: &Value, key: &str, errors: &mut Vec<ValidationFailure>) -> Option<String> {
     match body.get(key) {
-        Some(Value::String(s)) if is_atomic_str(s) => Some(s.clone()),
+        Some(Value::String(s)) if is_atomic_amount(s) => Some(s.clone()),
         _ => { errors.push(ValidationFailure { message: format!("The {key} field format is invalid"), rule: "regex".into(), field: key.into() }); None }
     }
 }
@@ -488,10 +469,6 @@ fn add_interval(start: chrono::DateTime<chrono::Utc>, unit: &str, count: i64) ->
     }
 }
 
-fn iso(dt: chrono::DateTime<chrono::Utc>) -> String {
-    dt.format("%Y-%m-%dT%H:%M:%S%.3f+00:00").to_string()
-}
-
 /// generateInvoiceForCycle.
 async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, is_retry: bool) -> AppResult<i64> {
     let cycle = sqlx::query_as::<_, CycleRow>(&format!("SELECT {CYCLE_COLS} FROM subscription_cycles WHERE id = $1"))
@@ -511,7 +488,7 @@ async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, is_retry: b
     let snap: Value = serde_json::from_str(&sub.plan_snapshot).unwrap_or(json!({}));
     let attempt = cycle.attempt_count + 1;
     let expires_at = snap.get("invoiceExpiresAfterSeconds").and_then(|v| v.as_i64())
-        .map(|secs| iso(chrono::Utc::now() + chrono::Duration::seconds(secs)));
+        .map(|secs| to_iso(chrono::Utc::now() + chrono::Duration::seconds(secs)));
     let mut body = json!({
         "externalId": format!("{}:{}:{}", sub.public_id, cycle.public_id, attempt),
         "paymentNetwork": snap["paymentNetwork"],
@@ -543,8 +520,8 @@ async fn generate_due_invoice(state: &AppState, sub_id: i64, now: chrono::DateTi
     let count = snap["intervalCount"].as_i64().unwrap_or(1);
     let period_start = next;
     let period_end = add_interval(period_start, unit, count);
-    let ps = iso(period_start);
-    let pe = iso(period_end);
+    let ps = to_iso(period_start);
+    let pe = to_iso(period_end);
 
     let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_cycles WHERE subscription_id = $1 AND period_start = $2")
         .bind(sub.id).bind(&ps).fetch_optional(&state.db.pool).await?;
@@ -633,7 +610,7 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
     let public_id = format!("sub_{}", random_hex(16));
     let sub_id: i64 = sqlx::query_scalar::<_, i64>("INSERT INTO subscriptions (user_id, subscription_plan_id, subscription_customer_id, public_id, external_id, status, payment_mode, plan_snapshot, next_billing_at, metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, $10, $11) RETURNING id")
         .bind(auth.user_id).bind(plan.id).bind(customer_id).bind(&public_id).bind(&external_id).bind(&payment_mode)
-        .bind(snapshot.to_string()).bind(iso(starts_at)).bind(body.get("metadata").filter(|v| !v.is_null()).map(|m| m.to_string()))
+        .bind(snapshot.to_string()).bind(to_iso(starts_at)).bind(body.get("metadata").filter(|v| !v.is_null()).map(|m| m.to_string()))
         .bind(&now_s).bind(&now_s).fetch_one(&state.db.pool).await?;
 
     if starts_at <= now {
@@ -649,9 +626,9 @@ pub async fn subs_show(auth: AuthMerchant, State(state): State<AppState>, Path(p
     Ok(Json(serialize_subscription(&state, &sub, true).await?))
 }
 
-async fn set_sub_status(state: &AppState, user_id: i64, public_id: &str, set: impl FnOnce(&SubRow) -> Result<(String, String), AppError>) -> AppResult<Json<Value>> {
+async fn set_sub_status(state: &AppState, user_id: i64, public_id: &str, set: impl FnOnce(&SubRow) -> Result<String, AppError>) -> AppResult<Json<Value>> {
     let sub = load_subscription(state, user_id, public_id).await?;
-    let (sql_set, _) = set(&sub)?;
+    let sql_set = set(&sub)?;
     sqlx::query(&format!("UPDATE subscriptions SET {sql_set}, updated_at = $1 WHERE id = $2"))
         .bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
     let sub = load_subscription(state, user_id, public_id).await?;
@@ -661,7 +638,7 @@ async fn set_sub_status(state: &AppState, user_id: i64, public_id: &str, set: im
 pub async fn subs_pause(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
     set_sub_status(&state, auth.user_id, &public_id, |s| {
         if s.status == "cancelled" { return Err(AppError::commerce(422, "Cancelled subscriptions cannot be paused")); }
-        Ok((format!("status = 'paused', paused_at = '{}'", now_iso()), String::new()))
+        Ok(format!("status = 'paused', paused_at = '{}'", now_iso()))
     }).await
 }
 
@@ -669,7 +646,7 @@ pub async fn subs_resume(auth: AuthMerchant, State(state): State<AppState>, Path
     set_sub_status(&state, auth.user_id, &public_id, |s| {
         if s.status != "paused" { return Err(AppError::commerce(422, "Only paused subscriptions can be resumed")); }
         let nb = if s.next_billing_at.is_none() { format!(", next_billing_at = '{}'", now_iso()) } else { String::new() };
-        Ok((format!("status = 'active', paused_at = NULL{nb}"), String::new()))
+        Ok(format!("status = 'active', paused_at = NULL{nb}"))
     }).await
 }
 

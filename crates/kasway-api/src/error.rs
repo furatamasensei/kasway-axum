@@ -50,6 +50,16 @@ pub struct ValidationFailure {
     pub field: String,
 }
 
+impl ValidationFailure {
+    pub fn new(field: &str, rule: &str, message: &str) -> Self {
+        ValidationFailure {
+            message: message.to_string(),
+            rule: rule.to_string(),
+            field: field.to_string(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct MessageBody {
     message: String,
@@ -68,11 +78,12 @@ impl AppError {
 
     /// Single-field VineJS-shaped 422.
     pub fn validation_field(field: &str, rule: &str, message: &str) -> Self {
-        AppError::Validation(vec![ValidationFailure {
-            message: message.to_string(),
-            rule: rule.to_string(),
-            field: field.to_string(),
-        }])
+        AppError::Validation(vec![ValidationFailure::new(field, rule, message)])
+    }
+
+    /// 422 `{ message }` (CommerceError shape).
+    pub fn unprocessable(msg: impl Into<String>) -> Self {
+        AppError::commerce(422, msg.into())
     }
 
     pub fn bad_request(msg: impl Into<String>) -> Self {

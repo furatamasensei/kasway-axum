@@ -4,7 +4,7 @@
 //! the Adonis "compression failed → keep original size" path.
 
 use crate::auth::AuthMerchant;
-use crate::error::{AppError, AppResult, ValidationFailure};
+use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::util::now_iso;
 use axum::extract::{Multipart, Path, State};
@@ -52,10 +52,6 @@ fn serialize_media(m: &MediaRow) -> Value {
     })
 }
 
-fn vfail(field: &str, rule: &str, msg: &str) -> AppError {
-    AppError::Validation(vec![ValidationFailure { message: msg.into(), rule: rule.into(), field: field.into() }])
-}
-
 /// `POST /api/media` (merchant) — multipart upload.
 pub async fn store(
     auth: AuthMerchant,
@@ -66,7 +62,7 @@ pub async fn store(
     let mut file_ext: Option<String> = None;
     let (mut width, mut height, mut duration): (Option<i64>, Option<i64>, Option<i64>) = (None, None, None);
 
-    while let Some(field) = multipart.next_field().await.map_err(|_| vfail("file", "file", "Invalid multipart payload"))? {
+    while let Some(field) = multipart.next_field().await.map_err(|_| AppError::validation_field("file", "file", "Invalid multipart payload"))? {
         match field.name().map(|s| s.to_string()).as_deref() {
             Some("file") => {
                 let ext = field.file_name()
@@ -77,9 +73,9 @@ pub async fn store(
                 // MAX_SIZE so an oversized upload is never fully buffered.
                 let mut field = field;
                 let mut buf: Vec<u8> = Vec::new();
-                while let Some(chunk) = field.chunk().await.map_err(|_| vfail("file", "file", "Could not read uploaded file"))? {
+                while let Some(chunk) = field.chunk().await.map_err(|_| AppError::validation_field("file", "file", "Could not read uploaded file"))? {
                     if buf.len() + chunk.len() > MAX_SIZE {
-                        return Err(vfail("file", "size", "The file size must be under 100mb"));
+                        return Err(AppError::validation_field("file", "size", "The file size must be under 100mb"));
                     }
                     buf.extend_from_slice(&chunk);
                 }
@@ -92,13 +88,13 @@ pub async fn store(
         }
     }
 
-    let bytes = file_bytes.ok_or_else(|| vfail("file", "required", "The file field must be defined"))?;
+    let bytes = file_bytes.ok_or_else(|| AppError::validation_field("file", "required", "The file field must be defined"))?;
     if bytes.len() > MAX_SIZE {
-        return Err(vfail("file", "size", "The file size must be under 100mb"));
+        return Err(AppError::validation_field("file", "size", "The file size must be under 100mb"));
     }
     let ext = file_ext.filter(|e| !e.is_empty())
         .filter(|e| IMAGE_EXTENSIONS.contains(&e.as_str()) || VIDEO_EXTENSIONS.contains(&e.as_str()))
-        .ok_or_else(|| vfail("file", "extname", "The file must have one of the allowed extensions"))?;
+        .ok_or_else(|| AppError::validation_field("file", "extname", "The file must have one of the allowed extensions"))?;
 
     let is_image = IMAGE_EXTENSIONS.contains(&ext.as_str());
     let media_type = if is_image { "image" } else { "video" };
@@ -111,9 +107,9 @@ pub async fn store(
     // write to the filesystem storage disk
     let path = media_dir().join(&key);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| AppError::commerce(500, "Storage write failed"))?;
+        tokio::fs::create_dir_all(parent).await.map_err(|_| AppError::commerce(500, "Storage write failed"))?;
     }
-    std::fs::write(&path, &bytes).map_err(|_| AppError::commerce(500, "Storage write failed"))?;
+    tokio::fs::write(&path, &bytes).await.map_err(|_| AppError::commerce(500, "Storage write failed"))?;
 
     let now = now_iso();
     let id: i64 = sqlx::query_scalar::<_, i64>(
@@ -143,6 +139,6 @@ pub async fn destroy(
     };
     sqlx::query("DELETE FROM media WHERE id = $1").bind(id).execute(&state.db.pool).await?;
     // best-effort storage delete (@beforeDelete hook)
-    let _ = std::fs::remove_file(media_dir().join(&key));
+    let _ = tokio::fs::remove_file(media_dir().join(&key)).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

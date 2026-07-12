@@ -7,10 +7,9 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use crate::util::{constant_time_eq, now_iso};
+use crate::util::{constant_time_eq, now_iso, sha256_hex};
 
 pub struct TokenKind {
     pub table: &'static str,
@@ -27,12 +26,6 @@ pub const MERCHANT: TokenKind = TokenKind {
 pub struct Verified {
     pub tokenable_id: i64,
     pub token_id: i64,
-}
-
-fn sha256_hex(input: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// Create and persist a token for `tokenable_id`; returns the public value.

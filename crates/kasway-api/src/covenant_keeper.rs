@@ -21,7 +21,7 @@ use crate::handlers::{invoices, webhooks};
 use crate::kaspa_wrpc::KaspaWrpcClient;
 use crate::kpr1::parse_required_outputs;
 use crate::state::AppState;
-use crate::util::now_iso;
+use crate::util::{decode_hex, decode_hex32, encode_hex, now_iso};
 use kasway_covenant::escrow_v2::{
     compile_escrow_v2, complete_refund_by_arbiter, complete_refund_by_merchant, complete_release,
     complete_release_arbitrated, complete_settlement, prepare_refund_by_arbiter, prepare_release, prepare_settlement,
@@ -145,28 +145,9 @@ fn keeper_key(state: &AppState) -> Option<KeeperKey> {
     KeeperKey::from_secret_bytes(&bytes).ok()
 }
 
-fn decode_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
-/// The keeper's own error type for a single settlement (string-wrapped).
-#[derive(Debug)]
-struct KeeperError(String);
-impl std::fmt::Display for KeeperError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for KeeperError {}
+/// Box a message as the keeper's error for a single settlement (Display = the message).
 fn kerr(msg: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(KeeperError(msg.into()))
+    msg.into().into()
 }
 
 async fn settle_one(
@@ -187,14 +168,16 @@ async fn settle_one(
     let gross = params.gross_amount;
 
     // Locate the covenant funding UTXO (value == gross) and a keeper fee UTXO.
-    let cov_utxos = client.fetch_utxos(&covenant_addr).await.map_err(|e| kerr(e.to_string()))?;
+    // The two lookups are independent, so run them concurrently.
+    let keeper_address = keeper.address(prefix).to_string();
+    let (cov_utxos, fee_utxos) = tokio::join!(client.fetch_utxos(&covenant_addr), client.fetch_utxos(&keeper_address));
+    let cov_utxos = cov_utxos.map_err(|e| kerr(e.to_string()))?;
     let Some((cov_txid, cov_index, cov_value)) = cov_utxos.into_iter().find(|(_, _, v)| *v == gross) else {
         return Err(kerr("covenant funding UTXO not found yet"));
     };
-    let keeper_address = keeper.address(prefix).to_string();
     // Deterministic fee-UTXO pick (mirrors gather_release_inputs/gather_refund_inputs)
     // so concurrent settlements in one batch are less likely to collide on a UTXO.
-    let mut fee_utxos = client.fetch_utxos(&keeper_address).await.map_err(|e| kerr(e.to_string()))?;
+    let mut fee_utxos = fee_utxos.map_err(|e| kerr(e.to_string()))?;
     fee_utxos.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let Some((fee_txid, fee_index, fee_value)) = fee_utxos.into_iter().find(|(_, _, v)| *v > min_fee + 1) else {
         return Err(kerr(format!("no keeper fee UTXO > {min_fee} sompi at {keeper_address}")));
@@ -209,14 +192,8 @@ async fn settle_one(
         .map_err(|e| kerr(e.to_string()))?;
     let spend = complete_release(&compiled, draft, EP_RELEASE_CAPTURED, None).map_err(|e| kerr(e.to_string()))?;
     let tx_id = client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| kerr(e.to_string()))?;
-    let now = now_iso();
 
-    sqlx::query(
-        "UPDATE kpr1_payment_intents SET covenant_state = 'captured', status = 'settled', settled_at = COALESCE(settled_at, $1), release_tx_id = $2, updated_at = $1 WHERE id = $3",
-    )
-    .bind(&now).bind(&tx_id).bind(c.intent_pk).execute(&state.db.pool).await?;
-    sqlx::query("UPDATE invoices SET status = 'paid', paid_at = COALESCE(paid_at, $1), updated_at = $1 WHERE id = $2 AND status = 'open'")
-        .bind(&now).bind(c.invoice_id).execute(&state.db.pool).await?;
+    mark_settled_paid(state, c.intent_pk, c.invoice_id, "captured", &tx_id).await?;
     emit_invoice_event(state, c, "invoice.paid", &tx_id).await?;
 
     tracing::info!("covenant keeper: intent {} auto-captured to merchant via tx {tx_id}", c.intent_pk);
@@ -246,6 +223,34 @@ async fn invoice_payload(state: &AppState, invoice_id: i64) -> Option<serde_json
     Some(invoices::serialize_invoice(&inv, &items, intent.as_ref()))
 }
 
+/// Mark the intent settled (with its terminal `covenant_state`) and the invoice
+/// paid. Shared by every merchant-payout settlement path.
+async fn mark_settled_paid(
+    state: &AppState,
+    intent_pk: i64,
+    invoice_id: i64,
+    covenant_state: &str,
+    tx_id: &str,
+) -> Result<(), sqlx::Error> {
+    let now = now_iso();
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET covenant_state = $4, status = 'settled', \
+         settled_at = COALESCE(settled_at, $1), release_tx_id = $2, updated_at = $1 WHERE id = $3",
+    )
+    .bind(&now)
+    .bind(tx_id)
+    .bind(intent_pk)
+    .bind(covenant_state)
+    .execute(&state.db.pool)
+    .await?;
+    sqlx::query("UPDATE invoices SET status = 'paid', paid_at = COALESCE(paid_at, $1), updated_at = $1 WHERE id = $2 AND status = 'open'")
+        .bind(&now)
+        .bind(invoice_id)
+        .execute(&state.db.pool)
+        .await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Customer-driven release (merchant capture). release() needs the CUSTOMER's
 // signature, so it is a two-step checkout flow:
@@ -257,18 +262,7 @@ async fn invoice_payload(state: &AppState, invoice_id: i64) -> Option<serde_json
 // ---------------------------------------------------------------------------
 
 fn rerr(msg: impl AsRef<str>) -> AppError {
-    AppError::commerce(422, msg.as_ref())
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len() / 2).map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()).collect()
+    AppError::unprocessable(msg.as_ref())
 }
 
 /// Everything needed to (re)build a release spend for a funded covenant.
@@ -367,15 +361,18 @@ async fn gather_release_inputs(state: &AppState, client: &KaspaWrpcClient, publi
     }
     let gross = params.gross_amount;
 
-    let cov_utxos = client.fetch_utxos(&covenant_addr).await.map_err(|e| rerr(e.to_string()))?;
+    // The covenant and keeper fee lookups are independent; fetch them concurrently.
+    let keeper_address = keeper.address(prefix).to_string();
+    let (cov_utxos, fee_utxos) = tokio::join!(client.fetch_utxos(&covenant_addr), client.fetch_utxos(&keeper_address));
     let covenant_utxo = cov_utxos
+        .map_err(|e| rerr(e.to_string()))?
         .into_iter()
         .find(|(_, _, v)| *v == gross)
         .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
         .ok_or_else(|| rerr("covenant funding UTXO not visible yet"))?;
 
     // Deterministic fee-UTXO pick so prepare and submit build the identical tx.
-    let mut fee_utxos = client.fetch_utxos(&keeper.address(prefix).to_string()).await.map_err(|e| rerr(e.to_string()))?;
+    let mut fee_utxos = fee_utxos.map_err(|e| rerr(e.to_string()))?;
     fee_utxos.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let fee_utxo = fee_utxos
         .into_iter()
@@ -422,42 +419,23 @@ pub(crate) async fn customer_release_submit(state: &AppState, public_id: &str, s
     let ctx = gather_release_inputs(state, &client, public_id).await?;
 
     // Claim the row so a concurrent keeper refund can't race this release.
-    let claimed = sqlx::query(
-        "UPDATE kpr1_payment_intents SET covenant_state = 'releasing', updated_at = $1 WHERE id = $2 AND covenant_state = 'funded'",
-    )
-    .bind(now_iso())
-    .bind(ctx.intent_pk)
-    .execute(&state.db.pool)
-    .await
-    .map_err(AppError::Database)?;
-    if claimed.rows_affected() == 0 {
+    if !claim_funded(state, ctx.intent_pk, "releasing").await? {
         return Err(rerr("covenant is no longer awaiting release"));
     }
 
     let outcome = build_and_broadcast_release(&client, &ctx, &sig).await;
     match outcome {
         Ok(tx_id) => {
-            let now = now_iso();
-            sqlx::query(
-                "UPDATE kpr1_payment_intents SET covenant_state = 'released', status = 'settled', \
-                 settled_at = COALESCE(settled_at, $1), release_tx_id = $2, updated_at = $1 WHERE id = $3",
-            )
-            .bind(&now).bind(&tx_id).bind(ctx.intent_pk).execute(&state.db.pool).await.map_err(AppError::Database)?;
-            sqlx::query("UPDATE invoices SET status = 'paid', paid_at = COALESCE(paid_at, $1), updated_at = $1 WHERE id = $2 AND status = 'open'")
-                .bind(&now).bind(ctx.invoice_id).execute(&state.db.pool).await.map_err(AppError::Database)?;
-            let funded = Funded {
-                intent_pk: ctx.intent_pk, invoice_id: ctx.invoice_id, user_id: ctx.user_id, store_id: ctx.store_id,
-                public_id: ctx.public_id.clone(), network: String::new(), required_outputs: String::new(),
-                customer_refund_address: None, covenant_address: None, gross_amount: None, expiry_ts: None,
-                arbiter_panel_json: None, arbiter_threshold: None,
-            };
-            let _ = emit_invoice_event(state, &funded, "invoice.paid", &tx_id).await;
+            mark_settled_paid(state, ctx.intent_pk, ctx.invoice_id, "released", &tx_id)
+                .await
+                .map_err(AppError::Database)?;
+            let target = webhook_target(ctx.intent_pk, ctx.invoice_id, ctx.user_id, ctx.store_id, ctx.public_id.clone());
+            let _ = emit_invoice_event(state, &target, "invoice.paid", &tx_id).await;
             Ok(json!({ "released": true, "releaseTxId": tx_id, "invoiceStatus": "paid" }))
         }
         Err(e) => {
             // Release failed: return the claim so a later attempt (or expiry refund) can proceed.
-            let _ = sqlx::query("UPDATE kpr1_payment_intents SET covenant_state = 'funded', updated_at = $1 WHERE id = $2 AND covenant_state = 'releasing'")
-                .bind(now_iso()).bind(ctx.intent_pk).execute(&state.db.pool).await;
+            restore_funded(state, ctx.intent_pk, "releasing").await;
             Err(e)
         }
     }
@@ -592,13 +570,6 @@ async fn gather_refund_inputs(
     }
     let gross = params.gross_amount;
 
-    let cov_utxos = client.fetch_utxos(&covenant_addr).await.map_err(|e| rerr(e.to_string()))?;
-    let covenant_utxo = cov_utxos
-        .into_iter()
-        .find(|(_, _, v)| *v == gross)
-        .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
-        .ok_or_else(|| rerr("covenant funding UTXO not visible yet"))?;
-
     // The fee payer is a covenant party (merchant or customer); they supply and
     // sign their own fee input, so Kasway never subsidizes refund gas.
     let fee_payer = match who {
@@ -606,8 +577,18 @@ async fn gather_refund_inputs(
         FeePayer::Customer => params.customer_refund.clone(),
     };
     let fee_payer_addr = fee_payer.address().to_string();
+
+    // The covenant and fee-payer lookups are independent; fetch them concurrently.
+    let (cov_utxos, fee_utxos) = tokio::join!(client.fetch_utxos(&covenant_addr), client.fetch_utxos(&fee_payer_addr));
+    let covenant_utxo = cov_utxos
+        .map_err(|e| rerr(e.to_string()))?
+        .into_iter()
+        .find(|(_, _, v)| *v == gross)
+        .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
+        .ok_or_else(|| rerr("covenant funding UTXO not visible yet"))?;
+
     // Deterministic fee-UTXO pick so prepare and submit build the identical tx.
-    let mut fee_utxos = client.fetch_utxos(&fee_payer_addr).await.map_err(|e| rerr(e.to_string()))?;
+    let mut fee_utxos = fee_utxos.map_err(|e| rerr(e.to_string()))?;
     fee_utxos.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
     let fee_utxo = fee_utxos
         .into_iter()
@@ -727,14 +708,9 @@ pub(crate) async fn arbiter_release(state: &AppState, public_id: &str) -> AppRes
 
     match outcome {
         Ok(tx_id) => {
-            let now = now_iso();
-            sqlx::query(
-                "UPDATE kpr1_payment_intents SET covenant_state = 'arbitrated', status = 'settled', \
-                 settled_at = COALESCE(settled_at, $1), release_tx_id = $2, updated_at = $1 WHERE id = $3",
-            )
-            .bind(&now).bind(&tx_id).bind(ctx.intent_pk).execute(&state.db.pool).await.map_err(AppError::Database)?;
-            sqlx::query("UPDATE invoices SET status = 'paid', paid_at = COALESCE(paid_at, $1), updated_at = $1 WHERE id = $2 AND status = 'open'")
-                .bind(&now).bind(ctx.invoice_id).execute(&state.db.pool).await.map_err(AppError::Database)?;
+            mark_settled_paid(state, ctx.intent_pk, ctx.invoice_id, "arbitrated", &tx_id)
+                .await
+                .map_err(AppError::Database)?;
             let target = webhook_target(ctx.intent_pk, ctx.invoice_id, ctx.user_id, ctx.store_id, ctx.public_id.clone());
             let _ = emit_invoice_event(state, &target, "invoice.paid", &tx_id).await;
             Ok(json!({ "released": true, "resolution": "arbitrated", "releaseTxId": tx_id, "invoiceStatus": "paid" }))
@@ -903,14 +879,9 @@ pub(crate) async fn mutual_settle_submit(
     .await;
     match outcome {
         Ok(tx_id) => {
-            let now = now_iso();
-            sqlx::query(
-                "UPDATE kpr1_payment_intents SET covenant_state = 'settled_mutual', status = 'settled', \
-                 settled_at = COALESCE(settled_at, $1), release_tx_id = $2, updated_at = $1 WHERE id = $3",
-            )
-            .bind(&now).bind(&tx_id).bind(ctx.intent_pk).execute(&state.db.pool).await.map_err(AppError::Database)?;
-            sqlx::query("UPDATE invoices SET status = 'paid', paid_at = COALESCE(paid_at, $1), updated_at = $1 WHERE id = $2 AND status = 'open'")
-                .bind(&now).bind(ctx.invoice_id).execute(&state.db.pool).await.map_err(AppError::Database)?;
+            mark_settled_paid(state, ctx.intent_pk, ctx.invoice_id, "settled_mutual", &tx_id)
+                .await
+                .map_err(AppError::Database)?;
             let target = webhook_target(ctx.intent_pk, ctx.invoice_id, ctx.user_id, ctx.store_id, ctx.public_id.clone());
             let _ = emit_invoice_event(state, &target, "invoice.paid", &tx_id).await;
             Ok(json!({ "settled": true, "resolution": "mutual", "settleTxId": tx_id, "invoiceStatus": "paid" }))

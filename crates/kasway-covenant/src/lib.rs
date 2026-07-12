@@ -44,7 +44,7 @@ pub fn network_prefix(network: &str) -> Result<Prefix, CovenantError> {
 pub const MAX_PAYOUTS: usize = 8;
 
 /// Address kind, matching the covenant's `payout_kinds` / `refund_kind` encoding.
-const KIND_P2PK: i64 = 0;
+pub(crate) const KIND_P2PK: i64 = 0;
 const KIND_P2SH: i64 = 1;
 
 #[derive(Debug, thiserror::Error)]
@@ -268,6 +268,14 @@ fn covenant_signature_script(redeem: &[u8], entrypoint_sig: Vec<u8>) -> Result<V
     .map_err(|e| CovenantError::Compile(format!("p2sh sigscript: {e}")))
 }
 
+/// The fee input's signature script: the fee payer's pushed 65-byte signature.
+fn fee_signature_script(fee_sig: &[u8]) -> Result<Vec<u8>, CovenantError> {
+    Ok(ScriptBuilder::new()
+        .add_data(fee_sig)
+        .map_err(|e| CovenantError::Compile(format!("fee sigscript: {e}")))?
+        .drain())
+}
+
 /// Assemble the two-input spend (covenant input 0 + fee input 1) with BOTH
 /// signature scripts still empty, returning the tx, its UTXO entries, and both
 /// input sighashes. `SIG_HASH_ALL` excludes signature scripts, so these sighashes
@@ -329,10 +337,7 @@ fn build_fee_signed_tx(
     let (mut tx, entries, cov_sighash, fee_sighash) =
         assemble_unsigned(redeem, outputs, lock_time, covenant_utxo, fee_utxo, fee_spk);
     let fee_sig = keeper.sign_sighash(&fee_sighash)?;
-    tx.inputs[1].signature_script = ScriptBuilder::new()
-        .add_data(&fee_sig)
-        .map_err(|e| CovenantError::Compile(format!("fee sigscript: {e}")))?
-        .drain();
+    tx.inputs[1].signature_script = fee_signature_script(&fee_sig)?;
     Ok((tx, entries, cov_sighash))
 }
 
@@ -340,6 +345,39 @@ fn push_change(outputs: &mut Vec<TransactionOutput>, fee_utxo: &Utxo, miner_fee:
     if let Some(change) = fee_utxo.value.checked_sub(miner_fee).filter(|c| *c > 0) {
         outputs.push(TransactionOutput { value: change, script_public_key: pay_to_address_script(fee_payer_address), covenant: None });
     }
+}
+
+/// The merchant-win release outputs: the ordered payouts plus fee-payer change.
+pub(crate) fn merchant_split_outputs(
+    payouts: &[Payout],
+    fee_utxo: &Utxo,
+    miner_fee: u64,
+    fee_payer_address: &Address,
+) -> Vec<TransactionOutput> {
+    let mut outputs: Vec<TransactionOutput> = payouts
+        .iter()
+        .map(|p| TransactionOutput { value: p.value, script_public_key: p.destination.script_public_key(), covenant: None })
+        .collect();
+    push_change(&mut outputs, fee_utxo, miner_fee, fee_payer_address);
+    outputs
+}
+
+/// The customer-refund outputs: the full gross back to the customer plus
+/// fee-payer change.
+pub(crate) fn customer_refund_outputs(
+    customer_refund: &Destination,
+    gross_amount: u64,
+    fee_utxo: &Utxo,
+    miner_fee: u64,
+    fee_payer_address: &Address,
+) -> Vec<TransactionOutput> {
+    let mut outputs = vec![TransactionOutput {
+        value: gross_amount,
+        script_public_key: customer_refund.script_public_key(),
+        covenant: None,
+    }];
+    push_change(&mut outputs, fee_utxo, miner_fee, fee_payer_address);
+    outputs
 }
 
 fn to_hex(bytes: &[u8]) -> String {

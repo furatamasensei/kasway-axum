@@ -10,7 +10,7 @@ use crate::error::{AppError, AppResult};
 use crate::kaspa_wrpc::KaspaWrpcClient;
 use crate::kpr1::parse_required_outputs;
 use crate::state::AppState;
-use crate::util::now_iso;
+use crate::util::{decode_hex, decode_hex32, encode_hex, now_iso};
 use axum::extract::{Path, State};
 use axum::Json;
 use kasway_covenant::{covenant_address, network_prefix, Destination, KeeperKey, Payout};
@@ -18,21 +18,6 @@ use serde_json::{json, Value};
 
 fn derr(msg: impl AsRef<str>) -> AppError {
     AppError::commerce(422, msg.as_ref())
-}
-
-fn decode_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// The funded intent backing a dispute (subset needed to rebuild the covenant).
@@ -95,7 +80,7 @@ pub async fn open_dispute(
     let signature = body
         .get("signature")
         .and_then(|v| v.as_str())
-        .and_then(|s| (0..s.len() / 2).map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()).collect::<Option<Vec<u8>>>())
+        .and_then(decode_hex)
         .filter(|s| s.len() == 64)
         .ok_or_else(|| derr("signature must be a 64-byte hex Schnorr signature"))?;
 
@@ -120,22 +105,14 @@ pub async fn open_dispute(
         .ok_or_else(|| derr("merchant payout address missing or not a schnorr P2PK address"))?;
 
     // Domain-separated digest binding this request to the escrow + evidence set.
-    let digest: [u8; 32] = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(b"KASWAY/dispute/open");
-        h.update(public_id.as_bytes());
-        h.update(ch);
-        h.update(mh);
-        h.finalize().into()
-    };
+    let digest = dispute::sha256_bytes(&[b"KASWAY/dispute/open", public_id.as_bytes(), &ch, &mh]);
     let signer_pk = if party == "customer" { &customer_pk } else { &merchant_pk };
     if !kasway_covenant::verify_datasig(signer_pk, &digest, &signature) {
         return Err(AppError::commerce(403, "dispute open must be signed by the customer or merchant"));
     }
 
     let dispute_id = dispute::open_dispute(&state, intent.intent_pk, "jury", &ch, &mh).await?;
-    Ok(Json(json!({ "disputeId": dispute_id, "state": "open", "evidenceRoot": hex(&dispute::evidence_root(&ch, &mh)) })))
+    Ok(Json(json!({ "disputeId": dispute_id, "state": "open", "evidenceRoot": encode_hex(&dispute::evidence_root(&ch, &mh)) })))
 }
 
 /// `POST /internal/payment-ops/kpr1/disputes/:disputeId/committee`
@@ -161,20 +138,20 @@ pub async fn draw_committee(
     if (committee.len() as u32) < k {
         return Err(derr("bonded juror pool too small to draw the committee"));
     }
-    let params = build_params(&state, &intent, committee.clone(), k, &disp_id_bytes, &evidence_root).await?;
+    let params = build_params(&intent, committee.clone(), k, &disp_id_bytes, &evidence_root)?;
     let prefix = network_prefix(&intent.network).map_err(|e| derr(e.to_string()))?;
     let compiled = kasway_covenant::jury_escrow::compile_jury_escrow(&params).map_err(|e| derr(e.to_string()))?;
     let cov_addr = covenant_address(&compiled, prefix).map_err(|e| derr(e.to_string()))?.to_string();
 
-    let committee_json = serde_json::to_string(&committee.iter().map(|p| hex(p)).collect::<Vec<_>>()).unwrap_or_default();
+    let committee_json = serde_json::to_string(&committee.iter().map(|p| encode_hex(p)).collect::<Vec<_>>()).unwrap_or_default();
     sqlx::query(
         "UPDATE kpr1_disputes SET state = 'jury_voting', committee_json = $1, jury_threshold = $2, \
          verdict_digest_merchant = $3, verdict_digest_customer = $4, updated_at = $5 WHERE id = $6",
     )
     .bind(&committee_json)
     .bind(k as i32)
-    .bind(hex(&params.verdict_digest_merchant))
-    .bind(hex(&params.verdict_digest_customer))
+    .bind(encode_hex(&params.verdict_digest_merchant))
+    .bind(encode_hex(&params.verdict_digest_customer))
     .bind(now_iso())
     .bind(dispute_id)
     .execute(&state.db.pool)
@@ -184,11 +161,11 @@ pub async fn draw_committee(
     Ok(Json(json!({
         "disputeId": dispute_id,
         "publicId": public_id,
-        "committee": committee.iter().map(|p| hex(p)).collect::<Vec<_>>(),
+        "committee": committee.iter().map(|p| encode_hex(p)).collect::<Vec<_>>(),
         "juryThreshold": k,
         "juryCovenantAddress": cov_addr,
-        "verdictDigestMerchant": hex(&params.verdict_digest_merchant),
-        "verdictDigestCustomer": hex(&params.verdict_digest_customer),
+        "verdictDigestMerchant": encode_hex(&params.verdict_digest_merchant),
+        "verdictDigestCustomer": encode_hex(&params.verdict_digest_customer),
     })))
 }
 
@@ -210,7 +187,7 @@ pub async fn cast_vote(
     let datasig = body
         .get("datasig")
         .and_then(|v| v.as_str())
-        .and_then(|s| (0..s.len() / 2).map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()).collect::<Option<Vec<u8>>>())
+        .and_then(decode_hex)
         .filter(|s| s.len() == 64)
         .ok_or_else(|| derr("datasig must be a 64-byte hex Schnorr signature"))?;
 
@@ -234,7 +211,7 @@ pub async fn settle_jury(
 ) -> AppResult<Json<Value>> {
     let (_public_id, intent, disp_id_bytes, evidence_root, _party) = load_dispute_ctx(&state, dispute_id).await?;
     let (committee, k) = load_committee(&state, dispute_id).await?;
-    let params = build_params(&state, &intent, committee, k, &disp_id_bytes, &evidence_root).await?;
+    let params = build_params(&intent, committee, k, &disp_id_bytes, &evidence_root)?;
 
     let votes = dispute::load_votes(&state, dispute_id).await?;
     let (verdict_byte, signer_idx, datasigs) = dispute::tally(&votes, k).ok_or_else(|| derr("no K-of-N verdict yet"))?;
@@ -330,13 +307,7 @@ async fn load_dispute_ctx(
     let intent = load_intent(state, &public_id).await?;
 
     // dispute_id bytes = sha256 of the numeric id (stable, opaque anchor).
-    let disp_id_bytes = {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(b"KASWAY/jury/dispute-id");
-        h.update(dispute_id.to_le_bytes());
-        h.finalize().into()
-    };
+    let disp_id_bytes = dispute::sha256_bytes(&[b"KASWAY/jury/dispute-id", &dispute_id.to_le_bytes()]);
 
     // Parties excluded from the committee (customer + merchant pubkeys).
     let outs = parse_required_outputs(&intent.required_outputs);
@@ -358,15 +329,13 @@ async fn load_dispute_ctx(
     Ok((public_id, intent, disp_id_bytes, evidence_root, party))
 }
 
-async fn build_params(
-    state: &AppState,
+fn build_params(
     intent: &DisputeIntent,
     committee: Vec<[u8; 32]>,
     k: u32,
     disp_id_bytes: &[u8; 32],
     evidence_root: &[u8; 32],
 ) -> AppResult<kasway_covenant::jury_escrow::JuryEscrowParams> {
-    let _ = state;
     let gross = intent.gross_amount.ok_or_else(|| derr("intent gross missing"))? as u64;
     let refund_addr = intent.customer_refund_address.clone().ok_or_else(|| derr("customer refund address missing"))?;
     let customer_refund = Destination::parse(&refund_addr).map_err(|e| derr(e.to_string()))?;

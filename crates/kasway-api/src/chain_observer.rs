@@ -9,9 +9,9 @@
 //!
 //! - creates/updates the `payment_observations` row (observed amount/outputs,
 //!   accepted DAA score, confirmations),
-//! - verifies the observed outputs against the intent's `required_outputs`
-//!   (`crate::kpr1::verify_required_outputs` — exact address + amount, every
-//!   output present). On mismatch it FAILS CLOSED: the intent is marked
+//! - verifies the covenant funding (one output paying the covenant P2SH
+//!   address EXACTLY the gross amount — under- or overfunding is rejected).
+//!   On mismatch it FAILS CLOSED: the intent is marked
 //!   `failed` with a stable `failure_reason` and a `payment_anomaly_signals`
 //!   row records the discrepancy — the invoice is never marked paid,
 //! - once confirmations (`virtual DAA score - accepting DAA score`) meet the

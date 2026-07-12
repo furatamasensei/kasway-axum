@@ -6,21 +6,19 @@
 //! verdict — `release_jury` (merchant wins) or `refund_jury` (customer wins).
 //! Kasway holds none of the committee keys.
 
-use kaspa_consensus_core::tx::{Transaction, TransactionOutput, UtxoEntry};
+use kaspa_consensus_core::tx::{Transaction, UtxoEntry};
 use kaspa_txscript::pay_to_address_script;
-use kaspa_txscript::script_builder::ScriptBuilder;
 use silverscript_lang::ast::Expr;
 use silverscript_lang::compiler::{compile_contract, CompileOptions, CompiledContract};
 
 use crate::{
-    assemble_unsigned, build_fee_signed_tx, covenant_signature_script, push_change, to_i64, CovenantError,
-    Destination, KeeperKey, Payout, Prefix, SignedSpend, Utxo, MAX_PAYOUTS,
+    assemble_unsigned, build_fee_signed_tx, covenant_signature_script, customer_refund_outputs, fee_signature_script,
+    merchant_split_outputs, to_i64, CovenantError, Destination, KeeperKey, Payout, Prefix, SignedSpend, Utxo,
+    KIND_P2PK, MAX_PAYOUTS,
 };
 
 /// JuryEscrow covenant source.
 pub const JURY_ESCROW_SRC: &str = include_str!("../contracts/jury_escrow.sil");
-
-const KIND_P2PK: i64 = 0;
 
 pub const EP_RELEASE_JURY: &str = "release_jury";
 pub const EP_REFUND_JURY: &str = "refund_jury";
@@ -109,36 +107,6 @@ pub fn compile_jury_escrow(params: &JuryEscrowParams) -> Result<CompiledContract
     Ok(compile_contract(JURY_ESCROW_SRC, &args, CompileOptions::default())?)
 }
 
-fn merchant_split_outputs(
-    params: &JuryEscrowParams,
-    fee_utxo: &Utxo,
-    miner_fee: u64,
-    fee_payer_address: &kaspa_addresses::Address,
-) -> Vec<TransactionOutput> {
-    let mut outputs: Vec<TransactionOutput> = params
-        .payouts
-        .iter()
-        .map(|p| TransactionOutput { value: p.value, script_public_key: p.destination.script_public_key(), covenant: None })
-        .collect();
-    push_change(&mut outputs, fee_utxo, miner_fee, fee_payer_address);
-    outputs
-}
-
-fn customer_refund_outputs(
-    params: &JuryEscrowParams,
-    fee_utxo: &Utxo,
-    miner_fee: u64,
-    fee_payer_address: &kaspa_addresses::Address,
-) -> Vec<TransactionOutput> {
-    let mut outputs = vec![TransactionOutput {
-        value: params.gross_amount,
-        script_public_key: params.customer_refund.script_public_key(),
-        covenant: None,
-    }];
-    push_change(&mut outputs, fee_utxo, miner_fee, fee_payer_address);
-    outputs
-}
-
 /// Build the covenant sig-script for a jury entrypoint: the ordered `datasigs`
 /// (each 64 bytes) and their committee `signer_idx`.
 fn jury_sigscript(
@@ -169,7 +137,7 @@ pub fn prepare_release_jury(
     keeper: &KeeperKey,
     prefix: Prefix,
 ) -> Result<JuryReleaseDraft, CovenantError> {
-    let outputs = merchant_split_outputs(params, fee_utxo, miner_fee, &keeper.address(prefix));
+    let outputs = merchant_split_outputs(&params.payouts, fee_utxo, miner_fee, &keeper.address(prefix));
     let (transaction, entries, covenant_sighash) =
         build_fee_signed_tx(&compiled.script, outputs, 0, covenant_utxo, fee_utxo, keeper, prefix)?;
     Ok(JuryReleaseDraft { transaction, entries, covenant_sighash })
@@ -204,7 +172,7 @@ pub fn prepare_refund_jury(
     miner_fee: u64,
     fee_payer_address: &kaspa_addresses::Address,
 ) -> Result<JuryRefundDraft, CovenantError> {
-    let outputs = customer_refund_outputs(params, fee_utxo, miner_fee, fee_payer_address);
+    let outputs = customer_refund_outputs(&params.customer_refund, params.gross_amount, fee_utxo, miner_fee, fee_payer_address);
     let fee_spk = pay_to_address_script(fee_payer_address);
     let (transaction, entries, covenant_sighash, fee_sighash) =
         assemble_unsigned(&compiled.script, outputs, 0, covenant_utxo, fee_utxo, fee_spk);
@@ -220,10 +188,7 @@ pub fn complete_refund_jury(
 ) -> Result<SignedSpend, CovenantError> {
     let entrypoint_sig = jury_sigscript(compiled, EP_REFUND_JURY, datasigs, signer_idx)?;
     draft.transaction.inputs[0].signature_script = covenant_signature_script(&compiled.script, entrypoint_sig)?;
-    draft.transaction.inputs[1].signature_script = ScriptBuilder::new()
-        .add_data(fee_sig)
-        .map_err(|e| CovenantError::Compile(format!("fee sigscript: {e}")))?
-        .drain();
+    draft.transaction.inputs[1].signature_script = fee_signature_script(fee_sig)?;
     Ok(SignedSpend { transaction: draft.transaction, entries: draft.entries })
 }
 

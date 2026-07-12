@@ -1,5 +1,6 @@
 //! Shared application state injected into every handler.
 
+use crate::util::{decode_hex32, http_client};
 use kasway_db::Db;
 use std::sync::Arc;
 
@@ -258,7 +259,7 @@ impl AppConfig {
         if let Some(ip) = remote_ip.filter(|s| !s.is_empty()) {
             form.push(("remoteip", ip));
         }
-        let resp = match reqwest::Client::new()
+        let resp = match http_client()
             .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
             .form(&form)
             .send()
@@ -272,17 +273,4 @@ impl AppConfig {
             Err(_) => false,
         }
     }
-}
-
-/// Decode a 64-char hex string into a fixed 32-byte array (same pattern as
-/// `covenant_keeper::decode_hex32`). Returns `None` on any malformed input.
-fn decode_hex32(s: &str) -> Option<[u8; 32]> {
-    if s.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
 }

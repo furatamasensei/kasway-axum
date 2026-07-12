@@ -24,11 +24,10 @@
 
 use crate::handlers::webhooks::{allow_loopback, is_forbidden_ip, validate_webhook_url};
 use crate::state::AppState;
-use crate::util::now_iso;
+use crate::util::{encode_hex, now_iso, to_iso};
 use hmac::{Hmac, Mac};
 use serde_json::{json, Value};
 use sha2::Sha256;
-use std::net::ToSocketAddrs;
 
 /// Payload schema version reported in `X-Kasway-Webhook-Version`.
 const WEBHOOK_VERSION: &str = "1";
@@ -66,18 +65,8 @@ pub fn enabled_from_env() -> bool {
     }
 }
 
-/// Build the outbound HTTP client: 10s timeout, redirects never followed.
-pub fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("webhook http client")
-}
-
 /// Per-delivery client that only connects to the pre-validated IPs for `host`
-/// (DNS-rebind pinning). Mirrors `http_client`'s settings: same timeout,
-/// redirects never followed, no proxy.
+/// (DNS-rebind pinning): 10s timeout, redirects never followed, no proxy.
 fn pinned_client(host: &str, addrs: &[std::net::SocketAddr]) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))
@@ -104,10 +93,9 @@ async fn read_capped_body(mut resp: reqwest::Response) -> String {
 /// Spawn the polling loop as a tokio background task (called at startup).
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let client = http_client();
         tracing::info!("webhook delivery worker started");
         loop {
-            match run_tick(&state, &client).await {
+            match run_tick(&state).await {
                 // Backlog drained (or nothing due): idle before polling again.
                 Ok(0) => tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await,
                 // Claimed a full-or-partial batch: keep draining immediately.
@@ -138,15 +126,13 @@ struct DueDelivery {
 
 /// One worker tick: claim due deliveries (pending, next attempt due, endpoint
 /// active and not paused) and attempt each one. Returns how many were claimed.
-pub async fn run_tick(state: &AppState, client: &reqwest::Client) -> Result<usize, sqlx::Error> {
+pub async fn run_tick(state: &AppState) -> Result<usize, sqlx::Error> {
     let now = now_iso();
     // Reaper: a crash between claiming (pending → delivering) and recording the
     // outcome can leave rows stuck in `delivering` forever (the claim query only
     // selects `pending`). Reset any that have been delivering past the stuck
     // threshold back to `pending` so they get retried.
-    let stuck_cutoff = (chrono::Utc::now() - chrono::Duration::seconds(DELIVERING_STUCK_SECS))
-        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
-        .to_string();
+    let stuck_cutoff = to_iso(chrono::Utc::now() - chrono::Duration::seconds(DELIVERING_STUCK_SECS));
     sqlx::query(
         "UPDATE webhook_deliveries SET status = 'pending', updated_at = $1 \
          WHERE status = 'delivering' \
@@ -178,20 +164,25 @@ pub async fn run_tick(state: &AppState, client: &reqwest::Client) -> Result<usiz
     .fetch_all(&state.db.pool)
     .await?;
 
+    let rows = sqlx::query_as::<_, DueDelivery>(
+        "SELECT d.id, d.attempt_count, ev.id AS event_id, ev.event_type, ev.resource_type, \
+                ev.resource_id, ev.payload, ev.created_at AS event_created_at, \
+                e.user_id AS endpoint_user_id, e.url, e.signing_secret \
+         FROM webhook_deliveries d \
+         JOIN webhook_events ev ON ev.id = d.webhook_event_id \
+         JOIN webhook_endpoints e ON e.id = d.webhook_endpoint_id \
+         WHERE d.id = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    // Process in the order the claim returned the ids.
+    let mut by_id: std::collections::HashMap<i64, DueDelivery> =
+        rows.into_iter().map(|d| (d.id, d)).collect();
     for id in &ids {
-        let delivery = sqlx::query_as::<_, DueDelivery>(
-            "SELECT d.id, d.attempt_count, ev.id AS event_id, ev.event_type, ev.resource_type, \
-                    ev.resource_id, ev.payload, ev.created_at AS event_created_at, \
-                    e.user_id AS endpoint_user_id, e.url, e.signing_secret \
-             FROM webhook_deliveries d \
-             JOIN webhook_events ev ON ev.id = d.webhook_event_id \
-             JOIN webhook_endpoints e ON e.id = d.webhook_endpoint_id \
-             WHERE d.id = $1",
-        )
-        .bind(id)
-        .fetch_one(&state.db.pool)
-        .await?;
-        attempt_delivery(state, client, &delivery).await?;
+        if let Some(delivery) = by_id.remove(id) {
+            attempt_delivery(state, &delivery).await?;
+        }
     }
     Ok(ids.len())
 }
@@ -204,19 +195,14 @@ pub fn sign_payload(signing_secret: &str, timestamp: &str, raw_body: &str) -> St
     mac.update(timestamp.as_bytes());
     mac.update(b".");
     mac.update(raw_body.as_bytes());
-    let hex: String = mac.finalize().into_bytes().iter().map(|b| format!("{:02x}", b)).collect();
-    format!("sha256={hex}")
+    format!("sha256={}", encode_hex(&mac.finalize().into_bytes()))
 }
 
 /// Attempt one claimed delivery and record the outcome.
-async fn attempt_delivery(
-    state: &AppState,
-    _base_client: &reqwest::Client,
-    d: &DueDelivery,
-) -> Result<(), sqlx::Error> {
+async fn attempt_delivery(state: &AppState, d: &DueDelivery) -> Result<(), sqlx::Error> {
     // SSRF policy re-check at delivery time (URLs are validated on
     // registration, but DNS/config may have changed since).
-    if let Err((code, reason)) = validate_webhook_url(&d.url, allow_loopback(state)) {
+    if let Err((code, reason)) = validate_webhook_url(&d.url, allow_loopback(state)).await {
         return record_failure(state, d, None, None, &format!("{code}: {reason}")).await;
     }
 
@@ -234,7 +220,7 @@ async fn attempt_delivery(
         .to_string();
     let port = parsed.port_or_known_default().unwrap_or(443);
     let allow_lb = allow_loopback(state);
-    let addrs: Vec<std::net::SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
+    let addrs: Vec<std::net::SocketAddr> = match tokio::net::lookup_host(format!("{host}:{port}")).await {
         Ok(it) => it.collect(),
         Err(_) => return record_failure(state, d, None, None, "forbidden_address: host could not be resolved").await,
     };
@@ -335,9 +321,7 @@ async fn record_failure(
     } else {
         // Exponential backoff: base × 2^(n-1) after the n-th failed attempt.
         let delay_secs = profile.base_delay_secs * (1i64 << (attempt - 1).min(30));
-        let next = (chrono::Utc::now() + chrono::Duration::seconds(delay_secs))
-            .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
-            .to_string();
+        let next = to_iso(chrono::Utc::now() + chrono::Duration::seconds(delay_secs));
         ("pending", Some(next))
     };
 

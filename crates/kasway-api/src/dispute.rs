@@ -23,7 +23,7 @@
 use crate::error::{AppError, AppResult};
 use crate::kaspa_wrpc::KaspaWrpcClient;
 use crate::state::AppState;
-use crate::util::now_iso;
+use crate::util::{decode_hex, encode_hex, now_iso};
 use kasway_covenant::jury_escrow::{
     compile_jury_escrow, complete_refund_jury, complete_release_jury, prepare_refund_jury, prepare_release_jury,
     JuryEscrowParams, VERDICT_CUSTOMER, VERDICT_MERCHANT, VERDICT_TAG,
@@ -35,7 +35,7 @@ use sha2::{Digest, Sha256};
 pub const VERDICT_CUSTOMER_BIT: u8 = VERDICT_CUSTOMER;
 pub const VERDICT_MERCHANT_BIT: u8 = VERDICT_MERCHANT;
 
-fn sha256_bytes(chunks: &[&[u8]]) -> [u8; 32] {
+pub(crate) fn sha256_bytes(chunks: &[&[u8]]) -> [u8; 32] {
     let mut h = Sha256::new();
     for c in chunks {
         h.update(c);
@@ -129,7 +129,7 @@ pub fn tally(votes: &[Vote], k: u32) -> Option<(u8, Vec<u32>, Vec<Vec<u8>>)> {
 
 /// Errors from the dispute settlement path.
 fn derr(msg: impl AsRef<str>) -> AppError {
-    AppError::commerce(422, msg.as_ref())
+    AppError::unprocessable(msg.as_ref())
 }
 
 /// Assemble and broadcast the on-chain jury settlement for a dispute whose votes
@@ -193,10 +193,6 @@ async fn pick_fee_utxo(client: &KaspaWrpcClient, address: &str, min_fee: u64) ->
 // DB-backed lifecycle (uses the 0034_dispute_layer tables).
 // ---------------------------------------------------------------------------
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 /// Open a dispute for a funded intent: record the tier, evidence hashes and
 /// `evidence_root`, and move the intent to `disputed`. Returns the dispute id.
 ///
@@ -243,9 +239,9 @@ pub async fn open_dispute(
     )
     .bind(intent_id)
     .bind(tier)
-    .bind(hex(customer_hash))
-    .bind(hex(merchant_hash))
-    .bind(hex(&root))
+    .bind(encode_hex(customer_hash))
+    .bind(encode_hex(merchant_hash))
+    .bind(encode_hex(&root))
     .bind(&now)
     .fetch_one(&mut *tx)
     .await
@@ -271,10 +267,10 @@ pub async fn record_vote(
          ON CONFLICT (dispute_id, juror_pubkey) DO UPDATE SET reveal_bit = $4, reveal_datasig = $5, updated_at = $6",
     )
     .bind(dispute_id)
-    .bind(hex(juror_pubkey))
+    .bind(encode_hex(juror_pubkey))
     .bind(committee_index as i32)
     .bind(verdict_byte as i16)
-    .bind(hex(reveal_datasig))
+    .bind(encode_hex(reveal_datasig))
     .bind(&now)
     .execute(&state.db.pool)
     .await
@@ -300,13 +296,6 @@ pub async fn load_votes(state: &AppState, dispute_id: i64) -> AppResult<Vec<Vote
         }
     }
     Ok(votes)
-}
-
-fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len() / 2).map(|i| u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()).collect()
 }
 
 /// Convenience: the network prefix helper, re-exported for handlers/harness.

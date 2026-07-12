@@ -15,6 +15,14 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
+/// `body[key]` as a trimmed, non-empty string.
+fn body_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+    body.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 fn kpr1_err(code: &str, message: &str, metadata: Option<Value>) -> Response {
     let mut body = json!({ "message": message, "code": code });
     if let Some(Value::Object(m)) = metadata {
@@ -62,7 +70,7 @@ pub async fn submit_kpr1_payment(
             Some(json!({ "status": status }))));
     }
 
-    let expected_tx_id = body.get("txId").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let expected_tx_id = body_str(&body, "txId").map(str::to_string);
     let has_signed = body.get("signedTransaction").map(|v| !v.is_null()).unwrap_or(false);
     if expected_tx_id.is_none() && !has_signed {
         return Ok(kpr1_err("KPR1_PAYMENT_PROOF_REQUIRED", "KPR-1 wallet submission requires either a tx id or a signed transaction payload", None));
@@ -125,12 +133,7 @@ pub async fn finalize_kpr1_covenant(
     Path(public_id): Path<String>,
     Json(body): Json<Value>,
 ) -> AppResult<Response> {
-    let refund_address = body
-        .get("refundAddress")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(refund_address) = refund_address else {
+    let Some(refund_address) = body_str(&body, "refundAddress") else {
         return Ok(kpr1_err(
             "KPR1_REFUND_ADDRESS_REQUIRED",
             "A customer refund address is required to finalize the covenant",
@@ -162,12 +165,7 @@ pub async fn submit_kpr1_release(
     Path(public_id): Path<String>,
     Json(body): Json<Value>,
 ) -> AppResult<Response> {
-    let signature = body
-        .get("signature")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let Some(signature) = signature else {
+    let Some(signature) = body_str(&body, "signature") else {
         return Ok(kpr1_err(
             "KPR1_RELEASE_SIGNATURE_REQUIRED",
             "A customer signature is required to release funds to the merchant",
@@ -202,8 +200,8 @@ pub async fn submit_kpr1_refund(
     Path(public_id): Path<String>,
     Json(body): Json<Value>,
 ) -> AppResult<Response> {
-    let covenant_sig = body.get("covenantSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
-    let fee_sig = body.get("feeSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let covenant_sig = body_str(&body, "covenantSignature");
+    let fee_sig = body_str(&body, "feeSignature");
     let (Some(covenant_sig), Some(fee_sig)) = (covenant_sig, fee_sig) else {
         return Ok(kpr1_err(
             "KPR1_REFUND_SIGNATURES_REQUIRED",
@@ -270,9 +268,9 @@ pub async fn submit_kpr1_settle(
         Ok(v) => v,
         Err(resp) => return Ok(resp),
     };
-    let customer_sig = body.get("customerSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
-    let merchant_sig = body.get("merchantSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
-    let fee_sig = body.get("feeSignature").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty());
+    let customer_sig = body_str(&body, "customerSignature");
+    let merchant_sig = body_str(&body, "merchantSignature");
+    let fee_sig = body_str(&body, "feeSignature");
     let (Some(customer_sig), Some(merchant_sig), Some(fee_sig)) = (customer_sig, merchant_sig, fee_sig) else {
         return Ok(kpr1_err(
             "KPR1_SETTLE_SIGNATURES_REQUIRED",

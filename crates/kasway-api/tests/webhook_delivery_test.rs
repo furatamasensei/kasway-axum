@@ -92,7 +92,7 @@ async fn worker_delivers_signed_event_and_marks_succeeded() {
     let (url, hits) = spawn_receiver(200).await;
     let (secret, delivery_id) = endpoint_with_pending_delivery(&app, &token, &url).await;
 
-    let claimed = kasway_api::webhook_worker::run_tick(&app.state, &kasway_api::webhook_worker::http_client())
+    let claimed = kasway_api::webhook_worker::run_tick(&app.state)
         .await
         .unwrap();
     assert_eq!(claimed, 1);
@@ -138,7 +138,7 @@ async fn failed_delivery_schedules_backoff_then_permanently_fails() {
     let (url, hits) = spawn_receiver(500).await;
     let (_secret, delivery_id) = endpoint_with_pending_delivery(&app, &token, &url).await;
 
-    let claimed = kasway_api::webhook_worker::run_tick(&app.state, &kasway_api::webhook_worker::http_client())
+    let claimed = kasway_api::webhook_worker::run_tick(&app.state)
         .await
         .unwrap();
     assert_eq!(claimed, 1);
@@ -156,7 +156,7 @@ async fn failed_delivery_schedules_backoff_then_permanently_fails() {
     assert!(next.as_str() > kasway_api::util::now_iso().as_str(), "next_attempt_at {next} should be in the future");
 
     // not due yet -> the next tick claims nothing
-    let claimed = kasway_api::webhook_worker::run_tick(&app.state, &kasway_api::webhook_worker::http_client())
+    let claimed = kasway_api::webhook_worker::run_tick(&app.state)
         .await
         .unwrap();
     assert_eq!(claimed, 0);
@@ -167,7 +167,7 @@ async fn failed_delivery_schedules_backoff_then_permanently_fails() {
         .execute(&app.db.pool)
         .await
         .unwrap();
-    let claimed = kasway_api::webhook_worker::run_tick(&app.state, &kasway_api::webhook_worker::http_client())
+    let claimed = kasway_api::webhook_worker::run_tick(&app.state)
         .await
         .unwrap();
     assert_eq!(claimed, 1);
@@ -202,7 +202,7 @@ async fn paused_endpoint_is_not_delivered() {
         .unwrap();
     assert_eq!(res.status(), 200);
 
-    let claimed = kasway_api::webhook_worker::run_tick(&app.state, &kasway_api::webhook_worker::http_client())
+    let claimed = kasway_api::webhook_worker::run_tick(&app.state)
         .await
         .unwrap();
     assert_eq!(claimed, 0);
