@@ -82,30 +82,7 @@ pub async fn login(
         })));
     }
 
-    // team-member (client) path
-    let member = sqlx::query_as::<_, (i64, Option<String>, String)>(
-        "SELECT id, password, role FROM team_members WHERE LOWER(email) = LOWER($1)",
-    )
-    .bind(&email)
-    .fetch_optional(&state.db.pool)
-    .await?;
-
-    let Some((id, stored, role)) = member else {
-        return Err(AppError::bad_credentials());
-    };
-    let ok = stored
-        .as_deref()
-        .map(|h| verify_password(&password, h))
-        .unwrap_or(false);
-    if !ok {
-        return Err(AppError::bad_credentials());
-    }
-    let token = auth_token::mint(&state.db.pool, &auth_token::CLIENT, id).await?;
-    Ok(Json(json!({
-        "token": token,
-        "role": role,
-        "onboarded": true,
-    })))
+    Err(AppError::bad_credentials())
 }
 
 /// `POST /api/auth/register`
@@ -118,7 +95,7 @@ pub async fn register(
         return Err(AppError::bad_request("Captcha validation failed"));
     }
 
-    // registerValidator: fullName (required), email (email + unique users/team_members), password (required)
+    // registerValidator: fullName (required), email (email + unique users), password (required)
     let mut errors = Vec::new();
     let full_name = validate_required_string(&body, "fullName", &mut errors);
     let email = validate_email(&body, "email", &mut errors);
@@ -127,10 +104,8 @@ pub async fn register(
     // unique email check only if the email passed format validation
     if let Some(email) = email.as_ref() {
         let taken: Option<i64> = sqlx::query_scalar(
-            "SELECT CAST(1 AS BIGINT) FROM users WHERE LOWER(email) = LOWER($1) \
-             UNION SELECT CAST(1 AS BIGINT) FROM team_members WHERE LOWER(email) = LOWER($2) LIMIT 1",
+            "SELECT CAST(1 AS BIGINT) FROM users WHERE LOWER(email) = LOWER($1) LIMIT 1",
         )
-        .bind(email)
         .bind(email)
         .fetch_optional(&state.db.pool)
         .await?;

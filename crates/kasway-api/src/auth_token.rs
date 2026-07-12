@@ -3,7 +3,7 @@
 //! Token string = `{prefix}{base64url("{id}.{secret}")}`; the DB stores only
 //! `sha256(secret)` (hex). Verification decodes the id, loads the row, and
 //! constant-time compares the recomputed hash. Mirrors the merchant (`oat_`)
-//! and team-member (`tmat_`) guards in `config/auth.ts`.
+//! guard in `config/auth.ts`.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
@@ -22,12 +22,6 @@ pub const MERCHANT: TokenKind = TokenKind {
     table: "auth_access_tokens",
     type_: "auth_token",
     prefix: "oat_",
-};
-
-pub const CLIENT: TokenKind = TokenKind {
-    table: "team_member_auth_access_tokens",
-    type_: "team_member_auth_token",
-    prefix: "tmat_",
 };
 
 pub struct Verified {

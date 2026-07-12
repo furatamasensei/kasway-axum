@@ -35,31 +35,6 @@ impl FromRequestParts<AppState> for AuthMerchant {
     }
 }
 
-/// Authenticated team member (client guard), resolved from a `tmat_` token.
-pub struct AuthClient {
-    pub member_id: i64,
-    pub token_id: i64,
-}
-
-#[axum::async_trait]
-impl FromRequestParts<AppState> for AuthClient {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let token = bearer_token(parts).ok_or(AppError::Unauthorized("Unauthorized access"))?;
-        match auth_token::verify(&state.db.pool, &auth_token::CLIENT, &token).await? {
-            Some(v) => Ok(AuthClient {
-                member_id: v.tokenable_id,
-                token_id: v.token_id,
-            }),
-            None => Err(AppError::Unauthorized("Unauthorized access")),
-        }
-    }
-}
-
 /// Extract the `Authorization: Bearer <token>` value.
 pub fn bearer_token(parts: &Parts) -> Option<String> {
     let auth = parts.headers.get("authorization")?.to_str().ok()?;

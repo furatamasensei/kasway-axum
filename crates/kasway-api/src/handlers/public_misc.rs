@@ -1,25 +1,13 @@
-//! Public misc endpoints: GET /api/payments/tocatta/beta/templates
-//! (MerchantProgrammableSettlementBetaController.templates) and GET /api/price
+//! Public misc endpoint: GET /api/price
 //! (PricesController.index — CoinGecko passthrough, cached 1 minute).
 
-use crate::handlers::internal_tocatta_beta::merchant_contract;
 use crate::state::AppState;
 use axum::extract::State;
 use axum::Json;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::sync::Mutex;
 
 const CURRENCY_CODES: &str = "usd,aed,ars,aud,bdt,bhd,bmd,brl,cad,chf,clp,cny,czk,dkk,eur,gbp,gel,hkd,huf,idr,ils,inr,jpy,krw,kwd,lkr,mmk,mxn,myr,ngn,nok,nzd,php,pkr,pln,ron,rub,sar,sek,sgd,thb,try,twd,uah,vef,vnd,zar";
-
-/// `GET /api/payments/tocatta/beta/templates`
-pub async fn beta_templates() -> Json<Value> {
-    let mut contract = merchant_contract();
-    if let Value::Object(o) = &mut contract {
-        o.insert("templates".into(), json!([]));
-        o.insert("message".into(), json!("Programmable settlement beta template preview is disabled until merchant beta approval is complete."));
-    }
-    Json(contract)
-}
 
 // 1-minute price cache (cache.getOrSet ttl '1m'). Stores (unix_secs, value).
 static PRICE_CACHE: Mutex<Option<(i64, Value)>> = Mutex::new(None);

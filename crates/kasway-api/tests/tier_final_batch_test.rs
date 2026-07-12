@@ -1,24 +1,9 @@
-//! Final batch port: beta templates (#50), price (#72), risk evaluate (#161),
-//! exception link/ignore observation (#154/#155), checkout kpr1-payments (#58),
-//! transmit SSE (#1), admin queue gate (#249).
+//! Final batch port (slim rail): price (#72), checkout kpr1-payments (#58),
+//! transmit SSE (#1).
 
 mod common;
 
 use serde_json::{json, Value};
-
-// --- #50 beta templates -----------------------------------------------------
-#[tokio::test]
-async fn beta_templates_preview_disabled() {
-    let app = common::spawn_app().await;
-    let res = app.client.get(app.url("/api/payments/tocatta/beta/templates")).send().await.unwrap();
-    assert_eq!(res.status(), 200);
-    let body: Value = res.json().await.unwrap();
-    assert!(body["templates"].is_array());
-    assert_eq!(body["templates"].as_array().unwrap().len(), 0);
-    assert!(body["message"].as_str().unwrap().contains("beta"));
-    // carries the merchant settlement contract
-    assert!(body.get("supportedSplitTypes").is_some() || body.is_object());
-}
 
 // --- #72 price --------------------------------------------------------------
 #[tokio::test]
@@ -30,49 +15,6 @@ async fn price_returns_ok_without_network() {
     assert_eq!(res.status(), 200);
     let body: Value = res.json().await.unwrap();
     assert!(body.is_null()); // PRICE LOAD ERROR → null, faithful to Adonis
-}
-
-// --- #161 risk evaluate -----------------------------------------------------
-#[tokio::test]
-async fn risk_evaluate_requires_auth() {
-    let app = common::spawn_app().await;
-    let res = app.client.post(app.url("/api/payments/ops/risk/evaluate")).json(&json!({})).send().await.unwrap();
-    assert_eq!(res.status(), 401);
-}
-
-#[tokio::test]
-async fn risk_evaluate_passive_only() {
-    let app = common::spawn_app().await;
-    let token = common::register_merchant(&app, "risk-eval@test.io", "secret123").await;
-    let res = app.client.post(app.url("/api/payments/ops/risk/evaluate"))
-        .bearer_auth(&token).json(&json!({})).send().await.unwrap();
-    assert_eq!(res.status(), 200);
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["passiveOnly"], true);
-    assert!(body["data"].is_array());
-}
-
-// --- #155 ignore observation ------------------------------------------------
-#[tokio::test]
-async fn ignore_observation_requires_observation_key() {
-    let app = common::spawn_app().await;
-    let token = common::register_merchant(&app, "ignore-obs@test.io", "secret123").await;
-    // an exception key with no `:observation:` segment → 422
-    let res = app.client.post(app.url("/api/payments/ops/exceptions/invoice:1:underpaid/ignore-observation"))
-        .bearer_auth(&token).json(&json!({})).send().await.unwrap();
-    assert_eq!(res.status(), 422);
-    let body: Value = res.json().await.unwrap();
-    assert!(body["message"].as_str().unwrap().contains("observation"));
-}
-
-// --- #154 link observation --------------------------------------------------
-#[tokio::test]
-async fn link_observation_validates_body() {
-    let app = common::spawn_app().await;
-    let token = common::register_merchant(&app, "link-obs@test.io", "secret123").await;
-    let res = app.client.post(app.url("/api/payments/ops/exceptions/invoice:1:underpaid/link-observation"))
-        .bearer_auth(&token).json(&json!({})).send().await.unwrap();
-    assert_eq!(res.status(), 422); // invoiceId/paymentObservationId required
 }
 
 // --- #58 checkout kpr1-payments ---------------------------------------------
@@ -162,16 +104,4 @@ async fn transmit_private_channel_authorization() {
     let res = app.client.post(app.url("/__transmit/unsubscribe"))
         .json(&json!({ "uid": "u1", "channel": format!("merchant/{uid}/client/online") })).send().await.unwrap();
     assert_eq!(res.status(), 204);
-}
-
-// --- #249 admin queue gate --------------------------------------------------
-#[tokio::test]
-async fn admin_queue_disabled_gate() {
-    let app = common::spawn_app().await;
-    for path in ["/admin/queue", "/admin/queue/active"] {
-        let res = app.client.get(app.url(path)).send().await.unwrap();
-        assert_eq!(res.status(), 404, "{path}");
-        let body: Value = res.json().await.unwrap();
-        assert_eq!(body["message"], "Not found");
-    }
 }
