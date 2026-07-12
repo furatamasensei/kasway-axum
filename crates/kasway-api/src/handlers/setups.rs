@@ -7,7 +7,7 @@
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
-use crate::kpr1::{is_kaspa_address, MAX_BPS, MAX_SPLIT_ADDRESSES};
+use crate::kpr1::{compute_config_commitment, is_kaspa_address, percentage_to_bps, MAX_BPS, MAX_SPLIT_ADDRESSES};
 use crate::state::AppState;
 use crate::store_context::{ensure_default_store, resolve_owned_store};
 use crate::util::{json_or_null, now_iso};
@@ -54,12 +54,60 @@ const SETUP_COLS: &str = "id, user_id, store_id, tos_agreed, kaspa_main_address,
     kasplex_tax_percentage, kasplex_split_enabled, kasplex_split_addresses, redirect_url, \
     webhook_url, created_at, updated_at";
 
-fn serialize_setup(s: &SetupRow) -> Value {
+/// Commitment to this store's Kaspa rate config, matching the `configCommitment`
+/// the KPR-1 minter bakes into every intent. A merchant publishes this so a
+/// customer can check the config bound to their payment. `None` until a valid
+/// payout address is configured. Percentages go through the SAME `percentage_to_bps`
+/// the minter uses, so the hashes line up exactly.
+fn config_commitment(state: &AppState, s: &SetupRow) -> Option<String> {
+    let merchant = s.kaspa_main_address.as_deref().map(str::trim).filter(|x| !x.is_empty())?;
+    if !is_kaspa_address(merchant) {
+        return None;
+    }
+    let tax_enabled = s.kaspa_tax_enabled.unwrap_or(0) != 0;
+    let (tax_bps, tax_address) = if tax_enabled {
+        let bps = percentage_to_bps(s.kaspa_tax_percentage.as_deref()).ok()?;
+        let addr = s.kaspa_tax_address.as_deref().map(str::trim).filter(|x| !x.is_empty()).map(String::from);
+        (bps, addr)
+    } else {
+        (0, None)
+    };
+    let mut splits: Vec<(String, String, i64)> = Vec::new();
+    if s.kaspa_split_enabled.unwrap_or(0) != 0 {
+        let parsed: Value = serde_json::from_str(s.kaspa_split_addresses.as_deref().unwrap_or("[]")).ok()?;
+        for item in parsed.as_array()? {
+            let id = item.get("identifier").and_then(|v| v.as_str())?.to_string();
+            let addr = item.get("address").and_then(|v| v.as_str())?.to_string();
+            // Match the minter: percentage may be a string or a number.
+            let pct = match item.get("percentage") {
+                Some(Value::String(p)) => p.clone(),
+                Some(other) => other.to_string(),
+                None => return None,
+            };
+            let bps = percentage_to_bps(Some(&pct)).ok()?;
+            splits.push((id, addr, bps));
+        }
+    }
+    let cfg = &state.config.kpr1;
+    Some(compute_config_commitment(
+        merchant,
+        tax_enabled,
+        tax_bps,
+        tax_address.as_deref(),
+        &splits,
+        cfg.platform_fee_bps,
+        cfg.platform_fee_flat_sompi,
+        &cfg.platform_fee_address,
+    ))
+}
+
+fn serialize_setup(state: &AppState, s: &SetupRow) -> Value {
     json!({
         "id": s.id,
         "userId": s.user_id,
         "storeId": s.store_id,
         "tosAgreed": s.tos_agreed.unwrap_or(0) != 0,
+        "configCommitment": config_commitment(state, s),
         "kaspaMainAddress": s.kaspa_main_address,
         "kaspaTaxEnabled": s.kaspa_tax_enabled.unwrap_or(0) != 0,
         "kaspaTaxAddress": s.kaspa_tax_address,
@@ -301,7 +349,7 @@ async fn upsert_kaspa_setup(
 pub async fn index(auth: AuthMerchant, State(state): State<AppState>) -> AppResult<Json<Value>> {
     let store_id = ensure_default_store(&state, auth.user_id).await?;
     let setup = find_setup(&state, auth.user_id, store_id, true).await?;
-    Ok(Json(setup.map(|s| serialize_setup(&s)).unwrap_or(Value::Null)))
+    Ok(Json(setup.map(|s| serialize_setup(&state, &s)).unwrap_or(Value::Null)))
 }
 
 /// `POST /api/setup`
@@ -312,7 +360,7 @@ pub async fn store(
 ) -> AppResult<Json<Value>> {
     let store_id = ensure_default_store(&state, auth.user_id).await?;
     let setup = store_setup_for_store(&state, auth.user_id, store_id, true, &body).await?;
-    Ok(Json(serialize_setup(&setup)))
+    Ok(Json(serialize_setup(&state, &setup)))
 }
 
 /// `PUT /api/setup`
@@ -323,7 +371,7 @@ pub async fn update(
 ) -> AppResult<Json<Value>> {
     let store_id = ensure_default_store(&state, auth.user_id).await?;
     let setup = update_setup_for_store(&state, auth.user_id, store_id, true, &body).await?;
-    Ok(Json(serialize_setup(&setup)))
+    Ok(Json(serialize_setup(&state, &setup)))
 }
 
 // --- handlers: per-store (/api/stores/:id/setup) ---
@@ -336,7 +384,7 @@ pub async fn store_show(
 ) -> AppResult<Json<Value>> {
     let (store_id, is_default) = resolve_owned_store(&state, auth.user_id, id).await?;
     let setup = find_setup(&state, auth.user_id, store_id, is_default).await?;
-    Ok(Json(setup.map(|s| serialize_setup(&s)).unwrap_or(Value::Null)))
+    Ok(Json(setup.map(|s| serialize_setup(&state, &s)).unwrap_or(Value::Null)))
 }
 
 /// `POST /api/stores/:id/setup`
@@ -348,7 +396,7 @@ pub async fn store_store(
 ) -> AppResult<Json<Value>> {
     let (store_id, is_default) = resolve_owned_store(&state, auth.user_id, id).await?;
     let setup = store_setup_for_store(&state, auth.user_id, store_id, is_default, &body).await?;
-    Ok(Json(serialize_setup(&setup)))
+    Ok(Json(serialize_setup(&state, &setup)))
 }
 
 /// `PUT /api/stores/:id/setup`
@@ -360,7 +408,7 @@ pub async fn store_update(
 ) -> AppResult<Json<Value>> {
     let (store_id, is_default) = resolve_owned_store(&state, auth.user_id, id).await?;
     let setup = update_setup_for_store(&state, auth.user_id, store_id, is_default, &body).await?;
-    Ok(Json(serialize_setup(&setup)))
+    Ok(Json(serialize_setup(&state, &setup)))
 }
 
 /// `POST /api/stores/:id/setup/clone`
@@ -373,7 +421,7 @@ pub async fn store_clone(
     let source_id = source_store_id(&body)?;
     let sections: Vec<String> = SETUP_SECTIONS.iter().map(|s| s.to_string()).collect();
     let setup = copy_sections(&state, auth.user_id, id, source_id, &sections).await?;
-    Ok(Json(serialize_setup(&setup)))
+    Ok(Json(serialize_setup(&state, &setup)))
 }
 
 /// `POST /api/stores/:id/setup/copy` and `/sync`
@@ -386,7 +434,7 @@ pub async fn store_copy(
     let source_id = source_store_id(&body)?;
     let sections = sections_input(&body)?;
     let setup = copy_sections(&state, auth.user_id, id, source_id, &sections).await?;
-    Ok(Json(serialize_setup(&setup)))
+    Ok(Json(serialize_setup(&state, &setup)))
 }
 
 // --- core service logic ---

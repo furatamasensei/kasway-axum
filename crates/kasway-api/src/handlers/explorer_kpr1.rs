@@ -3,7 +3,9 @@
 //! / payment_credits / invoices, projecting public payment facts.
 
 use crate::error::AppResult;
+use crate::kpr1::{canonicalize, signing_public_key_b64, verify_intent_signature};
 use crate::state::AppState;
+use crate::util::sha256_hex;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -332,6 +334,161 @@ async fn serialize(
         result["wallet"] = json!({ "canonicalIntent": canon });
     }
     Ok(result)
+}
+
+// ---- settlement proof (self-verifying) -------------------------------------
+//
+// Unlike the explorer projection above (which echoes stored DB status flags),
+// the settlement proof RECOMPUTES the answer: it re-hashes the stored canonical
+// intent, re-verifies the ed25519 signature against the published signing key,
+// and surfaces the on-chain settlement tx id + covenant address so a third party
+// can independently confirm the outcome on any Kaspa node — without trusting a
+// Kasway "paid" flag.
+
+#[derive(sqlx::FromRow)]
+struct ProofRow {
+    intent_id: String,
+    invoice_id: i64,
+    network: String,
+    asset_id: String,
+    amount_sompi: i64,
+    canonical_hash: String,
+    canonical_intent: String,
+    signature_algorithm: String,
+    signature_key_id: String,
+    script_hash: Option<String>,
+    covenant_address: Option<String>,
+    covenant_state: Option<String>,
+    gross_amount: Option<i64>,
+    release_tx_id: Option<String>,
+    refund_tx_id: Option<String>,
+    settled_at: Option<String>,
+}
+
+const PROOF_COLS: &str = "intent_id, invoice_id, network, asset_id, amount_sompi, canonical_hash, \
+    canonical_intent, signature_algorithm, signature_key_id, script_hash, covenant_address, \
+    covenant_state, gross_amount, release_tx_id, refund_tx_id, settled_at";
+
+async fn proof_by_intent(state: &AppState, intent_id: &str) -> AppResult<Option<ProofRow>> {
+    Ok(sqlx::query_as::<_, ProofRow>(&format!(
+        "SELECT {PROOF_COLS} FROM kpr1_payment_intents WHERE intent_id = $1 LIMIT 1"
+    ))
+    .bind(intent_id)
+    .fetch_optional(&state.db.pool)
+    .await?)
+}
+
+/// `proof_by` for the BIGINT `invoice_id` column (Postgres rejects bigint = text).
+async fn proof_by_invoice(state: &AppState, invoice_id: i64) -> AppResult<Option<ProofRow>> {
+    Ok(sqlx::query_as::<_, ProofRow>(&format!(
+        "SELECT {PROOF_COLS} FROM kpr1_payment_intents WHERE invoice_id = $1 LIMIT 1"
+    ))
+    .bind(invoice_id)
+    .fetch_optional(&state.db.pool)
+    .await?)
+}
+
+/// Strip the `signature` object from a signed intent, yielding the exact payload
+/// that was ed25519-signed at mint time.
+fn intent_without_signature(intent: &Value) -> Value {
+    let mut m = intent.as_object().cloned().unwrap_or_default();
+    m.remove("signature");
+    Value::Object(m)
+}
+
+fn build_settlement_proof(state: &AppState, row: &ProofRow, lookup_type: &str, lookup_value: &str) -> Value {
+    let signed_intent: Value = serde_json::from_str(&row.canonical_intent).unwrap_or(json!({}));
+
+    // 1. Recompute the canonical hash from the stored signed intent.
+    let recomputed_hash = sha256_hex(canonicalize(&signed_intent).as_bytes());
+    let hash_matches = recomputed_hash == row.canonical_hash;
+
+    // 2. Re-verify the ed25519 signature over the unsigned canonical payload
+    //    against the published signing key (recomputed, not a stored flag).
+    let unsigned_canonical = canonicalize(&intent_without_signature(&signed_intent));
+    let sig_value = signed_intent
+        .get("signature")
+        .and_then(|s| s.get("value"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let seed = &state.config.kpr1.signing_seed;
+    let signature_verified = !sig_value.is_empty() && verify_intent_signature(seed, &unsigned_canonical, sig_value);
+
+    // 3. On-chain settlement facts anyone can independently check.
+    let covenant_state = row.covenant_state.clone().unwrap_or_else(|| "pending".into());
+    let settled = covenant_state == "settled"
+        || matches!(covenant_state.as_str(), "released" | "captured" | "arbitrated" | "settled_mutual" | "settled_jury")
+        || row.release_tx_id.is_some();
+    let refunded = covenant_state == "refunded" || row.refund_tx_id.is_some();
+    let settlement_tx_id = row.release_tx_id.clone().or_else(|| row.refund_tx_id.clone());
+    let outcome = if refunded { "refunded" } else if settled { "settled" } else { "pending" };
+
+    let config_commitment = signed_intent.get("configCommitment").and_then(|v| v.as_str());
+
+    json!({
+        "lookup": { "type": lookup_type, "value": lookup_value, "matched": true },
+        "payment": {
+            "rail": "kpr1_covenant",
+            "intentId": row.intent_id,
+            "invoiceId": row.invoice_id,
+            "network": row.network,
+            "assetId": row.asset_id,
+            "amountSompi": row.amount_sompi.to_string(),
+            "grossSompi": row.gross_amount.map(|g| g.to_string()),
+        },
+        // Everything a third party needs to verify the intent OFFLINE, plus the
+        // recomputed verdict so they need not trust our DB flags.
+        "proof": {
+            "canonicalHash": row.canonical_hash,
+            "recomputedCanonicalHash": recomputed_hash,
+            "canonicalHashMatches": hash_matches,
+            "signature": {
+                "alg": row.signature_algorithm,
+                "keyId": row.signature_key_id,
+                "publicKey": signing_public_key_b64(seed),
+                "publicKeyEncoding": "base64-raw-ed25519",
+                "verified": signature_verified,
+            },
+            "configCommitment": config_commitment,
+            "selfVerified": hash_matches && signature_verified,
+            "canonicalIntent": signed_intent,
+        },
+        "settlement": {
+            "outcome": outcome,
+            "covenantState": covenant_state,
+            "covenantAddress": row.covenant_address,
+            "scriptHash": row.script_hash,
+            "settlementTxId": settlement_tx_id,
+            "releaseTxId": row.release_tx_id,
+            "refundTxId": row.refund_tx_id,
+            "settledAt": row.settled_at,
+            "note": "settlementTxId is a Kaspa transaction — verify it against any Kaspa node/explorer to confirm the covenant paid the intent's outputs. Custody and payout are enforced on-chain by the covenant, not by this response.",
+        },
+    })
+}
+
+/// `GET /api/explorer/kpr1/intents/:intentId/settlement-proof`
+pub async fn settlement_proof_by_intent(State(state): State<AppState>, Path(intent_id): Path<String>) -> AppResult<Response> {
+    match proof_by_intent(&state, &intent_id).await? {
+        Some(row) => Ok(Json(build_settlement_proof(&state, &row, "intent_id", &intent_id)).into_response()),
+        None => Ok(not_found("intent_id", &intent_id)),
+    }
+}
+
+/// `GET /api/explorer/kpr1/invoices/:publicId/settlement-proof`
+pub async fn settlement_proof_by_invoice(State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Response> {
+    let invoice_id: Option<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE public_id = $1")
+        .bind(&public_id)
+        .fetch_optional(&state.db.pool)
+        .await?;
+    let row = match invoice_id {
+        Some(id) => proof_by_invoice(&state, id).await?,
+        None => None,
+    };
+    match row {
+        Some(row) => Ok(Json(build_settlement_proof(&state, &row, "invoice_public_id", &public_id)).into_response()),
+        None => Ok(not_found("invoice_public_id", &public_id)),
+    }
 }
 
 fn not_found(lookup_type: &str, value: &str) -> Response {

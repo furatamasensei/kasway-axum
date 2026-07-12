@@ -77,7 +77,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/internal/payment-ops/tocatta/covenants/tn10/status", get(handlers::internal_covenant::tn10_status))
         .route("/internal/payment-ops/tocatta/covenants/tn10/split-executions", post(handlers::internal_covenant::execute_split))
         .route("/internal/payment-ops/tocatta/covenants/tn10/hold-release-executions", post(handlers::internal_covenant::execute_hold_release))
-        // --- Internal KPR-1 dispute resolution (arbiter; internal token) ---
+        // --- Internal KPR-1 dispute resolution (independent M-of-N arbiter panel; internal token) ---
+        .route("/internal/payment-ops/kpr1/invoices/:publicId/release-arbitrated/prepare", post(handlers::internal_kpr1_ops::release_arbitrated_prepare))
         .route("/internal/payment-ops/kpr1/invoices/:publicId/release-arbitrated", post(handlers::internal_kpr1_ops::release_arbitrated))
         .route("/internal/payment-ops/kpr1/invoices/:publicId/refund-arbitrated/prepare", post(handlers::internal_kpr1_ops::refund_arbitrated_prepare))
         .route("/internal/payment-ops/kpr1/invoices/:publicId/refund-arbitrated", post(handlers::internal_kpr1_ops::refund_arbitrated_submit))
@@ -98,6 +99,8 @@ pub fn build_router(state: AppState) -> Router {
         // --- Public KPR-1 explorer ---
         .route("/api/explorer/kpr1/intents/:intentId", get(handlers::explorer_kpr1::show_intent))
         .route("/api/explorer/kpr1/intents/:intentId/wallet-verification", get(handlers::explorer_kpr1::wallet_verification))
+        .route("/api/explorer/kpr1/intents/:intentId/settlement-proof", get(handlers::explorer_kpr1::settlement_proof_by_intent))
+        .route("/api/explorer/kpr1/invoices/:publicId/settlement-proof", get(handlers::explorer_kpr1::settlement_proof_by_invoice))
         .route("/api/explorer/kpr1/payment-requests/:canonicalHash", get(handlers::explorer_kpr1::show_payment_request))
         .route("/api/explorer/kpr1/transactions/:txId", get(handlers::explorer_kpr1::show_transaction))
         .route("/api/explorer/kpr1/invoices/:publicId", get(handlers::explorer_kpr1::show_invoice))

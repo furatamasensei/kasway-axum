@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::util::{decode_hex32, encode_hex, now_iso, sha256_hex, to_iso};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier};
 use serde_json::{json, Value};
 
 const KPR1_VERSION: &str = "kpr-1";
@@ -76,7 +76,7 @@ pub fn platform_fee_total(gross: i128, bps: i64, flat: i64) -> AppResult<i128> {
 }
 
 /// percentage (e.g. 2.5) -> bps (250), at most 2 decimals.
-fn percentage_to_bps(percentage: Option<&str>) -> AppResult<i64> {
+pub(crate) fn percentage_to_bps(percentage: Option<&str>) -> AppResult<i64> {
     let Some(p) = percentage else { return Ok(0) };
     let p = p.trim();
     if p.is_empty() {
@@ -131,6 +131,55 @@ pub fn canonicalize(value: &Value) -> String {
 fn sign(message: &str, seed: &[u8; 32]) -> String {
     let key = SigningKey::from_bytes(seed);
     B64.encode(key.sign(message.as_bytes()).to_bytes())
+}
+
+/// The raw ed25519 public key (32 bytes, base64) for the KPR-1 signing seed.
+/// Published in the settlement proof so a third party can verify intents offline.
+pub fn signing_public_key_b64(seed: &[u8; 32]) -> String {
+    B64.encode(SigningKey::from_bytes(seed).verifying_key().to_bytes())
+}
+
+/// Verify a base64 ed25519 `signature` over `message` against the seed's public
+/// key. Used by the self-verifying settlement proof — it recomputes the answer
+/// instead of trusting a stored DB flag.
+pub fn verify_intent_signature(seed: &[u8; 32], message: &str, signature_b64: &str) -> bool {
+    let key = SigningKey::from_bytes(seed);
+    let Ok(sig_bytes) = B64.decode(signature_b64) else { return false };
+    let Ok(sig) = Signature::from_slice(&sig_bytes) else { return false };
+    key.verifying_key().verify(message.as_bytes(), &sig).is_ok()
+}
+
+/// Deterministic commitment to the merchant's *rate configuration* — payout
+/// address, tax, revenue splits, and platform fee — independent of any single
+/// invoice's amounts. sha256 over canonical JSON, so identical config always
+/// yields the same commitment. A merchant can publish this once; a customer then
+/// checks that the `configCommitment` inside their signed KPR-1 intent matches
+/// the published value, proving the config was not swapped between publication
+/// and mint. `splits` is `(identifier, address, bps)` in any order (sorted here).
+pub fn compute_config_commitment(
+    merchant_address: &str,
+    tax_enabled: bool,
+    tax_bps: i64,
+    tax_address: Option<&str>,
+    splits: &[(String, String, i64)],
+    platform_fee_bps: i64,
+    platform_fee_flat_sompi: i64,
+    platform_fee_address: &str,
+) -> String {
+    let mut ordered: Vec<&(String, String, i64)> = splits.iter().collect();
+    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+    let split_json: Vec<Value> = ordered
+        .iter()
+        .map(|(id, addr, bps)| json!({ "identifier": id, "address": addr, "bps": bps }))
+        .collect();
+    let config = json!({
+        "version": 1,
+        "merchantAddress": merchant_address,
+        "tax": { "enabled": tax_enabled, "bps": tax_bps, "address": tax_address },
+        "splits": split_json,
+        "platformFee": { "bps": platform_fee_bps, "flatSompi": platform_fee_flat_sompi, "address": platform_fee_address },
+    });
+    sha256_hex(canonicalize(&config).as_bytes())
 }
 
 fn url_host(app_url: &str) -> String {
@@ -357,6 +406,23 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     let tax = resolve_tax_config(&setup)?;
     let (split_total_bps, split_outs) = resolve_split_config(&setup)?;
 
+    // Commit to the merchant's rate configuration (payout/tax/splits/platform
+    // fee) so the customer can verify it was not swapped before this intent was
+    // minted. Bound into the signed intent below (and thus into its canonical
+    // hash and the covenant the customer funds).
+    let commitment_splits: Vec<(String, String, i64)> =
+        split_outs.iter().map(|s| (s.identifier.clone(), s.address.clone(), s.bps)).collect();
+    let config_commitment = compute_config_commitment(
+        &merchant_address,
+        tax.enabled,
+        tax.bps,
+        tax.address.as_deref(),
+        &commitment_splits,
+        cfg.platform_fee_bps,
+        cfg.platform_fee_flat_sompi,
+        &platform_fee_address,
+    );
+
     let amount = ctx.total_amount as i128;
     let platform_fee = platform_fee_total(amount, cfg.platform_fee_bps, cfg.platform_fee_flat_sompi)?;
     let tax_amount = bps_amount(amount, tax.bps, "KPR-1 tax bps invalid")?;
@@ -467,6 +533,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         "expiryTs": expiry_ts,
         "template": template,
         "outputs": outputs,
+        "configCommitment": config_commitment,
         "settlement": { "mode": "covenant", "addressRequiredFromWallet": true, "captureWindowSeconds": capture_window },
         "refund": { "addressRequiredFromWallet": true, "captureWindowSeconds": capture_window },
         "merchant": { "name": cfg.app_name, "domain": url_host(&cfg.app_url) },
@@ -506,6 +573,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         "walletLocalSigningRequired": true,
         "settlementMode": "covenant",
         "covenantTemplate": { "id": TEMPLATE_ID, "version": TEMPLATE_VERSION, "kind": "refund_window" },
+        "configCommitment": config_commitment,
     });
 
     let now = now_iso();
@@ -714,4 +782,61 @@ fn finalize_response(address: &str, gross: u64, expiry: u64, state: &str) -> Val
         "expiryTs": expiry,
         "covenantState": state,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn splits_a() -> Vec<(String, String, i64)> {
+        vec![
+            ("partner-b".into(), "kaspatest:bbb0000000001".into(), 500),
+            ("partner-a".into(), "kaspatest:aaa0000000001".into(), 250),
+        ]
+    }
+
+    #[test]
+    fn config_commitment_is_deterministic_and_order_independent() {
+        let a = compute_config_commitment(
+            "kaspatest:merchant0001", true, 500, Some("kaspatest:tax0001"),
+            &splits_a(), 100, 0, "kaspatest:fee0001",
+        );
+        // Same config, splits supplied in the opposite order → identical hash.
+        let mut reordered = splits_a();
+        reordered.reverse();
+        let b = compute_config_commitment(
+            "kaspatest:merchant0001", true, 500, Some("kaspatest:tax0001"),
+            &reordered, 100, 0, "kaspatest:fee0001",
+        );
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 64); // sha256 hex
+    }
+
+    #[test]
+    fn config_commitment_changes_when_a_rate_changes() {
+        let base = compute_config_commitment(
+            "kaspatest:merchant0001", true, 500, Some("kaspatest:tax0001"),
+            &splits_a(), 100, 0, "kaspatest:fee0001",
+        );
+        // Bump the tax bps: the commitment must differ.
+        let bumped = compute_config_commitment(
+            "kaspatest:merchant0001", true, 750, Some("kaspatest:tax0001"),
+            &splits_a(), 100, 0, "kaspatest:fee0001",
+        );
+        assert_ne!(base, bumped);
+    }
+
+    #[test]
+    fn intent_signature_roundtrips_and_rejects_tampering() {
+        let seed = [9u8; 32];
+        let msg = r#"{"amountSompi":"1000","intentId":"kpr1_test"}"#;
+        let sig = sign(msg, &seed);
+        assert!(verify_intent_signature(&seed, msg, &sig));
+        // Tampered message must fail.
+        assert!(!verify_intent_signature(&seed, r#"{"amountSompi":"9999"}"#, &sig));
+        // Wrong key must fail.
+        assert!(!verify_intent_signature(&[8u8; 32], msg, &sig));
+        // Public key export is stable base64.
+        assert_eq!(signing_public_key_b64(&seed), signing_public_key_b64(&seed));
+    }
 }

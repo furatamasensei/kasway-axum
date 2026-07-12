@@ -25,8 +25,7 @@ use crate::util::{decode_hex, decode_hex32, encode_hex, now_iso};
 use kasway_covenant::escrow_v2::{
     compile_escrow_v2, complete_refund_by_arbiter, complete_refund_by_merchant, complete_release,
     complete_release_arbitrated, complete_settlement, prepare_refund_by_arbiter, prepare_release, prepare_settlement,
-    ArbiterRefundDraft, EscrowV2Params, EP_REFUND_BY_ARBITER, EP_REFUND_BY_MERCHANT, EP_RELEASE_CAPTURED,
-    EP_RELEASE_CONFIRMED,
+    ArbiterRefundDraft, EscrowV2Params, EP_RELEASE_CAPTURED, EP_RELEASE_CONFIRMED,
 };
 use kasway_covenant::{covenant_address, network_prefix, rpc_submit_params, Destination, KeeperKey, Payout, Utxo};
 use serde_json::json;
@@ -280,8 +279,47 @@ struct ReleaseCtx {
     min_fee: u64,
 }
 
-/// The Kasway arbiter signing key (from `COVENANT_ARBITER_SECRET`). It signs
-/// dispute rulings — `release_arbitrated` / `refund_by_arbiter` — server-side.
+/// Validate externally-collected M-of-N arbiter signatures against the covenant's
+/// consented panel and return them ordered `(sigs, signer_idx)`. Enforces: each
+/// index is inside the panel, indices are unique (strictly increasing after the
+/// sort → the covenant's no-double-count rule), each signature is 65 bytes, and
+/// at least `threshold` were supplied. The covenant itself checks the signatures
+/// cryptographically on-chain, so we only shape/bound the input here.
+fn prepare_arbiter_signatures(
+    params: &EscrowV2Params,
+    mut provided: Vec<(u32, Vec<u8>)>,
+) -> AppResult<(Vec<Vec<u8>>, Vec<u32>)> {
+    provided.sort_by_key(|(idx, _)| *idx);
+    let n = params.arbiter_panel.len() as u32;
+    let mut last: Option<u32> = None;
+    for (idx, sig) in &provided {
+        if *idx >= n {
+            return Err(rerr(format!("arbiter signer index {idx} is outside the {n}-member panel")));
+        }
+        if Some(*idx) == last {
+            return Err(rerr(format!("arbiter signer index {idx} is repeated")));
+        }
+        if sig.len() != 65 {
+            return Err(rerr("each arbiter signature must be 65-byte hex (schnorr signature || sighash-type byte)"));
+        }
+        last = Some(*idx);
+    }
+    if (provided.len() as u32) < params.arbiter_threshold {
+        return Err(rerr(format!(
+            "arbiter panel requires at least {} of {} signatures ({} supplied)",
+            params.arbiter_threshold,
+            n,
+            provided.len()
+        )));
+    }
+    let sigs: Vec<Vec<u8>> = provided.iter().map(|(_, s)| s.clone()).collect();
+    let idx: Vec<u32> = provided.iter().map(|(i, _)| *i).collect();
+    Ok((sigs, idx))
+}
+
+/// The Kasway arbiter signing key (from `COVENANT_ARBITER_SECRET`). Used ONLY for
+/// the transitional 1-of-1 dev fallback when no external panel signatures are
+/// supplied; production requires a real independent panel (see `state.rs`).
 fn arbiter_signing_key(state: &AppState) -> AppResult<KeeperKey> {
     let hex = state
         .config
@@ -648,11 +686,12 @@ async fn finalize_refund(state: &AppState, ctx: &RefundCtx, tx_id: &str) -> AppR
     Ok(json!({ "refunded": true, "refundTxId": tx_id, "invoiceStatus": "refunded" }))
 }
 
-/// Run a refund submit: claim the row, build+broadcast, persist (or roll back).
+/// Run a merchant refund submit: claim the row, build+broadcast, persist (or roll
+/// back). The merchant's single signature authorizes the covenant refund; the
+/// arbiter (M-of-N) path uses `submit_refund_arbitrated` instead.
 async fn submit_refund(
     state: &AppState,
     ctx: &RefundCtx,
-    entrypoint: &str,
     covenant_sig: &[u8],
     fee_sig: &[u8],
 ) -> AppResult<serde_json::Value> {
@@ -662,14 +701,37 @@ async fn submit_refund(
     let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
     let outcome = async {
         let (compiled, draft) = build_refund_draft(ctx)?;
-        // Merchant refund = merchant's single covenant sig. Arbiter refund = the
-        // M-of-N panel; in the transitional 1-of-1 panel the arbiter is index 0.
-        let spend = if entrypoint == EP_REFUND_BY_MERCHANT {
-            complete_refund_by_merchant(&compiled, draft, covenant_sig, fee_sig).map_err(|e| rerr(e.to_string()))?
-        } else {
-            complete_refund_by_arbiter(&compiled, draft, &[covenant_sig.to_vec()], &[0], fee_sig)
-                .map_err(|e| rerr(e.to_string()))?
-        };
+        let spend = complete_refund_by_merchant(&compiled, draft, covenant_sig, fee_sig)
+            .map_err(|e| rerr(e.to_string()))?;
+        client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))
+    }
+    .await;
+    match outcome {
+        Ok(tx_id) => finalize_refund(state, ctx, &tx_id).await,
+        Err(e) => {
+            restore_funded(state, ctx.intent_pk, "refunding").await;
+            Err(e)
+        }
+    }
+}
+
+/// `submit_refund` for the M-of-N arbiter refund: `signer_idx`-labelled panel
+/// signatures on the covenant input, plus the customer's fee signature.
+async fn submit_refund_arbitrated(
+    state: &AppState,
+    ctx: &RefundCtx,
+    sigs: &[Vec<u8>],
+    signer_idx: &[u32],
+    fee_sig: &[u8],
+) -> AppResult<serde_json::Value> {
+    if !claim_funded(state, ctx.intent_pk, "refunding").await? {
+        return Err(rerr("covenant is no longer awaiting settlement"));
+    }
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
+    let outcome = async {
+        let (compiled, draft) = build_refund_draft(ctx)?;
+        let spend = complete_refund_by_arbiter(&compiled, draft, sigs, signer_idx, fee_sig)
+            .map_err(|e| rerr(e.to_string()))?;
         client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))
     }
     .await;
@@ -684,11 +746,37 @@ async fn submit_refund(
 
 // ---- release_arbitrated (operator; server holds arbiter + keeper keys) ----
 
-/// Kasway (arbiter) releases the covenant to the merchant, resolving a dispute in
-/// the merchant's favor. Single operator call.
-pub(crate) async fn arbiter_release(state: &AppState, public_id: &str) -> AppResult<serde_json::Value> {
+/// Step 1: build the arbiter-release tx (merchant split, keeper subsidizes gas)
+/// and return the covenant sighash the INDEPENDENT arbiter panel signs, plus how
+/// many of the N members must sign. Each arbiter signs this sighash off-band; the
+/// operator collects `threshold` signatures and submits them to `arbiter_release`.
+pub(crate) async fn arbiter_release_prepare(state: &AppState, public_id: &str) -> AppResult<serde_json::Value> {
     let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
-    let arbiter = arbiter_signing_key(state)?;
+    let ctx = gather_release_inputs(state, &client, public_id).await?;
+    let compiled = compile_escrow_v2(&ctx.params).map_err(|e| rerr(e.to_string()))?;
+    let draft = prepare_release(&compiled, &ctx.params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
+        .map_err(|e| rerr(e.to_string()))?;
+    Ok(json!({
+        "covenantSighash": encode_hex(&draft.covenant_sighash),
+        "arbiterThreshold": ctx.params.arbiter_threshold,
+        "arbiterPanelSize": ctx.params.arbiter_panel.len(),
+        "sigHashType": "SIG_HASH_ALL",
+        "algorithm": "schnorr",
+        "note": "each independent arbiter signs this covenant sighash with their panel key; submit at least `arbiterThreshold` signatures as { index, signature } (signature = 65-byte hex: schnorr || sighash-type byte)",
+    }))
+}
+
+/// Kasway records the panel's ruling FOR the merchant: release the covenant to
+/// the merchant split. `arbiter_sigs` are the independent panel members'
+/// `(panel_index, 65-byte signature)` collected off-band. When empty, the
+/// transitional dev fallback signs with the single Kasway arbiter key at index 0
+/// (only valid for the 1-of-1 dev panel; production forbids that config).
+pub(crate) async fn arbiter_release(
+    state: &AppState,
+    public_id: &str,
+    arbiter_sigs: Vec<(u32, Vec<u8>)>,
+) -> AppResult<serde_json::Value> {
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
     let ctx = gather_release_inputs(state, &client, public_id).await?;
 
     if !claim_funded(state, ctx.intent_pk, "releasing").await? {
@@ -699,9 +787,15 @@ pub(crate) async fn arbiter_release(state: &AppState, public_id: &str) -> AppRes
         let compiled = compile_escrow_v2(&ctx.params).map_err(|e| rerr(e.to_string()))?;
         let draft = prepare_release(&compiled, &ctx.params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
             .map_err(|e| rerr(e.to_string()))?;
-        let arbiter_sig = arbiter.sign_sighash(&draft.covenant_sighash).map_err(|e| rerr(e.to_string()))?;
-        // Transitional 1-of-1 arbiter panel: the Kasway arbiter is panel index 0.
-        let spend = complete_release_arbitrated(&compiled, draft, &[arbiter_sig], &[0]).map_err(|e| rerr(e.to_string()))?;
+        let (sigs, idx) = if arbiter_sigs.is_empty() {
+            // Dev fallback only: server signs with the single Kasway arbiter key.
+            let arbiter = arbiter_signing_key(state)?;
+            let arbiter_sig = arbiter.sign_sighash(&draft.covenant_sighash).map_err(|e| rerr(e.to_string()))?;
+            (vec![arbiter_sig], vec![0u32])
+        } else {
+            prepare_arbiter_signatures(&ctx.params, arbiter_sigs)?
+        };
+        let spend = complete_release_arbitrated(&compiled, draft, &sigs, &idx).map_err(|e| rerr(e.to_string()))?;
         client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))
     }
     .await;
@@ -751,7 +845,7 @@ pub(crate) async fn merchant_refund_submit(
     let fee_sig = decode_sig65(fee_sig_hex)?;
     let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
     let ctx = gather_refund_inputs(state, &client, public_id, FeePayer::Merchant).await?;
-    submit_refund(state, &ctx, EP_REFUND_BY_MERCHANT, &covenant_sig, &fee_sig).await
+    submit_refund(state, &ctx, &covenant_sig, &fee_sig).await
 }
 
 // ---- refund_by_arbiter (Kasway signs covenant; customer signs fee) ----
@@ -760,34 +854,44 @@ pub(crate) async fn merchant_refund_submit(
 /// the CUSTOMER signs (they pay the gas); the covenant is authorized server-side.
 pub(crate) async fn arbiter_refund_prepare(state: &AppState, public_id: &str) -> AppResult<serde_json::Value> {
     let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
-    // Confirm the arbiter key exists before asking the customer to sign anything.
-    let _ = arbiter_signing_key(state)?;
     let ctx = gather_refund_inputs(state, &client, public_id, FeePayer::Customer).await?;
     let (_compiled, draft) = build_refund_draft(&ctx)?;
     Ok(json!({
+        "covenantSighash": encode_hex(&draft.covenant_sighash),
         "feeSighash": encode_hex(&draft.fee_sighash),
         "feePayerAddress": ctx.fee_payer.address().to_string(),
+        "arbiterThreshold": ctx.params.arbiter_threshold,
+        "arbiterPanelSize": ctx.params.arbiter_panel.len(),
         "sigHashType": "SIG_HASH_ALL",
         "algorithm": "schnorr",
-        "note": "customer signs this fee sighash with their refund key (they pay the refund gas); the covenant is authorized by the Kasway arbiter server-side. Submit the 65-byte signature (schnorr || sighash-type byte) as hex",
+        "note": "the customer signs feeSighash with their refund key (they pay the refund gas); the independent arbiter panel signs covenantSighash. Submit the customer feeSignature plus at least `arbiterThreshold` arbiterSignatures as { index, signature } (each 65-byte hex: schnorr || sighash-type byte)",
     }))
 }
 
-/// Step 2: the server signs the covenant with the arbiter key, attaches the
-/// customer's fee signature, broadcasts, and refunds the full gross.
+/// Step 2: the independent arbiter panel authorizes the covenant refund. Attaches
+/// the panel's `arbiter_sigs` (`(panel_index, 65-byte signature)`) and the
+/// customer's fee signature, broadcasts, and refunds the full gross. When
+/// `arbiter_sigs` is empty, the transitional dev fallback signs the covenant with
+/// the single Kasway arbiter key (only valid for the 1-of-1 dev panel).
 pub(crate) async fn arbiter_refund_submit(
     state: &AppState,
     public_id: &str,
     fee_sig_hex: &str,
+    arbiter_sigs: Vec<(u32, Vec<u8>)>,
 ) -> AppResult<serde_json::Value> {
     let fee_sig = decode_sig65(fee_sig_hex)?;
-    let arbiter = arbiter_signing_key(state)?;
     let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
     let ctx = gather_refund_inputs(state, &client, public_id, FeePayer::Customer).await?;
-    // The arbiter signs the deterministic covenant sighash server-side.
     let (_compiled, draft) = build_refund_draft(&ctx)?;
-    let arbiter_sig = arbiter.sign_sighash(&draft.covenant_sighash).map_err(|e| rerr(e.to_string()))?;
-    submit_refund(state, &ctx, EP_REFUND_BY_ARBITER, &arbiter_sig, &fee_sig).await
+    let (sigs, idx) = if arbiter_sigs.is_empty() {
+        // Dev fallback only: server signs with the single Kasway arbiter key.
+        let arbiter = arbiter_signing_key(state)?;
+        let arbiter_sig = arbiter.sign_sighash(&draft.covenant_sighash).map_err(|e| rerr(e.to_string()))?;
+        (vec![arbiter_sig], vec![0u32])
+    } else {
+        prepare_arbiter_signatures(&ctx.params, arbiter_sigs)?
+    };
+    submit_refund_arbitrated(state, &ctx, &sigs, &idx, &fee_sig).await
 }
 
 /// Decode a 65-byte covenant signature (schnorr signature || sighash-type byte).

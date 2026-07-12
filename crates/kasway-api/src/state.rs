@@ -131,6 +131,51 @@ impl Default for CovenantConfig {
     }
 }
 
+/// Enforce, in production, that Tier-2 dispute arbitration is delegated to an
+/// INDEPENDENT M-of-N panel that Kasway is not a member of. Returns an error
+/// message (used to panic at startup) when the panel is missing or Kasway sits
+/// on it. Dev/test keep the transitional 1-of-1 Kasway fallback.
+fn validate_production_arbiter(covenant: &CovenantConfig) -> Result<(), String> {
+    if covenant.arbiter_panel_hex.is_empty() {
+        return Err(
+            "COVENANT_ARBITER_PANEL must list independent arbiter x-only pubkeys in production; \
+             refusing to start with the 1-of-1 Kasway arbiter fallback (Kasway must not decide disputes alone)"
+                .to_string(),
+        );
+    }
+    // Every panel entry must be a valid 32-byte x-only pubkey.
+    let mut panel: Vec<[u8; 32]> = Vec::with_capacity(covenant.arbiter_panel_hex.len());
+    for hex in &covenant.arbiter_panel_hex {
+        let pk = decode_hex32(hex.trim())
+            .ok_or_else(|| format!("COVENANT_ARBITER_PANEL entry {hex:?} must be 32-byte hex"))?;
+        panel.push(pk);
+    }
+    if covenant.arbiter_threshold as usize > panel.len() || covenant.arbiter_threshold == 0 {
+        return Err(format!(
+            "COVENANT_ARBITER_THRESHOLD ({}) must be between 1 and the panel size ({})",
+            covenant.arbiter_threshold,
+            panel.len()
+        ));
+    }
+    // Kasway's own arbiter key MUST NOT be a panel member — that is the whole
+    // point of delegating the decision.
+    if let Some(hex) = covenant.arbiter_secret_hex.as_deref() {
+        if let Some(secret) = decode_hex32(hex.trim()) {
+            if let Ok(key) = kasway_covenant::KeeperKey::from_secret_bytes(&secret) {
+                let kasway_pk = key.x_only_pubkey();
+                if panel.iter().any(|pk| *pk == kasway_pk) {
+                    return Err(
+                        "COVENANT_ARBITER_PANEL must not contain Kasway's own arbiter pubkey \
+                         (COVENANT_ARBITER_SECRET); Kasway may not sit on the dispute panel it operates"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl AppConfig {
     pub fn from_env() -> Self {
         let mut kpr1 = Kpr1Config::default();
@@ -212,6 +257,12 @@ impl AppConfig {
                     "KASWAY_PLATFORM_FEE_ADDRESS must be set to a real address in production; \
                      refusing to start with the placeholder fee address"
                 );
+            }
+            // Tier-2 disputes must be decided by an INDEPENDENT M-of-N arbiter
+            // panel, never by Kasway alone. Refuse to start with the transitional
+            // 1-of-1 Kasway fallback (empty panel) or a panel that Kasway sits on.
+            if let Err(msg) = validate_production_arbiter(&covenant) {
+                panic!("{msg}");
             }
         }
 
