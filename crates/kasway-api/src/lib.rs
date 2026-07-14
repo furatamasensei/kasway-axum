@@ -9,7 +9,6 @@ pub mod auth_token;
 pub mod chain_observer;
 pub mod chain_source;
 pub mod covenant_keeper;
-pub mod dispute;
 pub mod error;
 pub mod handlers;
 pub mod kaspa_wrpc;
@@ -72,11 +71,6 @@ pub fn build_router(state: AppState) -> Router {
             "/internal/payment-indexer/checkpoints",
             get(handlers::internal_payment_indexer::checkpoints),
         )
-        // --- Internal covenant tooling (Toccata dry-run + tn10 executions) ---
-        .route("/internal/payment-ops/tocatta/covenants/transactions/dry-run", post(handlers::internal_covenant::dry_run))
-        .route("/internal/payment-ops/tocatta/covenants/tn10/status", get(handlers::internal_covenant::tn10_status))
-        .route("/internal/payment-ops/tocatta/covenants/tn10/split-executions", post(handlers::internal_covenant::execute_split))
-        .route("/internal/payment-ops/tocatta/covenants/tn10/hold-release-executions", post(handlers::internal_covenant::execute_hold_release))
         // --- Internal KPR-1 dispute resolution (independent M-of-N arbiter panel; internal token) ---
         .route("/internal/payment-ops/kpr1/invoices/:publicId/release-arbitrated/prepare", post(handlers::internal_kpr1_ops::release_arbitrated_prepare))
         .route("/internal/payment-ops/kpr1/invoices/:publicId/release-arbitrated", post(handlers::internal_kpr1_ops::release_arbitrated))
@@ -90,8 +84,6 @@ pub fn build_router(state: AppState) -> Router {
             post(handlers::medias::store).layer(DefaultBodyLimit::max(MEDIA_BODY_LIMIT)),
         )
         .route("/api/media/:id", delete(handlers::medias::destroy))
-        // --- OpenAPI spec (static) ---
-        .route("/openapi.json", get(handlers::docs::openapi))
         // --- Public misc (price) ---
         .route("/api/price", get(handlers::public_misc::price))
         // Transmit (SSE) routes are added AFTER the global timeout layer below so
@@ -191,12 +183,6 @@ pub fn build_router(state: AppState) -> Router {
         // Tier 1 bilateral mutual settlement (customer + merchant co-sign a split).
         .route("/api/checkout/invoices/:publicId/kpr1-settle/prepare", post(handlers::checkout::prepare_kpr1_settle))
         .route("/api/checkout/invoices/:publicId/kpr1-settle", post(handlers::checkout::submit_kpr1_settle))
-        // Tier 3 community-jury dispute flow: open (public) + committee/vote/settle (operator).
-        .route("/api/checkout/invoices/:publicId/dispute/open", post(handlers::dispute_ops::open_dispute))
-        .route("/internal/payment-ops/kpr1/disputes/:disputeId/committee", post(handlers::dispute_ops::draw_committee))
-        .route("/internal/payment-ops/kpr1/disputes/:disputeId/votes", post(handlers::dispute_ops::cast_vote))
-        .route("/internal/payment-ops/kpr1/disputes/:disputeId/settle-jury", post(handlers::dispute_ops::settle_jury))
-        .route("/internal/payment-ops/kpr1/disputes/:disputeId", get(handlers::dispute_ops::dispute_status))
         .route("/api/checkout/invoices/:publicId/kpr1-payments", post(handlers::checkout::submit_kpr1_payment))
         .route("/api/checkout/links/:publicId", get(handlers::checkout::link_show))
         .route(
@@ -229,7 +215,6 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/stores/:id/setup/clone", post(handlers::setups::store_clone))
         .route("/api/stores/:id/setup/copy", post(handlers::setups::store_copy))
-        .route("/api/stores/:id/setup/sync", post(handlers::setups::store_copy))
         // --- Webhook endpoints (resource + controls) ---
         .route(
             "/api/webhook-endpoints",

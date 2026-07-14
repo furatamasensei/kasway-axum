@@ -1,20 +1,27 @@
 # kasway-axum
 
 Rust/Axum port of the `kasway-v2-api` HTTP layer (originally AdonisJS 6 + PostgreSQL).
-Goal: **identical request/response contracts** for all endpoints, validated
-test-first. All 240 endpoints are ported (see `ENDPOINTS.md`), and the KPR-1
-payment path is settled on-chain through Kaspa covenants — the crypto/chain
-layer that phase 1 originally stubbed is now real.
+Goal: **identical request/response contracts** for the endpoints we carry forward,
+validated test-first. The KPR-1 payment path is settled on-chain through Kaspa
+covenants — the crypto/chain layer that phase 1 originally stubbed is now real.
+
+The port is not a 1:1 copy of the Adonis surface: the back-office endpoints that
+were never implemented here have been dropped rather than left as dead schema, and
+`build_router` is the only source of truth for what exists.
 
 ## Scope
 
-- **In:** every HTTP endpoint, DB persistence (PostgreSQL via `sqlx`), validation,
-  auth (Adonis-compatible: Bearer access tokens, `x-kasway-api-key`,
-  internal token), request/response contract parity, real KPR-1 intent signing
-  (ed25519), on-chain covenant settlement, and dispute resolution.
+- **In:** the merchant HTTP surface (stores, invoices, payment links, subscriptions,
+  webhooks, API keys, checkout, explorer), DB persistence (PostgreSQL via `sqlx`),
+  validation, auth (Adonis-compatible: Bearer access tokens, `x-kasway-api-key`,
+  internal token), real KPR-1 intent signing (ed25519), and on-chain covenant
+  settlement.
 - **Real (no longer stubbed):** KPR-1 minting/signing, covenant compilation +
-  P2SH derivation (`kasway-covenant`), on-chain payment observation, covenant
-  release/refund, and the Tier-3 community-jury dispute layer.
+  P2SH derivation (`kasway-covenant`), on-chain payment observation, and covenant
+  release/refund/settle.
+- **Dispute resolution:** bilateral mutual settlement (customer + merchant co-sign
+  a split) and an independent M-of-N arbiter panel. Kasway is refused a seat on
+  that panel in production — see `validate_production_arbiter` in `state.rs`.
 - **Still stubbed/deferred:** mail, S3/R2 object storage, and external
   queue/broker infra. Webhook delivery runs as an in-process worker (see
   `crates/kasway-api/src/webhook_worker.rs`) rather than an external queue.
@@ -27,20 +34,19 @@ layer that phase 1 originally stubbed is now real.
 crates/
   kasway-db/        # sqlx PostgreSQL pool + embedded migrations (ported from Lucid)
   kasway-covenant/  # SilverScript-compiled Kaspa covenants: escrow_v2 (tiered
-                    #   dispute resolution), jury_escrow (K-of-N jury), juror_bond;
-                    #   P2SH derivation + spend sig scripts. The ONLY place that
-                    #   touches rusty-kaspa / assembles covenant script bytes.
+                    #   dispute resolution); P2SH derivation + spend sig scripts.
+                    #   The ONLY place that touches rusty-kaspa / assembles
+                    #   covenant script bytes.
   kasway-api/       # axum app: lib.rs (build_router), main.rs (bin), handlers,
-                    #   auth, background workers, KPR-1, dispute orchestration
+                    #   auth, background workers, KPR-1
     tests/          # integration tests: spawn app on ephemeral port, hit it with reqwest
 ```
 
-## Workflow (per the migration rules)
+## Workflow
 
-1. Map endpoints (`ENDPOINTS.md` — the coverage contract; nothing left behind).
-2. For each endpoint: read the Adonis controller/validator/model, write the Rust
+1. For each endpoint: read the Adonis controller/validator/model, write the Rust
    contract test first (red), then implement the handler (green).
-3. `cargo test` must stay green; `ENDPOINTS.md` Status column tracks progress.
+2. `cargo test` must stay green.
 
 ## Running
 
@@ -119,21 +125,31 @@ Not yet: no address watching — payments are only observed for transactions who
 txid a wallet submitted; unsolicited transfers to merchant addresses arrive with
 the address-watching phase.
 
-## Disputes (Tier-3 community jury)
+## Disputes
 
-Disputes escalate to an on-chain `JuryEscrow` settlement (see
-`crates/kasway-api/src/dispute.rs` and `kasway-covenant/src/jury_escrow.rs`):
-**open** (record evidence hashes, freeze the juror-pool + evidence roots) →
-**select** (deterministically draw a K-of-N committee from the bonded pool using
-a beacon seed, excluding the parties) → **vote** (collect each member's 64-byte
-`datasig` over the verdict digest) → **settle** (once K sigs agree, broadcast
-`release_jury` or `refund_jury`; the covenant verifies the committee sigs
-on-chain via `checkSigFromStack`). The tiered `escrow_v2` covenant also supports
-an M-of-N arbiter panel (`COVENANT_ARBITER_*`). Committee selection and digest
-derivations are pure/deterministic so anyone can recompute and audit them.
+Two paths, both enforced on-chain by the tiered `escrow_v2` covenant:
+
+1. **Bilateral settlement** — customer and merchant co-sign a split of the escrowed
+   amount. No third party is involved, and it resolves the large majority of real
+   disputes.
+2. **Arbiter panel** — an independent M-of-N panel (`COVENANT_ARBITER_PANEL`,
+   `COVENANT_ARBITER_THRESHOLD`) signs the release or refund. In production,
+   `validate_production_arbiter` (`state.rs`) refuses to start if the panel is
+   empty or if Kasway's own arbiter key sits on it: Kasway does not decide disputes
+   about payments it processes. Dev/test fall back to a transitional 1-of-1 panel.
+
+If neither path resolves within `COVENANT_CAPTURE_WINDOW_SECS`, the keeper
+auto-captures to the merchant.
+
+A Tier-3 community-jury layer (`jury_escrow`, `juror_bond`, `dispute.rs`) was
+prototyped and removed: a bonded jury rewards agreeing with the majority rather
+than being right, which degenerates to voting the base rate without reading the
+evidence — and e-commerce disputes turn on off-chain evidence a stranger cannot
+check. It is recoverable from git history if a use case with verifiable evidence
+appears.
 
 ## Status
 
-All 240 endpoints ported (`ENDPOINTS.md`); KPR-1 covenant settlement, chain
-observation, and the jury dispute layer are implemented and covered by
-integration tests.
+KPR-1 covenant settlement, chain observation, and both dispute paths are
+implemented and covered by integration tests. `build_router` in
+`crates/kasway-api/src/lib.rs` is the authoritative list of endpoints.

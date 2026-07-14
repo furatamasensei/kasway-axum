@@ -1,13 +1,10 @@
 pub mod api_keys;
 pub mod auth;
 pub mod checkout;
-pub mod dispute_ops;
 pub mod commerce;
 pub mod currencies;
-pub mod docs;
 pub mod explorer_kpr1;
 pub mod health;
-pub mod internal_covenant;
 pub mod internal_kpr1_ops;
 pub mod internal_payment_indexer;
 pub mod invoices;

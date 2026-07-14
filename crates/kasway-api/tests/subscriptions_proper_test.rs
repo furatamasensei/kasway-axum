@@ -2,14 +2,6 @@ mod common;
 
 use serde_json::{json, Value};
 
-async fn merchant_with_setup(app: &common::TestApp, email: &str) -> String {
-    let token = common::register_merchant(app, email, "secret123").await;
-    let uid = common::merchant_user_id(&app.db, email).await;
-    let store = common::seed_default_store(&app.db, uid).await;
-    common::seed_setup(&app.db, uid, store, "kaspatest:merchantpayout00001").await;
-    token
-}
-
 async fn create_plan(app: &common::TestApp, token: &str) -> String {
     let p: Value = app.client.post(app.url("/api/commerce/subscription-plans")).bearer_auth(token)
         .json(&json!({ "name": "Monthly", "amount": "500000000", "intervalUnit": "month", "intervalCount": 1 }))
@@ -20,7 +12,7 @@ async fn create_plan(app: &common::TestApp, token: &str) -> String {
 #[tokio::test]
 async fn subscription_create_spawns_first_invoice() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "su1@example.com").await;
+    let token = common::merchant_with_setup(&app, "su1@example.com").await;
     let plan = create_plan(&app, &token).await;
 
     let res = app
@@ -49,7 +41,7 @@ async fn subscription_create_spawns_first_invoice() {
 #[tokio::test]
 async fn subscription_validation_and_archived_plan() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "su2@example.com").await;
+    let token = common::merchant_with_setup(&app, "su2@example.com").await;
 
     let bad = app.client.post(app.url("/api/commerce/subscriptions")).bearer_auth(&token).json(&json!({ "customer": { "email": "a@x.com" } })).send().await.unwrap();
     assert_eq!(bad.status(), 422);
@@ -73,7 +65,7 @@ async fn subscription_validation_and_archived_plan() {
 #[tokio::test]
 async fn subscription_lifecycle_pause_resume_cancel() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "su3@example.com").await;
+    let token = common::merchant_with_setup(&app, "su3@example.com").await;
     let plan = create_plan(&app, &token).await;
     let sub: Value = app.client.post(app.url("/api/commerce/subscriptions")).bearer_auth(&token).json(&json!({ "planPublicId": plan, "customer": { "email": "a@x.com" } })).send().await.unwrap().json().await.unwrap();
     let sid = sub["publicId"].as_str().unwrap().to_string();
@@ -96,7 +88,7 @@ async fn subscription_lifecycle_pause_resume_cancel() {
 #[tokio::test]
 async fn subscription_invoices_list_and_retry_guard() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "su4@example.com").await;
+    let token = common::merchant_with_setup(&app, "su4@example.com").await;
     let plan = create_plan(&app, &token).await;
     let sub: Value = app.client.post(app.url("/api/commerce/subscriptions")).bearer_auth(&token).json(&json!({ "planPublicId": plan, "customer": { "email": "a@x.com" } })).send().await.unwrap().json().await.unwrap();
     let sid = sub["publicId"].as_str().unwrap().to_string();
@@ -117,7 +109,7 @@ async fn subscription_invoices_list_and_retry_guard() {
 #[tokio::test]
 async fn subscription_future_start_no_invoice() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "su5@example.com").await;
+    let token = common::merchant_with_setup(&app, "su5@example.com").await;
     let plan = create_plan(&app, &token).await;
     let sub: Value = app.client.post(app.url("/api/commerce/subscriptions")).bearer_auth(&token).json(&json!({ "planPublicId": plan, "startsAt": "2099-01-01T00:00:00.000+00:00", "customer": { "email": "a@x.com" } })).send().await.unwrap().json().await.unwrap();
     assert_eq!(sub["cycles"].as_array().unwrap().len(), 0);

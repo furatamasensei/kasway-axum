@@ -26,7 +26,7 @@ impl FromRequestParts<AppState> for AuthMerchant {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let token = bearer_token(parts).ok_or(AppError::Unauthorized("Unauthorized access"))?;
-        match auth_token::verify(&state.db.pool, &auth_token::MERCHANT, &token).await? {
+        match auth_token::verify(&state.db.pool, &token).await? {
             Some(v) => Ok(AuthMerchant {
                 user_id: v.tokenable_id,
                 token_id: v.token_id,

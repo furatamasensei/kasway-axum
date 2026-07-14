@@ -2,16 +2,12 @@ mod common;
 
 use serde_json::{json, Value};
 
-async fn merchant(app: &common::TestApp, email: &str) -> String {
-    common::register_merchant(app, email, "secret123").await
-}
-
 // --- regional pricing ---
 
 #[tokio::test]
 async fn regional_countries_lists_supported() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "rp1@example.com").await;
+    let token = common::merchant(&app, "rp1@example.com").await;
     let body: Value = app.client.get(app.url("/api/regional-pricing/countries")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
     let arr = body.as_array().unwrap();
     assert!(arr.len() >= 10);
@@ -21,7 +17,7 @@ async fn regional_countries_lists_supported() {
 #[tokio::test]
 async fn regional_settings_default_then_update() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "rp2@example.com").await;
+    let token = common::merchant(&app, "rp2@example.com").await;
 
     // default settings (lazily created) -> fail_closed, no countries
     let def: Value = app.client.get(app.url("/api/regional-pricing/settings")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
@@ -48,7 +44,7 @@ async fn regional_settings_default_then_update() {
 #[tokio::test]
 async fn regional_update_rejects_unsupported_and_duplicates() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "rp3@example.com").await;
+    let token = common::merchant(&app, "rp3@example.com").await;
 
     let unsupported = app
         .client

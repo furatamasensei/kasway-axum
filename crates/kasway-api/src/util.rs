@@ -60,7 +60,7 @@ pub fn is_atomic_amount(s: &str) -> bool {
 
 /// Build a Lucid `SimplePaginator` `meta` object (same keys/order/URLs).
 pub fn paginator_meta(total: i64, per_page: i64, current_page: i64) -> Value {
-    let last_page = std::cmp::max(((total as f64) / (per_page as f64)).ceil() as i64, 1);
+    let last_page = ((total + per_page - 1) / per_page).max(1);
     json!({
         "total": total,
         "perPage": per_page,

@@ -1,8 +1,7 @@
 //! Kasway covenant crate.
 //!
-//! Compiles the Kasway escrow covenants ([`escrow_v2`] tiers 0–2, [`jury_escrow`]
-//! and [`juror_bond`] for the Tier-3 jury) and derives their P2SH addresses and
-//! spend sig scripts. **Every covenant script byte comes from the SilverScript
+//! Compiles the Kasway escrow covenant ([`escrow_v2`], tiers 0–2) and derives its
+//! P2SH address and spend sig scripts. **Every covenant script byte comes from the SilverScript
 //! compiler** (`silverscript_lang`); there is no hand-assembled opcode anywhere in
 //! Kasway. All Kaspa consensus crypto (address parsing, script building, P2SH
 //! derivation) is confined to this crate so the rest of the backend never touches
@@ -18,14 +17,6 @@ pub use silverscript_lang::compiler::CompiledContract;
 /// Escrow — tiered dispute-resolution covenant (optimistic release/capture +
 /// mutual settlement + M-of-N arbiter panel); see `escrow_v2.sil`.
 pub mod escrow_v2;
-
-/// Tier-3 **jury dispute-escrow** — K-of-N committee `datasig` verdicts honored
-/// on-chain via `checkSigFromStack`; see `jury_escrow.sil`.
-pub mod jury_escrow;
-
-/// Tier-3 **juror bond** — commit-reveal (via `OpTxInputDaaScore`) + slashing;
-/// see `juror_bond.sil`.
-pub mod juror_bond;
 
 /// Map a Kasway network label to the Kaspa address prefix. Keeps rusty-kaspa's
 /// `Prefix` out of the rest of the backend.
