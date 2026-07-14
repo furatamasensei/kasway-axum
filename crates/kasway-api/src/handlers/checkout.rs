@@ -28,6 +28,10 @@ fn kpr1_err(code: &str, message: &str, metadata: Option<Value>) -> Response {
     if let Some(Value::Object(m)) = metadata {
         for (k, v) in m { body[k] = v; }
     }
+    // Every KPR-1 refusal passes through here, so one line here covers them all.
+    // The access log only shows "422" — useless when a user reports "my payment
+    // failed"; the machine code is the thing that says WHY.
+    tracing::warn!("kpr1 refused: {code} — {message}");
     (StatusCode::UNPROCESSABLE_ENTITY, Json(body)).into_response()
 }
 

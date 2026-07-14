@@ -357,6 +357,22 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         return Err(err("KPR-1 covenant payments are disabled"));
     }
 
+    // Reject small invoices up front, with a number a merchant can act on. The
+    // storage-mass guard below already refuses them — but only after the fact and
+    // in terms of "smallest payout" and KIP-9 mass, which says nothing a merchant
+    // can price against. The floor exists because the covenant splits the payment
+    // into several outputs, and KIP-9 charges ~1e12/value per output: the platform
+    // fee slice of a tiny invoice is tiny, and a tiny output is expensive. At 2%
+    // the hard technical limit is ~1.13 KAS; this floor keeps ~2x headroom so that
+    // adding a tax or split output does not silently push an invoice over the cap.
+    if ctx.total_amount < cfg.min_invoice_sompi {
+        return Err(err(&format!(
+            "KPR-1 invoices must be at least {} KAS (got {} KAS): below this the covenant's payout slices are too small to settle on-chain.",
+            cfg.min_invoice_sompi as f64 / 100_000_000.0,
+            ctx.total_amount as f64 / 100_000_000.0,
+        )));
+    }
+
     // Setup lookup: (user, store) then fall back to (user, store IS NULL).
     let mut setup: Option<SetupRow> = None;
     if let Some(store_id) = ctx.store_id {
@@ -511,6 +527,43 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     // script hash are unknown here. The signed intent commits to the economic
     // terms (ordered payouts, gross, expiry); the covenant address is a
     // deterministic function of those plus the refund address.
+    // The merchant's own name, falling back to the platform's only when the
+    // invoice has no store (the "included" default store path).
+    let merchant_name: String = match ctx.store_id {
+        Some(store_id) => sqlx::query_scalar("SELECT name FROM stores WHERE id = $1")
+            .bind(store_id)
+            .fetch_optional(&state.db.pool)
+            .await?
+            .unwrap_or_else(|| cfg.app_name.clone()),
+        None => cfg.app_name.clone(),
+    };
+
+    // What the payer is actually buying. `imageUrl` only exists if the merchant
+    // put one in the item's metadata — there is no image column to read.
+    let items = sqlx::query_as::<_, (String, i64, i64, i64, Option<String>)>(
+        "SELECT name, quantity, unit_amount, total_amount, metadata FROM invoice_items \
+         WHERE invoice_id = $1 ORDER BY id",
+    )
+    .bind(ctx.invoice_id)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let display_items: Vec<Value> = items
+        .iter()
+        .map(|(name, quantity, unit_amount, total_amount, metadata)| {
+            let image_url = metadata
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                .and_then(|m| m.get("imageUrl").and_then(|v| v.as_str()).map(str::to_string));
+            json!({
+                "name": name,
+                "quantity": quantity,
+                "unitAmount": unit_amount.to_string(),
+                "totalAmount": total_amount.to_string(),
+                "imageUrl": image_url,
+            })
+        })
+        .collect();
+
     let capture_window = state.config.covenant.capture_window_secs;
     let expiry_ts = chrono::Utc::now().timestamp() + capture_window;
     let gross_amount = amount; // the covenant holds the full invoice amount
@@ -536,8 +589,19 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         "configCommitment": config_commitment,
         "settlement": { "mode": "covenant", "addressRequiredFromWallet": true, "captureWindowSeconds": capture_window },
         "refund": { "addressRequiredFromWallet": true, "captureWindowSeconds": capture_window },
-        "merchant": { "name": cfg.app_name, "domain": url_host(&cfg.app_url) },
-        "display": { "memo": format!("Invoice {}", ctx.public_id), "currencyCode": ctx.payment_asset },
+        // The merchant is the STORE, not the platform. This used to be
+        // `cfg.app_name`, so every payment request in every wallet claimed to
+        // come from "Kasway".
+        "merchant": { "name": merchant_name, "domain": url_host(&cfg.app_url) },
+        // Items ride INSIDE the signature. The review screen is what the payer
+        // consents to, so what they are buying must be as tamper-proof as the
+        // amount — otherwise a compromised API could show one basket and have the
+        // covenant pay for another.
+        "display": {
+            "memo": format!("Invoice {}", ctx.public_id),
+            "currencyCode": ctx.payment_asset,
+            "items": display_items,
+        },
     });
 
     let unsigned_payload = canonicalize(&intent_unsigned);
@@ -641,24 +705,27 @@ pub async fn finalize_covenant_for_invoice(
         return Err(err("KPR-1 payment intent not found"));
     };
 
-    let row = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>, String, Option<String>)>(
-        "SELECT id, network, required_outputs, gross_amount, expiry_ts, covenant_state, covenant_address \
-         FROM kpr1_payment_intents WHERE invoice_id = $1",
+    let row = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>, String, Option<String>, Option<String>)>(
+        "SELECT id, network, required_outputs, gross_amount, expiry_ts, covenant_state, covenant_address, \
+         customer_refund_address FROM kpr1_payment_intents WHERE invoice_id = $1",
     )
     .bind(inv_id)
     .fetch_optional(&state.db.pool)
     .await?;
-    let Some((intent_pk, network, required_outputs, gross_opt, expiry_opt, covenant_state, existing_address)) = row else {
+    let Some((intent_pk, network, required_outputs, gross_opt, expiry_opt, covenant_state, existing_address, existing_refund)) = row else {
         return Err(err("KPR-1 payment intent not found"));
     };
 
     let gross = gross_opt.ok_or_else(|| err("KPR-1 covenant gross amount is missing"))? as u64;
     let expiry = expiry_opt.ok_or_else(|| err("KPR-1 covenant expiry is missing"))? as u64;
 
-    // Idempotent: already finalized -> return the existing address.
+    // Idempotent: already finalized -> return the existing covenant, receipted
+    // with the refund address BAKED INTO IT rather than the one just requested.
+    // A second payer must be able to see that this escrow refunds elsewhere.
     if covenant_state != "pending" {
         if let Some(addr) = existing_address {
-            return Ok(finalize_response(&addr, gross, expiry, &covenant_state));
+            let refund = existing_refund.unwrap_or_default();
+            return Ok(finalize_response(state, &addr, gross, expiry, &covenant_state, &refund));
         }
     }
     if inv_status != "open" {
@@ -739,7 +806,7 @@ pub async fn finalize_covenant_for_invoice(
         .execute(&state.db.pool)
         .await?;
 
-    Ok(finalize_response(&address, gross, expiry, "awaiting_funding"))
+    Ok(finalize_response(state, &address, gross, expiry, "awaiting_funding", refund_address))
 }
 
 /// The Kasway arbiter public key baked into every covenant, derived from the
@@ -775,18 +842,63 @@ pub(crate) fn escrow_arbiter_panel(state: &AppState) -> AppResult<(Vec<[u8; 32]>
     Ok((panel, threshold))
 }
 
-fn finalize_response(address: &str, gross: u64, expiry: u64, state: &str) -> Value {
-    json!({
+/// Signed finalize receipt. `refund_address` is the address actually compiled
+/// into the covenant — NOT whatever the caller just asked for. Finalize is
+/// first-writer-wins, so a wallet that blindly trusted `covenantAddress` could
+/// fund an escrow that refunds to whoever finalized first. Signing the receipt
+/// with the KPR-1 key (the anchor wallets already pin) lets the payer verify
+/// both that Kasway issued it and that the refund path is theirs.
+fn finalize_response(
+    state: &AppState,
+    address: &str,
+    gross: u64,
+    expiry: u64,
+    covenant_state: &str,
+    refund_address: &str,
+) -> Value {
+    let cfg = &state.config.kpr1;
+    let unsigned = json!({
         "covenantAddress": address,
         "amountSompi": gross.to_string(),
         "expiryTs": expiry,
-        "covenantState": state,
-    })
+        "covenantState": covenant_state,
+        "refundAddress": refund_address,
+    });
+    let signature_value = sign(&canonicalize(&unsigned), &cfg.signing_seed);
+    let mut signed = unsigned;
+    signed["signature"] = json!({
+        "alg": SIGNATURE_ALGORITHM,
+        "keyId": cfg.signing_key_id,
+        "value": signature_value,
+    });
+    signed
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The 2 KAS floor is not arbitrary: it is the point where a 2% invoice keeps
+    /// ~2x headroom under the consensus mass cap, so a merchant can still add a
+    /// tax or split output. Guard the arithmetic that justifies it — if someone
+    /// lowers the floor or raises the fee, this fails before production does.
+    #[test]
+    fn the_min_invoice_leaves_headroom_for_a_tax_or_split_output() {
+        let min_invoice: i128 = 200_000_000; // 2 KAS
+        let fee = platform_fee_total(min_invoice, 200, 0).unwrap();
+        let merchant = min_invoice - fee;
+        let base = settlement_storage_mass(&[merchant, fee]);
+        assert!(base < MAX_SETTLEMENT_STORAGE_MASS, "base settlement already over budget: {base}");
+        // ~1.96x headroom against the 500k consensus cap (255,102 of it used).
+        assert!(base * 19 <= 500_000 * 10, "not enough headroom: {base}");
+        // And the leftover budget must still fit a realistic tax slice (11% VAT).
+        let tax = min_invoice * 11 / 100;
+        let with_tax = settlement_storage_mass(&[merchant - tax, fee, tax]);
+        assert!(
+            with_tax < MAX_SETTLEMENT_STORAGE_MASS,
+            "a merchant enabling an 11% tax would break the floor: {with_tax}"
+        );
+    }
 
     fn splits_a() -> Vec<(String, String, i64)> {
         vec![

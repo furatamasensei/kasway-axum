@@ -130,6 +130,13 @@ pub(crate) struct IntentRow {
     tx_id: Option<String>,
     verification_status: Option<String>,
     failure_reason: Option<String>,
+    // Covenant lifecycle. The payer's wallet needs these to know whether it may
+    // release funds to the merchant yet: release is only possible while the
+    // covenant is `funded` and the invoice is still open.
+    covenant_state: Option<String>,
+    covenant_address: Option<String>,
+    release_tx_id: Option<String>,
+    expiry_ts: Option<i64>,
     #[serde(serialize_with = "ser_json_arr")]
     required_outputs: String,
     #[serde(serialize_with = "ser_json_obj")]
@@ -151,6 +158,7 @@ const INTENT_COLS: &str = "id, invoice_id, user_id, intent_id, status, network, 
     merchant_address, platform_fee_address, template_id, template_version, script_hash, \
     canonical_hash, payment_request_uri, payment_intent_url, signature_algorithm, \
     signature_key_id, signature_value, tx_id, verification_status, failure_reason, \
+    covenant_state, covenant_address, release_tx_id, expiry_ts, \
     required_outputs, canonical_intent, metadata, expires_at, fetched_at, submitted_at, \
     observed_at, verified_at, settled_at, created_at, updated_at";
 

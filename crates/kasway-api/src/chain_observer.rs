@@ -41,6 +41,36 @@ use serde_json::json;
 
 /// Idle sleep between polls.
 const POLL_INTERVAL_SECS: u64 = 5;
+/// Sompi per KAS.
+const SOMPI_PER_KAS: i64 = 100_000_000;
+
+/// Sompi rendered as KAS for logs — humans reason in KAS, not 9-digit sompi.
+/// Trailing zeros are trimmed so 300000000 reads as `3 KAS`, not `3.00000000 KAS`.
+fn kas(sompi: i64) -> String {
+    let whole = sompi / SOMPI_PER_KAS;
+    let frac = (sompi % SOMPI_PER_KAS).abs();
+    if frac == 0 {
+        return format!("{whole} KAS");
+    }
+    // Trim the FRACTION, not the finished string — trimming after the unit is
+    // appended would do nothing (it ends in 'S').
+    let frac = format!("{frac:08}");
+    format!("{whole}.{} KAS", frac.trim_end_matches('0'))
+}
+
+#[cfg(test)]
+mod kas_tests {
+    use super::kas;
+
+    #[test]
+    fn renders_sompi_as_kas() {
+        assert_eq!(kas(300_000_000), "3 KAS");
+        assert_eq!(kas(0), "0 KAS");
+        assert_eq!(kas(150_000_000), "1.5 KAS");
+        assert_eq!(kas(1), "0.00000001 KAS");
+        assert_eq!(kas(100_000_001), "1.00000001 KAS");
+    }
+}
 /// Max intents examined per tick.
 const CLAIM_BATCH: i64 = 25;
 
@@ -196,9 +226,11 @@ async fn observe_candidate<S: ChainSource>(
         upsert_observation(state, c, "mismatched", funded, confirmations, &tx, &metadata, &now).await?;
         fail_intent(state, c, reason, &now).await?;
         tracing::warn!(
-            "chain observer: covenant intent {} tx {} funded {funded} != gross {gross} ({reason})",
+            "chain observer: covenant intent {} tx {} funded {} != gross {} ({reason})",
             c.intent_id,
-            c.tx_id
+            c.tx_id,
+            kas(funded),
+            kas(gross)
         );
         return Ok(Progress::Advanced);
     }
@@ -212,9 +244,20 @@ async fn observe_candidate<S: ChainSource>(
         // the invoice paid/refunded.
         upsert_observation(state, c, "settled", funded, confirmations, &tx, &metadata, &now).await?;
         mark_funded(state, c, &now).await?;
+        // The only line that says the happy path happened. Without it the
+        // observer is silent on success and looks dead while it is working.
+        tracing::info!(
+            "chain observer: covenant intent {} funded ({}, {confirmations} confirmations) -> verified",
+            c.intent_id,
+            kas(funded)
+        );
     } else {
         upsert_observation(state, c, "matched", funded, confirmations, &tx, &metadata, &now).await?;
         mark_verified(state, c, &now).await?;
+        tracing::info!(
+            "chain observer: covenant intent {} seen on-chain ({confirmations}/{required_confirmations} confirmations)",
+            c.intent_id
+        );
     }
     Ok(Progress::Advanced)
 }
@@ -333,6 +376,9 @@ async fn mark_funded(state: &AppState, c: &Candidate, now: &str) -> Result<(), s
     .bind(c.intent_pk)
     .execute(&state.db.pool)
     .await?;
+    // Publish from the funnel, not from each caller — every path that writes this
+    // state notifies the watchers, and a new path cannot forget to.
+    state.events.publish(&c.public_id, "funded");
     Ok(())
 }
 
@@ -352,6 +398,7 @@ async fn fail_intent(state: &AppState, c: &Candidate, reason: &str, now: &str) -
     .bind(c.intent_pk)
     .execute(&state.db.pool)
     .await?;
+    state.events.publish(&c.public_id, "failed");
 
     let metadata = json!({
         "txId": c.tx_id,

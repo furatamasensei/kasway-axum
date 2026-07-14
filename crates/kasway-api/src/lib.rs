@@ -10,10 +10,12 @@ pub mod chain_observer;
 pub mod chain_source;
 pub mod covenant_keeper;
 pub mod error;
+pub mod events;
 pub mod handlers;
 pub mod kaspa_wrpc;
 pub mod kpr1;
 pub mod password;
+pub mod rate_limit;
 pub mod state;
 pub mod store_context;
 pub mod util;
@@ -27,6 +29,8 @@ use axum::Router;
 use state::AppState;
 use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnResponse, TraceLayer};
+use tracing::Level;
 
 /// Global request timeout applied to every route.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -255,6 +259,21 @@ pub fn build_router(state: AppState) -> Router {
                 .route("/__transmit/unsubscribe", post(handlers::transmit::unsubscribe))
                 .layer(DefaultBodyLimit::max(GLOBAL_BODY_LIMIT)),
         )
+        // Rate limit the whole surface. The public checkout routes are the ones
+        // that need it (unauthenticated, keyed only by an invoice id), and there
+        // is no reason for an authenticated caller to exceed the budget either.
+        .layer(axum::middleware::from_fn(rate_limit::limit))
         .layer(cors)
+        // Access log. Outermost, so every request is accounted for — including
+        // the ones rejected by CORS or timed out, which are exactly the ones a
+        // confused user reports. Without this the server was silent between
+        // startup and a crash: a payment could fail end-to-end and leave no
+        // trace of the request that failed.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_failure(DefaultOnFailure::new().level(Level::WARN)),
+        )
         .with_state(state)
 }

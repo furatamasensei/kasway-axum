@@ -18,6 +18,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db,
         config: Arc::new(AppConfig::from_env()),
+        events: kasway_api::events::InvoiceEvents::new(),
     };
 
     // Background webhook delivery worker (WEBHOOK_WORKER_ENABLED, default on).
@@ -49,7 +50,13 @@ async fn main() -> anyhow::Result<()> {
     let addr = std::env::var("HOST_PORT").unwrap_or_else(|_| "0.0.0.0:3333".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("kasway-api listening on {addr}");
-    axum::serve(listener, app).await?;
+    // ConnectInfo: the rate limiter needs the peer address as a fallback when the
+    // request carries no proxy IP header.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

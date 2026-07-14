@@ -33,6 +33,76 @@ use tokio::task::JoinHandle;
 
 const POLL_INTERVAL_SECS: u64 = 5;
 const CLAIM_BATCH: i64 = 10;
+/// Minimum change a fee UTXO must leave behind (1 KAS). KIP-9 charges roughly
+/// `1e12 / value` storage mass per output, so 1 KAS of change costs ~10k mass —
+/// negligible against the 500k consensus cap. Anything much smaller starts to
+/// dominate the transaction's mass on its own.
+const KEEPER_CHANGE_FLOOR_SOMPI: u64 = 100_000_000;
+
+/// Pick the fee UTXO for a covenant spend: **the largest one**, not the first.
+///
+/// KIP-9 storage mass charges ~`1e12 / value` per output, and every settlement
+/// leaves the keeper's change behind as a new UTXO. Picking by (txid, index) —
+/// as this did — eventually picks one of those leftovers, whose change is
+/// smaller again, whose mass is larger again. The keeper self-poisons: a 0.06
+/// KAS leftover yields 0.04 KAS of change worth ~250k mass on its own, which
+/// alone pushes a normal release past the 500k consensus cap and the node
+/// rejects it ("storage mass ... larger than max allowed").
+///
+/// Taking the largest keeps the change big and its mass ~1k, and leaves the dust
+/// untouched instead of feeding on it. Still deterministic — prepare and submit
+/// must build the identical transaction — with (txid, index) breaking ties.
+fn pick_fee_utxo<T: Ord>(mut utxos: Vec<(T, u32, u64)>, min_fee: u64) -> Option<(T, u32, u64)> {
+    // Covering the fee is not enough: the change left over must ALSO be big
+    // enough that its own storage mass stays negligible (1 KAS => ~10k mass).
+    // Below this floor the transaction is born rejectable, so refuse to build it
+    // and surface "no fee UTXO" — an actionable error beats a broadcast loop the
+    // node will never accept.
+    utxos.retain(|(_, _, v)| *v > min_fee + KEEPER_CHANGE_FLOOR_SOMPI);
+    utxos.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| (&a.0, a.1).cmp(&(&b.0, b.1))));
+    utxos.into_iter().next()
+}
+
+#[cfg(test)]
+mod fee_utxo_tests {
+    use super::pick_fee_utxo;
+
+    fn utxo(id: &str, index: u32, value: u64) -> (String, u32, u64) {
+        (id.to_string(), index, value)
+    }
+
+    #[test]
+    fn prefers_the_largest_utxo_over_keeper_dust() {
+        // The dust is what earlier settlements left behind. Taking it would make
+        // the change tiny and the storage mass blow the consensus cap.
+        let utxos = vec![
+            utxo("aaa", 0, 6_000_000),   // 0.06 KAS — sorts first by txid
+            utxo("zzz", 1, 998_000_000), // 9.98 KAS
+            utxo("bbb", 0, 8_000_000),
+        ];
+        assert_eq!(pick_fee_utxo(utxos, 2_000_000).unwrap().2, 998_000_000);
+    }
+
+    #[test]
+    fn refuses_utxos_whose_change_would_blow_the_storage_mass_cap() {
+        // Covers the fee, but leaves only ~0.06 KAS of change: ~16M storage mass
+        // on that output alone. Building this tx guarantees a node rejection, so
+        // there must be NO pick rather than a doomed one.
+        let dust = vec![utxo("aaa", 0, 8_000_000)];
+        assert!(pick_fee_utxo(dust, 2_000_000).is_none());
+        // Comfortably above the fee + change floor.
+        let healthy = vec![utxo("aaa", 0, 998_000_000)];
+        assert!(pick_fee_utxo(healthy, 2_000_000).is_some());
+    }
+
+    #[test]
+    fn is_deterministic_when_values_tie() {
+        // prepare and submit must build the identical transaction.
+        let a = vec![utxo("bbb", 0, 500_000_000), utxo("aaa", 0, 500_000_000)];
+        let b = vec![utxo("aaa", 0, 500_000_000), utxo("bbb", 0, 500_000_000)];
+        assert_eq!(pick_fee_utxo(a, 2_000_000), pick_fee_utxo(b, 2_000_000));
+    }
+}
 
 /// `COVENANT_KEEPER_ENABLED` gate. Defaults on only when a keeper fee key and a
 /// node URL are configured; `0`/`false`/`off` force-disable.
@@ -54,6 +124,9 @@ pub fn spawn(state: AppState) -> JoinHandle<()> {
             tracing::warn!("covenant keeper: KASPA_NODE_URL not set; keeper idle");
             return;
         };
+        // Say so on the way up, like the observer does — a keeper that only ever
+        // logs on failure is indistinguishable from a keeper that never started.
+        tracing::info!("covenant keeper started");
         loop {
             match run_tick(&state, &client).await {
                 Ok(0) => tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await,
@@ -97,17 +170,31 @@ pub async fn run_tick(state: &AppState, client: &KaspaWrpcClient) -> Result<usiz
 
     // Only past-expiry funded covenants are auto-refunded here. Before expiry the
     // covenant waits for the customer to confirm release (a separate endpoint).
-    let now_ts = chrono::Utc::now().timestamp();
+    //
+    // "Past expiry" must be judged by CONSENSUS time, not the wall clock. The
+    // release tx carries lock_time = expiry, and the node only accepts it once
+    // its past median time has passed that — a clock that trails real time by a
+    // minute or so. Gating on Utc::now() meant every settlement opened with a
+    // burst of txs rejected as "input #0 is not finalized" until consensus caught
+    // up: harmless thanks to the retry, but it hammered the node and buried the
+    // log in warnings that looked like a real failure.
+    let consensus_ms = match client.past_median_time().await {
+        Ok(ms) => ms,
+        Err(err) => {
+            tracing::warn!("covenant keeper: past median time unavailable: {err}");
+            return Ok(0);
+        }
+    };
     let candidates = sqlx::query_as::<_, Funded>(
         "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, inv.store_id, inv.public_id, i.network, \
                 i.required_outputs, i.customer_refund_address, i.covenant_address, i.gross_amount, i.expiry_ts, \
                 i.arbiter_panel_json, i.arbiter_threshold \
          FROM kpr1_payment_intents i JOIN invoices inv ON inv.id = i.invoice_id \
-         WHERE i.covenant_state = 'funded' AND inv.status = 'open' AND i.expiry_ts <= $2 \
+         WHERE i.covenant_state = 'funded' AND inv.status = 'open' AND i.expiry_ts * 1000 < $2 \
          ORDER BY i.id LIMIT $1",
     )
     .bind(CLAIM_BATCH)
-    .bind(now_ts)
+    .bind(consensus_ms as i64)
     .fetch_all(&state.db.pool)
     .await?;
 
@@ -174,11 +261,8 @@ async fn settle_one(
     let Some((cov_txid, cov_index, cov_value)) = cov_utxos.into_iter().find(|(_, _, v)| *v == gross) else {
         return Err(kerr("covenant funding UTXO not found yet"));
     };
-    // Deterministic fee-UTXO pick (mirrors gather_release_inputs/gather_refund_inputs)
-    // so concurrent settlements in one batch are less likely to collide on a UTXO.
-    let mut fee_utxos = fee_utxos.map_err(|e| kerr(e.to_string()))?;
-    fee_utxos.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    let Some((fee_txid, fee_index, fee_value)) = fee_utxos.into_iter().find(|(_, _, v)| *v > min_fee + 1) else {
+    let fee_utxos = fee_utxos.map_err(|e| kerr(e.to_string()))?;
+    let Some((fee_txid, fee_index, fee_value)) = pick_fee_utxo(fee_utxos, min_fee) else {
         return Err(kerr(format!("no keeper fee UTXO > {min_fee} sompi at {keeper_address}")));
     };
 
@@ -247,6 +331,17 @@ async fn mark_settled_paid(
         .bind(invoice_id)
         .execute(&state.db.pool)
         .await?;
+    // Notify the watchers from the funnel, so every settlement path (keeper
+    // capture, customer release, arbitrated, mutual) publishes without each one
+    // having to remember to.
+    let public_id: Option<String> =
+        sqlx::query_scalar("SELECT public_id FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_optional(&state.db.pool)
+            .await?;
+    if let Some(public_id) = public_id {
+        state.events.publish(&public_id, covenant_state);
+    }
     Ok(())
 }
 
@@ -409,12 +504,8 @@ async fn gather_release_inputs(state: &AppState, client: &KaspaWrpcClient, publi
         .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
         .ok_or_else(|| rerr("covenant funding UTXO not visible yet"))?;
 
-    // Deterministic fee-UTXO pick so prepare and submit build the identical tx.
-    let mut fee_utxos = fee_utxos.map_err(|e| rerr(e.to_string()))?;
-    fee_utxos.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    let fee_utxo = fee_utxos
-        .into_iter()
-        .find(|(_, _, v)| *v > min_fee + 1)
+    let fee_utxos = fee_utxos.map_err(|e| rerr(e.to_string()))?;
+    let fee_utxo = pick_fee_utxo(fee_utxos, min_fee)
         .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
         .ok_or_else(|| rerr("no keeper fee UTXO available for release"))?;
 
@@ -469,11 +560,16 @@ pub(crate) async fn customer_release_submit(state: &AppState, public_id: &str, s
                 .map_err(AppError::Database)?;
             let target = webhook_target(ctx.intent_pk, ctx.invoice_id, ctx.user_id, ctx.store_id, ctx.public_id.clone());
             let _ = emit_invoice_event(state, &target, "invoice.paid", &tx_id).await;
+            tracing::info!(
+                "covenant release: invoice {} released to merchant by the customer via tx {tx_id}",
+                ctx.public_id
+            );
             Ok(json!({ "released": true, "releaseTxId": tx_id, "invoiceStatus": "paid" }))
         }
         Err(e) => {
             // Release failed: return the claim so a later attempt (or expiry refund) can proceed.
             restore_funded(state, ctx.intent_pk, "releasing").await;
+            tracing::warn!("covenant release: invoice {} failed: {e}", ctx.public_id);
             Err(e)
         }
     }
@@ -625,12 +721,8 @@ async fn gather_refund_inputs(
         .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
         .ok_or_else(|| rerr("covenant funding UTXO not visible yet"))?;
 
-    // Deterministic fee-UTXO pick so prepare and submit build the identical tx.
-    let mut fee_utxos = fee_utxos.map_err(|e| rerr(e.to_string()))?;
-    fee_utxos.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    let fee_utxo = fee_utxos
-        .into_iter()
-        .find(|(_, _, v)| *v > min_fee + 1)
+    let fee_utxos = fee_utxos.map_err(|e| rerr(e.to_string()))?;
+    let fee_utxo = pick_fee_utxo(fee_utxos, min_fee)
         .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
         .ok_or_else(|| rerr(format!("no fee UTXO > {min_fee} sompi at fee payer {fee_payer_addr}")))?;
 

@@ -8,9 +8,21 @@
 # The server runs its embedded migrations against the `kasway` database on
 # startup, so no separate migrate step is needed.
 
+# Log rotation lives HERE, not in the app: the server logs to stdout, and what
+# actually grows on disk is Docker's json-file log. Its default is unbounded — a
+# chatty API can fill the host's disk and take the database down with it. Capping
+# the driver bounds every service at max-size × max-file (30 MB below), and keeps
+# `docker compose logs` working exactly as before.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:16-alpine
+    logging: *default-logging
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -29,6 +41,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    logging: *default-logging
     depends_on:
       db:
         condition: service_healthy

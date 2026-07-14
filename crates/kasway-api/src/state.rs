@@ -8,6 +8,8 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: Db,
     pub config: Arc<AppConfig>,
+    /// Invoice state changes, for the SSE watchers. Cloned freely; it is a sender.
+    pub events: crate::events::InvoiceEvents,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +61,12 @@ pub struct Kpr1Config {
     pub enabled: bool,
     pub platform_fee_bps: i64,
     pub platform_fee_flat_sompi: i64,
+    /// Smallest invoice a covenant can settle. The covenant splits the payment
+    /// into several outputs and KIP-9 charges ~1e12/value per output, so a tiny
+    /// platform-fee slice is expensive: at 2% the hard limit is ~1.13 KAS. 2 KAS
+    /// keeps ~2x headroom, which is what lets a merchant add a tax or split
+    /// output without silently pushing the invoice over the consensus cap.
+    pub min_invoice_sompi: i64,
     pub platform_fee_address: String,
     pub signing_key_id: String,
     /// 32-byte ed25519 seed (hex). Fixed default keeps signatures deterministic.
@@ -73,8 +81,9 @@ impl Default for Kpr1Config {
     fn default() -> Self {
         Self {
             enabled: true,
-            platform_fee_bps: 100,
+            platform_fee_bps: 200,
             platform_fee_flat_sompi: 0,
+            min_invoice_sompi: 200_000_000, // 2 KAS
             platform_fee_address: "kaspatest:platformfeeaddr00000".to_string(),
             signing_key_id: "kpr1-key-1".to_string(),
             signing_seed: [7u8; 32],
@@ -187,6 +196,11 @@ impl AppConfig {
         if let Ok(v) = std::env::var("KASWAY_PLATFORM_FEE_FLAT_SOMPI") {
             if let Ok(n) = v.parse() {
                 kpr1.platform_fee_flat_sompi = n;
+            }
+        }
+        if let Ok(v) = std::env::var("KASWAY_MIN_INVOICE_SOMPI") {
+            if let Ok(n) = v.parse() {
+                kpr1.min_invoice_sompi = n;
             }
         }
         if let Ok(v) = std::env::var("KASWAY_PLATFORM_FEE_ADDRESS") {

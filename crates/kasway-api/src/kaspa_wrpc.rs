@@ -236,3 +236,18 @@ impl ChainSource for KaspaWrpcClient {
             })
     }
 }
+
+impl KaspaWrpcClient {
+    /// Virtual's past median time (ms) — the clock CONSENSUS uses to decide
+    /// whether a transaction's `lock_time` has passed. It trails wall-clock time,
+    /// so anything gating on a lock_time must read this and not `Utc::now()`, or
+    /// it will build transactions the node rejects as "input is not finalized".
+    pub async fn past_median_time(&self) -> Result<u64, ChainSourceError> {
+        let info = self.call("getBlockDagInfo", json!({})).await?;
+        info.get("pastMedianTime")
+            .and_then(as_u64_lenient)
+            .ok_or_else(|| {
+                ChainSourceError::Protocol("getBlockDagInfo response missing pastMedianTime".into())
+            })
+    }
+}

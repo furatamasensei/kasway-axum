@@ -121,11 +121,17 @@ impl IntoResponse for AppError {
                 let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 (code, Json(MessageBody { message })).into_response()
             }
-            AppError::Kpr1 { code, message } => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({ "message": message, "code": code })),
-            )
-                .into_response(),
+            AppError::Kpr1 { code, message } => {
+                // The other funnel for KPR-1 refusals (checkout.rs has its own,
+                // which returns a Response directly and never reaches here). The
+                // access log only shows 422 — the code is what says why.
+                tracing::warn!("kpr1 refused: {code} — {message}");
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "message": message, "code": code })),
+                )
+                    .into_response()
+            }
             AppError::Validation(failures) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(ErrorsBody { errors: failures }),
