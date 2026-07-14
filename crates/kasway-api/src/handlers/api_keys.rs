@@ -7,13 +7,13 @@
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::state::AppState;
-use crate::util::{encode_hex, now_iso, paginator_meta, sha256_hex};
+use crate::util::{encode_hex, now_iso, paginator_meta, ser_json_arr, sha256_hex};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const KEY_PREFIX: &str = "ksw";
@@ -35,12 +35,15 @@ const API_KEY_SCOPES: &[&str] = &[
     "mcp:subscriptions:read",
 ];
 
-#[derive(sqlx::FromRow)]
+/// Serialized like Lucid (camelCase); `keyHash` is never selected, so it cannot leak.
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct ApiKeyRow {
     id: i64,
     user_id: i64,
     name: String,
     prefix: String,
+    #[serde(serialize_with = "ser_json_arr")]
     scopes: String,
     last_used_at: Option<String>,
     expires_at: Option<String>,
@@ -52,21 +55,8 @@ struct ApiKeyRow {
 const SELECT_COLS: &str = "id, user_id, name, prefix, scopes, last_used_at, expires_at, \
                            revoked_at, created_at, updated_at";
 
-/// Serialize a row like Lucid (camelCase, declaration order, `keyHash` omitted).
 fn serialize_row(row: &ApiKeyRow) -> Value {
-    let scopes: Value = serde_json::from_str(&row.scopes).unwrap_or(Value::Array(vec![]));
-    json!({
-        "id": row.id,
-        "userId": row.user_id,
-        "name": row.name,
-        "prefix": row.prefix,
-        "scopes": scopes,
-        "lastUsedAt": row.last_used_at,
-        "expiresAt": row.expires_at,
-        "revokedAt": row.revoked_at,
-        "createdAt": row.created_at,
-        "updatedAt": row.updated_at,
-    })
+    serde_json::to_value(row).unwrap_or(Value::Null)
 }
 
 fn generate_key_material() -> (String, String, String) {

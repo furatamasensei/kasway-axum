@@ -10,36 +10,48 @@ use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::kpr1::{compute_config_commitment, is_kaspa_address, percentage_to_bps, MAX_BPS, MAX_SPLIT_ADDRESSES};
 use crate::state::AppState;
 use crate::store_context::{ensure_default_store, resolve_owned_store};
-use crate::util::{json_or_null, now_iso};
+use crate::util::{now_iso, ser_bool_opt, ser_json};
 use axum::extract::{Path, State};
 use axum::Json;
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::{json, Map, Value};
 
 const SETUP_SECTIONS: &[&str] = &["payout", "tax", "split", "redirects", "webhook"];
 
-#[derive(sqlx::FromRow, Clone)]
+#[derive(Serialize, sqlx::FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
 struct SetupRow {
     id: i64,
     user_id: i64,
     store_id: Option<i64>,
+    #[serde(serialize_with = "ser_bool_opt")]
     tos_agreed: Option<i64>,
     kaspa_main_address: Option<String>,
+    #[serde(serialize_with = "ser_bool_opt")]
     kaspa_tax_enabled: Option<i64>,
     kaspa_tax_address: Option<String>,
     kaspa_tax_percentage: Option<String>,
+    #[serde(serialize_with = "ser_bool_opt")]
     kaspa_split_enabled: Option<i64>,
+    #[serde(serialize_with = "ser_json")]
     kaspa_split_addresses: Option<String>,
     igra_main_address: Option<String>,
+    #[serde(serialize_with = "ser_bool_opt")]
     igra_tax_enabled: Option<i64>,
     igra_tax_address: Option<String>,
     igra_tax_percentage: Option<String>,
+    #[serde(serialize_with = "ser_bool_opt")]
     igra_split_enabled: Option<i64>,
+    #[serde(serialize_with = "ser_json")]
     igra_split_addresses: Option<String>,
     kasplex_main_address: Option<String>,
+    #[serde(serialize_with = "ser_bool_opt")]
     kasplex_tax_enabled: Option<i64>,
     kasplex_tax_address: Option<String>,
     kasplex_tax_percentage: Option<String>,
+    #[serde(serialize_with = "ser_bool_opt")]
     kasplex_split_enabled: Option<i64>,
+    #[serde(serialize_with = "ser_json")]
     kasplex_split_addresses: Option<String>,
     redirect_url: Option<String>,
     webhook_url: Option<String>,
@@ -102,35 +114,12 @@ fn config_commitment(state: &AppState, s: &SetupRow) -> Option<String> {
 }
 
 fn serialize_setup(state: &AppState, s: &SetupRow) -> Value {
-    json!({
-        "id": s.id,
-        "userId": s.user_id,
-        "storeId": s.store_id,
-        "tosAgreed": s.tos_agreed.unwrap_or(0) != 0,
-        "configCommitment": config_commitment(state, s),
-        "kaspaMainAddress": s.kaspa_main_address,
-        "kaspaTaxEnabled": s.kaspa_tax_enabled.unwrap_or(0) != 0,
-        "kaspaTaxAddress": s.kaspa_tax_address,
-        "kaspaTaxPercentage": s.kaspa_tax_percentage,
-        "kaspaSplitEnabled": s.kaspa_split_enabled.unwrap_or(0) != 0,
-        "kaspaSplitAddresses": json_or_null(&s.kaspa_split_addresses),
-        "igraMainAddress": s.igra_main_address,
-        "igraTaxEnabled": s.igra_tax_enabled.unwrap_or(0) != 0,
-        "igraTaxAddress": s.igra_tax_address,
-        "igraTaxPercentage": s.igra_tax_percentage,
-        "igraSplitEnabled": s.igra_split_enabled.unwrap_or(0) != 0,
-        "igraSplitAddresses": json_or_null(&s.igra_split_addresses),
-        "kasplexMainAddress": s.kasplex_main_address,
-        "kasplexTaxEnabled": s.kasplex_tax_enabled.unwrap_or(0) != 0,
-        "kasplexTaxAddress": s.kasplex_tax_address,
-        "kasplexTaxPercentage": s.kasplex_tax_percentage,
-        "kasplexSplitEnabled": s.kasplex_split_enabled.unwrap_or(0) != 0,
-        "kasplexSplitAddresses": json_or_null(&s.kasplex_split_addresses),
-        "redirectUrl": s.redirect_url,
-        "webhookUrl": s.webhook_url,
-        "createdAt": s.created_at,
-        "updatedAt": s.updated_at,
-    })
+    let mut obj = match serde_json::to_value(s) {
+        Ok(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
+    obj.insert("configCommitment".into(), json!(config_commitment(state, s)));
+    Value::Object(obj)
 }
 
 // --- input parsing ---

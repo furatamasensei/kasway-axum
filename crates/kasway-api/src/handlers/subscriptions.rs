@@ -6,11 +6,11 @@ use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::handlers::invoices;
 use crate::state::AppState;
-use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, to_iso};
+use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_json, to_iso};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const INTERVAL_UNITS: &[&str] = &["day", "week", "month", "year"];
@@ -24,7 +24,8 @@ pub struct PageQuery {
 
 // ---------------- plans ----------------
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct PlanRow {
     id: i64,
     user_id: i64,
@@ -33,6 +34,7 @@ struct PlanRow {
     status: String,
     name: String,
     description: Option<String>,
+    #[serde(serialize_with = "ser_amount")]
     amount: i64,
     currency: String,
     payment_network: String,
@@ -40,6 +42,7 @@ struct PlanRow {
     interval_unit: String,
     interval_count: i64,
     invoice_expires_after_seconds: Option<i64>,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     archived_at: Option<String>,
     created_at: Option<String>,
@@ -51,26 +54,7 @@ const PLAN_COLS: &str = "id, user_id, public_id, external_id, status, name, desc
     invoice_expires_after_seconds, metadata, archived_at, created_at, updated_at";
 
 fn serialize_plan(p: &PlanRow) -> Value {
-    json!({
-        "id": p.id,
-        "userId": p.user_id,
-        "publicId": p.public_id,
-        "externalId": p.external_id,
-        "status": p.status,
-        "name": p.name,
-        "description": p.description,
-        "amount": p.amount.to_string(),
-        "currency": p.currency,
-        "paymentNetwork": p.payment_network,
-        "paymentAsset": p.payment_asset,
-        "intervalUnit": p.interval_unit,
-        "intervalCount": p.interval_count,
-        "invoiceExpiresAfterSeconds": p.invoice_expires_after_seconds,
-        "metadata": json_or_null(&p.metadata),
-        "archivedAt": p.archived_at,
-        "createdAt": p.created_at,
-        "updatedAt": p.updated_at,
-    })
+    serde_json::to_value(p).unwrap_or(Value::Null)
 }
 
 async fn load_plan(state: &AppState, user_id: i64, public_id: &str) -> AppResult<PlanRow> {
@@ -196,7 +180,8 @@ pub async fn plans_archive(auth: AuthMerchant, State(state): State<AppState>, Pa
 
 // ---------------- customers ----------------
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct CustomerRow {
     id: i64,
     user_id: i64,
@@ -204,6 +189,7 @@ struct CustomerRow {
     external_id: Option<String>,
     email: Option<String>,
     name: Option<String>,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -212,17 +198,7 @@ struct CustomerRow {
 const CUSTOMER_COLS: &str = "id, user_id, public_id, external_id, email, name, metadata, created_at, updated_at";
 
 fn serialize_customer(c: &CustomerRow) -> Value {
-    json!({
-        "id": c.id,
-        "userId": c.user_id,
-        "publicId": c.public_id,
-        "externalId": c.external_id,
-        "email": c.email,
-        "name": c.name,
-        "metadata": json_or_null(&c.metadata),
-        "createdAt": c.created_at,
-        "updatedAt": c.updated_at,
-    })
+    serde_json::to_value(c).unwrap_or(Value::Null)
 }
 
 async fn load_customer(state: &AppState, user_id: i64, public_id: &str) -> AppResult<CustomerRow> {

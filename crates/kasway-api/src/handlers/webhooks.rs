@@ -12,11 +12,11 @@ use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
-use crate::util::{now_iso, paginator_meta, random_hex};
+use crate::util::{now_iso, paginator_meta, random_hex, ser_bool, ser_json_arr, ser_json_obj};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const WEBHOOK_EVENT_TYPES: &[&str] = &[
@@ -37,13 +37,16 @@ const WEBHOOK_EVENT_TYPES: &[&str] = &[
 
 // ---------- rows + serialization ----------
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct EndpointRow {
     id: i64,
     user_id: i64,
     store_id: Option<i64>,
     url: String,
+    #[serde(serialize_with = "ser_json_arr")]
     events: String,
+    #[serde(serialize_with = "ser_bool")]
     is_active: i64,
     paused_at: Option<String>,
     secret_rotated_at: Option<String>,
@@ -55,25 +58,15 @@ const ENDPOINT_COLS: &str = "id, user_id, store_id, url, events, is_active, paus
     secret_rotated_at, created_at, updated_at";
 
 fn serialize_endpoint(e: &EndpointRow, deliveries: Option<&[DeliveryRow]>) -> Value {
-    let mut obj = json!({
-        "id": e.id,
-        "userId": e.user_id,
-        "storeId": e.store_id,
-        "url": e.url,
-        "events": serde_json::from_str::<Value>(&e.events).unwrap_or(json!([])),
-        "isActive": e.is_active != 0,
-        "pausedAt": e.paused_at,
-        "secretRotatedAt": e.secret_rotated_at,
-        "createdAt": e.created_at,
-        "updatedAt": e.updated_at,
-    });
+    let mut obj = serde_json::to_value(e).unwrap_or(Value::Null);
     if let (Value::Object(map), Some(ds)) = (&mut obj, deliveries) {
         map.insert("deliveries".into(), Value::Array(ds.iter().map(|d| serialize_delivery(d, None, None)).collect()));
     }
     obj
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct EventRow {
     id: i64,
     user_id: i64,
@@ -81,6 +74,7 @@ struct EventRow {
     event_type: String,
     resource_type: String,
     resource_id: String,
+    #[serde(serialize_with = "ser_json_obj")]
     payload: String,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -89,17 +83,7 @@ struct EventRow {
 const EVENT_COLS: &str = "id, user_id, store_id, event_type, resource_type, resource_id, payload, created_at, updated_at";
 
 fn serialize_event(e: &EventRow, deliveries: Option<&[(DeliveryRow, Option<EndpointRow>)]>) -> Value {
-    let mut obj = json!({
-        "id": e.id,
-        "userId": e.user_id,
-        "storeId": e.store_id,
-        "eventType": e.event_type,
-        "resourceType": e.resource_type,
-        "resourceId": e.resource_id,
-        "payload": serde_json::from_str::<Value>(&e.payload).unwrap_or(json!({})),
-        "createdAt": e.created_at,
-        "updatedAt": e.updated_at,
-    });
+    let mut obj = serde_json::to_value(e).unwrap_or(Value::Null);
     if let (Value::Object(map), Some(ds)) = (&mut obj, deliveries) {
         map.insert(
             "deliveries".into(),
@@ -109,7 +93,8 @@ fn serialize_event(e: &EventRow, deliveries: Option<&[(DeliveryRow, Option<Endpo
     obj
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct DeliveryRow {
     id: i64,
     webhook_event_id: i64,
@@ -119,6 +104,7 @@ struct DeliveryRow {
     response_status: Option<i64>,
     response_body: Option<String>,
     error: Option<String>,
+    #[serde(serialize_with = "ser_bool")]
     is_replay: i64,
     last_attempted_at: Option<String>,
     next_attempt_at: Option<String>,
@@ -132,22 +118,7 @@ const DELIVERY_COLS: &str = "id, webhook_event_id, webhook_endpoint_id, status, 
     delivered_at, created_at, updated_at";
 
 fn serialize_delivery(d: &DeliveryRow, endpoint: Option<&EndpointRow>, event: Option<&EventRow>) -> Value {
-    let mut obj = json!({
-        "id": d.id,
-        "webhookEventId": d.webhook_event_id,
-        "webhookEndpointId": d.webhook_endpoint_id,
-        "status": d.status,
-        "attemptCount": d.attempt_count,
-        "responseStatus": d.response_status,
-        "responseBody": d.response_body,
-        "error": d.error,
-        "isReplay": d.is_replay != 0,
-        "lastAttemptedAt": d.last_attempted_at,
-        "nextAttemptAt": d.next_attempt_at,
-        "deliveredAt": d.delivered_at,
-        "createdAt": d.created_at,
-        "updatedAt": d.updated_at,
-    });
+    let mut obj = serde_json::to_value(d).unwrap_or(Value::Null);
     if let Value::Object(map) = &mut obj {
         if let Some(ep) = endpoint {
             map.insert("endpoint".into(), serialize_endpoint(ep, None));
