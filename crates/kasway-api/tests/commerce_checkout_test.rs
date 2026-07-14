@@ -2,15 +2,6 @@ mod common;
 
 use serde_json::{json, Value};
 
-/// Register a merchant, seed default store + payout setup, return (token, email).
-async fn merchant_with_setup(app: &common::TestApp, email: &str) -> String {
-    let token = common::register_merchant(app, email, "secret123").await;
-    let uid = common::merchant_user_id(&app.db, email).await;
-    let store = common::seed_default_store(&app.db, uid).await;
-    common::seed_setup(&app.db, uid, store, "kaspatest:merchantpayout00001").await;
-    token
-}
-
 async fn create_invoice(app: &common::TestApp, token: &str) -> Value {
     app.client
         .post(app.url("/api/invoices"))
@@ -29,7 +20,7 @@ async fn create_invoice(app: &common::TestApp, token: &str) -> Value {
 #[tokio::test]
 async fn commerce_store_returns_kpr1_contract() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "com1@example.com").await;
+    let token = common::merchant_with_setup(&app, "com1@example.com").await;
 
     let res = app
         .client
@@ -51,7 +42,7 @@ async fn commerce_store_returns_kpr1_contract() {
 #[tokio::test]
 async fn commerce_show_roundtrip_and_missing() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "com2@example.com").await;
+    let token = common::merchant_with_setup(&app, "com2@example.com").await;
     let created = create_invoice(&app, &token).await;
     let public_id = created["publicId"].as_str().unwrap();
 
@@ -83,7 +74,7 @@ async fn commerce_show_roundtrip_and_missing() {
 #[tokio::test]
 async fn checkout_show_returns_status_and_state() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "chk1@example.com").await;
+    let token = common::merchant_with_setup(&app, "chk1@example.com").await;
     let created = create_invoice(&app, &token).await;
     let public_id = created["publicId"].as_str().unwrap();
 
@@ -126,7 +117,7 @@ async fn checkout_show_missing_404() {
 #[tokio::test]
 async fn checkout_kpr1_intent_returns_canonical_and_marks_fetched() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "chk2@example.com").await;
+    let token = common::merchant_with_setup(&app, "chk2@example.com").await;
     let created = create_invoice(&app, &token).await;
     let public_id = created["publicId"].as_str().unwrap();
 
@@ -174,7 +165,7 @@ async fn checkout_kpr1_intent_missing_422() {
 #[tokio::test]
 async fn checkout_kpr1_intent_not_open_422() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "chk3@example.com").await;
+    let token = common::merchant_with_setup(&app, "chk3@example.com").await;
     let created = create_invoice(&app, &token).await;
     let id = created["id"].as_i64().unwrap();
     let public_id = created["publicId"].as_str().unwrap().to_string();

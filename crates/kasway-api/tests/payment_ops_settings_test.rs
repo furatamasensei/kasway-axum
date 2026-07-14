@@ -2,14 +2,10 @@ mod common;
 
 use serde_json::{json, Value};
 
-async fn merchant(app: &common::TestApp, email: &str) -> String {
-    common::register_merchant(app, email, "secret123").await
-}
-
 #[tokio::test]
 async fn confirmation_policy_default_and_update() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "po5@example.com").await;
+    let token = common::merchant(&app, "po5@example.com").await;
 
     let def: Value = app.client.get(app.url("/api/payments/ops/confirmation-policy")).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
     assert_eq!(def["requiredConfirmations"], 10);
@@ -33,7 +29,7 @@ async fn confirmation_policy_default_and_update() {
 #[tokio::test]
 async fn confirmation_policy_update_validation() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "po6@example.com").await;
+    let token = common::merchant(&app, "po6@example.com").await;
 
     let below_min = app.client.put(app.url("/api/payments/ops/confirmation-policy")).bearer_auth(&token).json(&json!({ "defaultConfirmations": 3 })).send().await.unwrap();
     assert_eq!(below_min.status(), 422);

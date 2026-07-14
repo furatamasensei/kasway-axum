@@ -2,8 +2,54 @@
 
 use chrono::{DateTime, Utc};
 use rand::RngCore;
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+// --- serde adapters for Lucid-shaped columns ------------------------------
+//
+// Row structs derive `Serialize` + `#[serde(rename_all = "camelCase")]` and use
+// these on the few columns whose SQL type does not match the JSON type Lucid
+// emitted: 0/1 BIGINT booleans, bigint amounts (strings on the wire), and TEXT
+// columns holding JSON.
+
+/// 0/1 BIGINT column -> JSON bool.
+pub fn ser_bool<S: Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_bool(*v != 0)
+}
+
+/// Nullable 0/1 BIGINT column -> JSON bool (absent reads as `false`).
+pub fn ser_bool_opt<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_bool(v.unwrap_or(0) != 0)
+}
+
+/// Atomic amount -> decimal string.
+pub fn ser_amount<S: Serializer>(v: &i64, s: S) -> Result<S::Ok, S::Error> {
+    s.collect_str(v)
+}
+
+/// Optional atomic amount -> decimal string, `null` when absent.
+pub fn ser_amount_opt<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(n) => s.collect_str(n),
+        None => s.serialize_none(),
+    }
+}
+
+/// Nullable TEXT column holding JSON -> parsed value (`null` when absent or unparseable).
+pub fn ser_json<S: Serializer>(v: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    json_or_null(v).serialize(s)
+}
+
+/// NOT NULL TEXT column holding a JSON object -> parsed value (`{}` on parse failure).
+pub fn ser_json_obj<S: Serializer>(v: &str, s: S) -> Result<S::Ok, S::Error> {
+    serde_json::from_str::<Value>(v).unwrap_or_else(|_| json!({})).serialize(s)
+}
+
+/// NOT NULL TEXT column holding a JSON array -> parsed value (`[]` on parse failure).
+pub fn ser_json_arr<S: Serializer>(v: &str, s: S) -> Result<S::Ok, S::Error> {
+    serde_json::from_str::<Value>(v).unwrap_or_else(|_| json!([])).serialize(s)
+}
 
 /// Hex-encoded SHA-256 of the input.
 pub fn sha256_hex(input: &[u8]) -> String {
@@ -60,7 +106,7 @@ pub fn is_atomic_amount(s: &str) -> bool {
 
 /// Build a Lucid `SimplePaginator` `meta` object (same keys/order/URLs).
 pub fn paginator_meta(total: i64, per_page: i64, current_page: i64) -> Value {
-    let last_page = std::cmp::max(((total as f64) / (per_page as f64)).ceil() as i64, 1);
+    let last_page = ((total + per_page - 1) / per_page).max(1);
     json!({
         "total": total,
         "perPage": per_page,

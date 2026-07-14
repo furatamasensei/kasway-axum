@@ -11,7 +11,8 @@ use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::Value;
 
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "gif"];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "avi", "mkv"];
@@ -21,7 +22,8 @@ fn media_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("kasway-media")
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct MediaRow {
     id: i64,
     user_id: i64,
@@ -37,19 +39,7 @@ struct MediaRow {
 }
 
 fn serialize_media(m: &MediaRow) -> Value {
-    json!({
-        "id": m.id,
-        "userId": m.user_id,
-        "key": m.key,
-        "mediaType": m.media_type,
-        "status": m.status,
-        "size": m.size,
-        "width": m.width,
-        "height": m.height,
-        "duration": m.duration,
-        "createdAt": m.created_at,
-        "updatedAt": m.updated_at,
-    })
+    serde_json::to_value(m).unwrap_or(Value::Null)
 }
 
 /// `POST /api/media` (merchant) — multipart upload.

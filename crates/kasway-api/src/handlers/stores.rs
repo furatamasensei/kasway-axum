@@ -4,13 +4,15 @@ use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::state::AppState;
 use crate::store_context::{assert_can_create_new_payments, ensure_default_store};
-use crate::util::{json_or_null, now_iso, random_hex};
+use crate::util::{now_iso, random_hex, ser_bool, ser_json};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use serde::Serialize;
 use serde_json::{json, Value};
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct StoreRow {
     id: i64,
     user_id: i64,
@@ -18,8 +20,11 @@ pub(crate) struct StoreRow {
     name: String,
     slug: Option<String>,
     status: String,
+    #[serde(serialize_with = "ser_bool")]
     is_included: i64,
+    #[serde(serialize_with = "ser_bool")]
     is_default: i64,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     disabled_at: Option<String>,
     archived_at: Option<String>,
@@ -31,21 +36,7 @@ const STORE_COLS: &str = "id, user_id, public_id, name, slug, status, is_include
     metadata, disabled_at, archived_at, created_at, updated_at";
 
 fn serialize_store(s: &StoreRow) -> Value {
-    json!({
-        "id": s.id,
-        "userId": s.user_id,
-        "publicId": s.public_id,
-        "name": s.name,
-        "slug": s.slug,
-        "status": s.status,
-        "isIncluded": s.is_included != 0,
-        "isDefault": s.is_default != 0,
-        "metadata": json_or_null(&s.metadata),
-        "disabledAt": s.disabled_at,
-        "archivedAt": s.archived_at,
-        "createdAt": s.created_at,
-        "updatedAt": s.updated_at,
-    })
+    serde_json::to_value(s).unwrap_or(Value::Null)
 }
 
 async fn load_owned_store(state: &AppState, user_id: i64, id: i64) -> AppResult<StoreRow> {

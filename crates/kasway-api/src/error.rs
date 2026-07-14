@@ -22,8 +22,6 @@ pub enum AppError {
     /// Forbidden with no body, matching bare `response.forbidden()`.
     #[error("forbidden")]
     Forbidden,
-    #[error("forbidden")]
-    ForbiddenWithMessage(String),
     #[error("not found")]
     NotFound(&'static str),
     #[error("service unavailable")]
@@ -111,9 +109,6 @@ impl IntoResponse for AppError {
                 (StatusCode::UNAUTHORIZED, Json(MessageBody { message: msg.into() })).into_response()
             }
             AppError::Forbidden => StatusCode::FORBIDDEN.into_response(),
-            AppError::ForbiddenWithMessage(msg) => {
-                (StatusCode::FORBIDDEN, Json(MessageBody { message: msg })).into_response()
-            }
             AppError::NotFound(msg) => {
                 (StatusCode::NOT_FOUND, Json(MessageBody { message: msg.into() })).into_response()
             }

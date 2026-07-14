@@ -2,10 +2,6 @@ mod common;
 
 use serde_json::{json, Value};
 
-async fn merchant(app: &common::TestApp, email: &str) -> String {
-    common::register_merchant(app, email, "secret123").await
-}
-
 async fn create_endpoint(app: &common::TestApp, token: &str, events: Value) -> Value {
     app.client
         .post(app.url("/api/webhook-endpoints"))
@@ -29,7 +25,7 @@ async fn endpoints_index_requires_auth() {
 #[tokio::test]
 async fn endpoint_store_returns_signing_secret() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh1@example.com").await;
+    let token = common::merchant(&app, "wh1@example.com").await;
 
     let res = app
         .client
@@ -50,7 +46,7 @@ async fn endpoint_store_returns_signing_secret() {
 #[tokio::test]
 async fn endpoint_store_rejects_http_and_invalid_event() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh2@example.com").await;
+    let token = common::merchant(&app, "wh2@example.com").await;
 
     // plain http to a non-loopback host -> forbidden_protocol
     let http = app
@@ -82,7 +78,7 @@ async fn endpoint_store_rejects_http_and_invalid_event() {
 #[tokio::test]
 async fn endpoint_show_update_destroy() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh3@example.com").await;
+    let token = common::merchant(&app, "wh3@example.com").await;
     let ep = create_endpoint(&app, &token, json!(["invoice.created"])).await;
     let id = ep["id"].as_i64().unwrap();
 
@@ -114,7 +110,7 @@ async fn endpoint_show_update_destroy() {
 #[tokio::test]
 async fn endpoint_pause_resume_rotate() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh4@example.com").await;
+    let token = common::merchant(&app, "wh4@example.com").await;
     let ep = create_endpoint(&app, &token, json!(["invoice.created"])).await;
     let id = ep["id"].as_i64().unwrap();
 
@@ -132,8 +128,8 @@ async fn endpoint_pause_resume_rotate() {
 #[tokio::test]
 async fn endpoint_pause_foreign_403() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh5@example.com").await;
-    let other = merchant(&app, "wh5b@example.com").await;
+    let token = common::merchant(&app, "wh5@example.com").await;
+    let other = common::merchant(&app, "wh5b@example.com").await;
     let ep = create_endpoint(&app, &token, json!(["invoice.created"])).await;
     let id = ep["id"].as_i64().unwrap();
 
@@ -144,7 +140,7 @@ async fn endpoint_pause_foreign_403() {
 #[tokio::test]
 async fn test_send_creates_event_and_delivery() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh6@example.com").await;
+    let token = common::merchant(&app, "wh6@example.com").await;
     let ep = create_endpoint(&app, &token, json!(["invoice.created"])).await;
     let id = ep["id"].as_i64().unwrap();
 
@@ -179,7 +175,7 @@ async fn test_send_creates_event_and_delivery() {
 #[tokio::test]
 async fn deliveries_and_events_listing_and_replay() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh7@example.com").await;
+    let token = common::merchant(&app, "wh7@example.com").await;
     let ep = create_endpoint(&app, &token, json!(["invoice.created"])).await;
     let id = ep["id"].as_i64().unwrap();
 
@@ -231,8 +227,8 @@ async fn deliveries_and_events_listing_and_replay() {
 #[tokio::test]
 async fn delivery_show_foreign_404() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh8@example.com").await;
-    let other = merchant(&app, "wh8b@example.com").await;
+    let token = common::merchant(&app, "wh8@example.com").await;
+    let other = common::merchant(&app, "wh8b@example.com").await;
     let ep = create_endpoint(&app, &token, json!(["invoice.created"])).await;
     let id = ep["id"].as_i64().unwrap();
     let ts: Value = app.client.post(app.url(&format!("/api/webhook-endpoints/{id}/test-send"))).bearer_auth(&token).json(&json!({ "eventType": "invoice.created" })).send().await.unwrap().json().await.unwrap();
@@ -245,8 +241,8 @@ async fn delivery_show_foreign_404() {
 #[tokio::test]
 async fn event_show_foreign_403() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "wh9@example.com").await;
-    let other = merchant(&app, "wh9b@example.com").await;
+    let token = common::merchant(&app, "wh9@example.com").await;
+    let other = common::merchant(&app, "wh9b@example.com").await;
     let ep = create_endpoint(&app, &token, json!(["invoice.created"])).await;
     let id = ep["id"].as_i64().unwrap();
     let ts: Value = app.client.post(app.url(&format!("/api/webhook-endpoints/{id}/test-send"))).bearer_auth(&token).json(&json!({ "eventType": "invoice.created" })).send().await.unwrap().json().await.unwrap();

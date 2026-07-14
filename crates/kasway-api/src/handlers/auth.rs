@@ -75,7 +75,7 @@ pub async fn login(
         if !password_ok {
             return Err(AppError::bad_credentials());
         }
-        let token = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, id).await?;
+        let token = auth_token::mint(&state.db.pool, id).await?;
         return Ok(Json(json!({
             "token": token,
             "role": "merchant",
@@ -141,7 +141,7 @@ pub async fn register(
     .fetch_one(&state.db.pool)
     .await?;
 
-    let token = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, id).await?;
+    let token = auth_token::mint(&state.db.pool, id).await?;
 
     Ok((
         StatusCode::OK,
@@ -171,7 +171,7 @@ pub async fn logout(
     auth: AuthMerchant,
     State(state): State<AppState>,
 ) -> AppResult<Json<Value>> {
-    auth_token::delete(&state.db.pool, &auth_token::MERCHANT, auth.token_id).await?;
+    auth_token::delete(&state.db.pool, auth.token_id).await?;
     Ok(Json(json!({ "success": true })))
 }
 
@@ -410,7 +410,7 @@ pub async fn callback_google(
         }
     };
 
-    let token_value = auth_token::mint(&state.db.pool, &auth_token::MERCHANT, user_id).await?;
+    let token_value = auth_token::mint(&state.db.pool, user_id).await?;
     let location = format!(
         "{}/auth/callback?token={}&onboarded={}",
         g.frontend_url, token_value, onboarded != 0

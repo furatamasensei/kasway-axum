@@ -10,10 +10,10 @@ use crate::handlers::payment_ops_settings::required_confirmations_for;
 use crate::kpr1::{self, IntentInvoiceCtx};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
-use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex};
+use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_amount_opt, ser_json, ser_json_arr, ser_json_obj};
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
 pub(crate) const FEE_DELEGATIONS: &[&str] = &["merchant_subsidized", "customer_pays"];
@@ -28,7 +28,8 @@ pub struct InvoiceQuery {
     source: Option<String>,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct InvoiceRow {
     id: i64,
     user_id: i64,
@@ -43,12 +44,16 @@ pub(crate) struct InvoiceRow {
     payment_network: Option<String>,
     payment_asset: Option<String>,
     payment_reference: Option<String>,
+    #[serde(serialize_with = "ser_amount")]
     subtotal_amount: i64,
+    #[serde(serialize_with = "ser_amount")]
     total_amount: i64,
     fee_delegation: Option<String>,
+    #[serde(serialize_with = "ser_amount")]
     service_fee_amount: i64,
     currency: String,
     pricing_country_code: Option<String>,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     expires_at: Option<String>,
     paid_at: Option<String>,
@@ -69,23 +74,28 @@ const INVOICE_COLS: &str = "id, user_id, store_id, public_id, external_id, subsc
     service_fee_amount, currency, pricing_country_code, metadata, expires_at, \
     paid_at, cancelled_at, created_at, updated_at";
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ItemRow {
     id: i64,
     invoice_id: i64,
     name: String,
     quantity: i64,
+    #[serde(serialize_with = "ser_amount")]
     unit_amount: i64,
+    #[serde(serialize_with = "ser_amount")]
     total_amount: i64,
     pricing_country_code: Option<String>,
     pricing_currency: Option<String>,
     pricing_source: Option<String>,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct IntentRow {
     id: i64,
     invoice_id: i64,
@@ -94,10 +104,13 @@ pub(crate) struct IntentRow {
     status: String,
     network: String,
     asset_id: String,
+    #[serde(serialize_with = "ser_amount")]
     amount_sompi: i64,
     platform_fee_bps: i64,
+    #[serde(serialize_with = "ser_amount")]
     platform_fee_amount: i64,
     tax_bps: Option<i64>,
+    #[serde(serialize_with = "ser_amount_opt")]
     tax_amount: Option<i64>,
     tax_address: Option<String>,
     merchant_address: String,
@@ -117,8 +130,11 @@ pub(crate) struct IntentRow {
     tx_id: Option<String>,
     verification_status: Option<String>,
     failure_reason: Option<String>,
+    #[serde(serialize_with = "ser_json_arr")]
     required_outputs: String,
+    #[serde(serialize_with = "ser_json_obj")]
     canonical_intent: String,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     expires_at: Option<String>,
     fetched_at: Option<String>,
@@ -143,93 +159,19 @@ fn amount_str(v: i64) -> Value {
 }
 
 fn serialize_item(item: &ItemRow) -> Value {
-    json!({
-        "id": item.id,
-        "invoiceId": item.invoice_id,
-        "name": item.name,
-        "quantity": item.quantity,
-        "unitAmount": amount_str(item.unit_amount),
-        "totalAmount": amount_str(item.total_amount),
-        "pricingCountryCode": item.pricing_country_code,
-        "pricingCurrency": item.pricing_currency,
-        "pricingSource": item.pricing_source,
-        "metadata": json_or_null(&item.metadata),
-        "createdAt": item.created_at,
-        "updatedAt": item.updated_at,
-    })
+    serde_json::to_value(item).unwrap_or(Value::Null)
 }
 
 pub(crate) fn serialize_intent(intent: &IntentRow) -> Value {
-    json!({
-        "id": intent.id,
-        "invoiceId": intent.invoice_id,
-        "userId": intent.user_id,
-        "intentId": intent.intent_id,
-        "status": intent.status,
-        "network": intent.network,
-        "assetId": intent.asset_id,
-        "amountSompi": amount_str(intent.amount_sompi),
-        "platformFeeBps": intent.platform_fee_bps,
-        "platformFeeAmount": amount_str(intent.platform_fee_amount),
-        "taxBps": intent.tax_bps,
-        "taxAmount": intent.tax_amount.map(amount_str).unwrap_or(Value::Null),
-        "taxAddress": intent.tax_address,
-        "merchantAddress": intent.merchant_address,
-        "platformFeeAddress": intent.platform_fee_address,
-        "templateId": intent.template_id,
-        "templateVersion": intent.template_version,
-        "scriptHash": intent.script_hash,
-        "canonicalHash": intent.canonical_hash,
-        "paymentRequestUri": intent.payment_request_uri,
-        "paymentIntentUrl": intent.payment_intent_url,
-        "signatureAlgorithm": intent.signature_algorithm,
-        "signatureKeyId": intent.signature_key_id,
-        "signatureValue": intent.signature_value,
-        "txId": intent.tx_id,
-        "verificationStatus": intent.verification_status,
-        "failureReason": intent.failure_reason,
-        "requiredOutputs": serde_json::from_str::<Value>(&intent.required_outputs).unwrap_or(json!([])),
-        "canonicalIntent": serde_json::from_str::<Value>(&intent.canonical_intent).unwrap_or(json!({})),
-        "metadata": json_or_null(&intent.metadata),
-        "expiresAt": intent.expires_at,
-        "fetchedAt": intent.fetched_at,
-        "submittedAt": intent.submitted_at,
-        "observedAt": intent.observed_at,
-        "verifiedAt": intent.verified_at,
-        "settledAt": intent.settled_at,
-        "createdAt": intent.created_at,
-        "updatedAt": intent.updated_at,
-    })
+    serde_json::to_value(intent).unwrap_or(Value::Null)
 }
 
 /// Replicates `Invoice.serialize()` including the KPR-1 hoisting logic.
 pub(crate) fn serialize_invoice(inv: &InvoiceRow, items: &[ItemRow], intent: Option<&IntentRow>) -> Value {
-    let mut obj = Map::new();
-    obj.insert("id".into(), json!(inv.id));
-    obj.insert("userId".into(), json!(inv.user_id));
-    obj.insert("storeId".into(), json!(inv.store_id));
-    obj.insert("publicId".into(), json!(inv.public_id));
-    obj.insert("externalId".into(), json!(inv.external_id));
-    obj.insert("subscriptionId".into(), json!(inv.subscription_id));
-    obj.insert("subscriptionCycleId".into(), json!(inv.subscription_cycle_id));
-    obj.insert("paymentLinkId".into(), json!(inv.payment_link_id));
-    obj.insert("status".into(), json!(inv.status));
-    obj.insert("paymentAddress".into(), json!(inv.payment_address));
-    obj.insert("paymentNetwork".into(), json!(inv.payment_network));
-    obj.insert("paymentAsset".into(), json!(inv.payment_asset));
-    obj.insert("paymentReference".into(), json!(inv.payment_reference));
-    obj.insert("subtotalAmount".into(), amount_str(inv.subtotal_amount));
-    obj.insert("totalAmount".into(), amount_str(inv.total_amount));
-    obj.insert("feeDelegation".into(), json!(inv.fee_delegation));
-    obj.insert("serviceFeeAmount".into(), amount_str(inv.service_fee_amount));
-    obj.insert("currency".into(), json!(inv.currency));
-    obj.insert("pricingCountryCode".into(), json!(inv.pricing_country_code));
-    obj.insert("metadata".into(), json_or_null(&inv.metadata));
-    obj.insert("expiresAt".into(), json!(inv.expires_at));
-    obj.insert("paidAt".into(), json!(inv.paid_at));
-    obj.insert("cancelledAt".into(), json!(inv.cancelled_at));
-    obj.insert("createdAt".into(), json!(inv.created_at));
-    obj.insert("updatedAt".into(), json!(inv.updated_at));
+    let mut obj = match serde_json::to_value(inv) {
+        Ok(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
 
     // preloaded relations
     obj.insert("items".into(), Value::Array(items.iter().map(serialize_item).collect()));

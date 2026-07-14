@@ -269,45 +269,6 @@ pub async fn seed_kpr1_intent(db: &Db, invoice_id: i64, user_id: i64, intent_id:
     .expect("seed intent")
 }
 
-/// Seed a payment_anomaly_signal row; returns its id.
-pub async fn seed_anomaly(db: &Db, user_id: i64, signal_type: &str, severity: &str, status: &str) -> i64 {
-    let t = "2026-01-01T00:00:00.000+00:00";
-    sqlx::query_scalar(
-        "INSERT INTO payment_anomaly_signals (user_id, signal_type, severity, status, resource_type, resource_id, detected_at, window_start, window_end, score, reason, metadata, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, 'payment', '1', $5, $6, $7, 5, 'spike', '{}', $8, $9) RETURNING id",
-    )
-    .bind(user_id).bind(signal_type).bind(severity).bind(status).bind(t).bind(t).bind(t).bind(t).bind(t)
-    .fetch_one(&db.pool).await.expect("seed anomaly")
-}
-
-/// Seed a payment_risk_rule_hit; returns its id.
-pub async fn seed_risk_hit(db: &Db, user_id: i64, rule_key: &str, severity: &str, status: &str) -> i64 {
-    let t = "2026-01-01T00:00:00.000+00:00";
-    let dedupe = format!("{rule_key}:{user_id}:{}", uuid::Uuid::new_v4());
-    sqlx::query_scalar(
-        "INSERT INTO payment_risk_rule_hits (user_id, rule_key, rule_version, severity, status, outcome, resource_type, resource_id, reason, dedupe_key, evaluator_version, detected_at, window_start, window_end, created_at, updated_at) \
-         VALUES ($1, $2, 'v1', $3, $4, 'observed', 'invoice', '1', 'r', $5, 'passive-risk-v1', $6, $7, $8, $9, $10) RETURNING id",
-    )
-    .bind(user_id).bind(rule_key).bind(severity).bind(status).bind(dedupe).bind(t).bind(t).bind(t).bind(t).bind(t)
-    .fetch_one(&db.pool).await.expect("seed risk hit")
-}
-
-/// Seed a payment_close_period row (status closed); returns its id.
-pub async fn seed_close_period(db: &Db, user_id: i64) -> i64 {
-    let t = "2026-01-01T00:00:00.000+00:00";
-    sqlx::query_scalar("INSERT INTO payment_close_periods (user_id, period_start, period_end, status, totals_checksum, closed_at, metadata, created_at, updated_at) VALUES ($1, '2026-01-01', '2026-01-31', 'closed', 'abc123', $2, '{}', $3, $4) RETURNING id")
-        .bind(user_id).bind(t).bind(t).bind(t)
-        .fetch_one(&db.pool).await.expect("seed close period")
-}
-
-/// Seed a payment_credit row (drives derived paymentStatus → exceptions).
-pub async fn seed_credit(db: &Db, invoice_id: i64, amount: i64) -> i64 {
-    let t = "2026-01-01T00:00:00.000+00:00";
-    sqlx::query_scalar("INSERT INTO payment_credits (invoice_id, amount, created_at, updated_at) VALUES ($1, $2, $3, $4) RETURNING id")
-        .bind(invoice_id).bind(amount).bind(t).bind(t)
-        .fetch_one(&db.pool).await.expect("seed credit")
-}
-
 /// Insert a payment_indexer_checkpoint row; returns its id.
 pub async fn seed_checkpoint(
     db: &Db,
@@ -333,4 +294,18 @@ pub async fn seed_checkpoint(
     .fetch_one(&db.pool)
     .await
     .expect("seed checkpoint")
+}
+
+/// Register a merchant with the standard test password; returns the bearer token.
+pub async fn merchant(app: &TestApp, email: &str) -> String {
+    register_merchant(app, email, "secret123").await
+}
+
+/// Register a merchant plus a default store and payout setup; returns the token.
+pub async fn merchant_with_setup(app: &TestApp, email: &str) -> String {
+    let token = register_merchant(app, email, "secret123").await;
+    let uid = merchant_user_id(&app.db, email).await;
+    let store = seed_default_store(&app.db, uid).await;
+    seed_setup(&app.db, uid, store, "kaspatest:merchantpayout00001").await;
+    token
 }

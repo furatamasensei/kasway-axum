@@ -2,10 +2,6 @@ mod common;
 
 use serde_json::{json, Value};
 
-async fn merchant(app: &common::TestApp, email: &str) -> String {
-    common::register_merchant(app, email, "secret123").await
-}
-
 // --- payments/networks (public) ---
 
 #[tokio::test]
@@ -30,7 +26,7 @@ async fn networks_public_list_and_assets() {
 #[tokio::test]
 async fn subscription_plans_crud() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "sp1@example.com").await;
+    let token = common::merchant(&app, "sp1@example.com").await;
 
     let created = app
         .client
@@ -74,7 +70,7 @@ async fn subscription_plans_crud() {
 #[tokio::test]
 async fn subscription_plan_validation_and_404() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "sp2@example.com").await;
+    let token = common::merchant(&app, "sp2@example.com").await;
 
     let bad = app.client.post(app.url("/api/commerce/subscription-plans")).bearer_auth(&token).json(&json!({ "amount": "abc", "intervalCount": 1 })).send().await.unwrap();
     assert_eq!(bad.status(), 422);
@@ -92,7 +88,7 @@ async fn subscription_plan_validation_and_404() {
 #[tokio::test]
 async fn subscription_plan_duplicate_external_id() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "sp3@example.com").await;
+    let token = common::merchant(&app, "sp3@example.com").await;
     app.client.post(app.url("/api/commerce/subscription-plans")).bearer_auth(&token).json(&json!({ "name": "A", "amount": "100", "intervalUnit": "month", "intervalCount": 1, "externalId": "ext-1" })).send().await.unwrap();
     let dup = app.client.post(app.url("/api/commerce/subscription-plans")).bearer_auth(&token).json(&json!({ "name": "B", "amount": "200", "intervalUnit": "month", "intervalCount": 1, "externalId": "ext-1" })).send().await.unwrap();
     assert_eq!(dup.status(), 422);
@@ -104,7 +100,7 @@ async fn subscription_plan_duplicate_external_id() {
 #[tokio::test]
 async fn subscription_customers_crud() {
     let app = common::spawn_app().await;
-    let token = merchant(&app, "sc1@example.com").await;
+    let token = common::merchant(&app, "sc1@example.com").await;
 
     let created = app.client.post(app.url("/api/commerce/subscription-customers")).bearer_auth(&token).json(&json!({ "email": "c@x.com", "name": "Cust" })).send().await.unwrap();
     assert_eq!(created.status(), 201);

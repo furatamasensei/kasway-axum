@@ -6,14 +6,15 @@ use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::handlers::invoices::{self, FEE_DELEGATIONS};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
-use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex};
+use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_json};
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct LinkRow {
     id: i64,
     user_id: i64,
@@ -21,12 +22,14 @@ pub(crate) struct LinkRow {
     public_id: String,
     status: String,
     title: String,
+    #[serde(serialize_with = "ser_amount")]
     amount: i64,
     currency: String,
     payment_network: String,
     payment_asset: String,
     fee_delegation: String,
     pricing_country_code: Option<String>,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -46,24 +49,7 @@ pub struct LinkQuery {
 }
 
 fn serialize_link(link: &LinkRow, payments_count: Option<i64>) -> Value {
-    let metadata = json_or_null(&link.metadata);
-    let mut obj = json!({
-        "id": link.id,
-        "userId": link.user_id,
-        "storeId": link.store_id,
-        "publicId": link.public_id,
-        "status": link.status,
-        "title": link.title,
-        "amount": link.amount.to_string(),
-        "currency": link.currency,
-        "paymentNetwork": link.payment_network,
-        "paymentAsset": link.payment_asset,
-        "feeDelegation": link.fee_delegation,
-        "pricingCountryCode": link.pricing_country_code,
-        "metadata": metadata,
-        "createdAt": link.created_at,
-        "updatedAt": link.updated_at,
-    });
+    let mut obj = serde_json::to_value(link).unwrap_or(Value::Null);
     // withCount('invoices') -> paymentsCount (omitted when not loaded).
     if let (Value::Object(map), Some(count)) = (&mut obj, payments_count) {
         map.insert("paymentsCount".into(), json!(count));
