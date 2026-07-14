@@ -3,12 +3,19 @@ FROM rust:slim-bookworm AS builder
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 
-RUN cargo build --release -p kasway-api && \
+# BuildKit cache mounts keep the cargo registry and target/ dir warm across
+# builds, so a source-only change recompiles just this workspace instead of
+# every dependency. The binary must be copied out of the cached target/ within
+# the same RUN, since the cache mount is not part of the image layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release -p kasway-api && \
     cp target/release/kasway-server /usr/local/bin/
 
 # --- Runtime ---

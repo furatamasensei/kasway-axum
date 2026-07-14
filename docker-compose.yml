@@ -1,0 +1,49 @@
+# Local development stack: the kasway-api server plus its PostgreSQL database.
+#
+#   docker compose up --build      # build the image and start the stack
+#   docker compose up -d           # start in the background
+#   docker compose logs -f api     # follow the server logs
+#   docker compose down            # stop; add -v to also drop the DB volume
+#
+# The server runs its embedded migrations against the `kasway` database on
+# startup, so no separate migrate step is needed.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: kasway
+    ports:
+      - "5432:5432"
+    volumes:
+      - kasway-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d kasway"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # `db` is the compose service hostname on the shared network.
+      DATABASE_URL: postgres://postgres:postgres@db:5432/kasway
+      HOST_PORT: 0.0.0.0:8080
+      RUST_LOG: info
+      # Everything below is optional; see .env.example for the full list.
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN:-dev-internal-token}
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8080:8080"
+
+volumes:
+  kasway-db-data:
