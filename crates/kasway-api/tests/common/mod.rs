@@ -246,6 +246,11 @@ pub async fn seed_invoice_item(
 /// Seed a KPR-1 payment intent for an invoice (stubbed crypto fields).
 pub async fn seed_kpr1_intent(db: &Db, invoice_id: i64, user_id: i64, intent_id: &str) -> i64 {
     let outputs = r#"[{"role":"merchant_net","address":"kaspatest:merchant","amountSompi":"900"},{"role":"split","address":"kaspatest:partner","amountSompi":"100","percentage":10}]"#;
+    // Relative to now, not a literal: a hardcoded date silently turns every test
+    // that seeds an intent red the day it passes.
+    let expires_at = (chrono::Utc::now() + chrono::Duration::minutes(10))
+        .format("%Y-%m-%dT%H:%M:%S%.3f+00:00")
+        .to_string();
     sqlx::query_scalar(
         "INSERT INTO kpr1_payment_intents \
          (invoice_id, user_id, intent_id, status, network, asset_id, amount_sompi, platform_fee_bps, \
@@ -254,7 +259,7 @@ pub async fn seed_kpr1_intent(db: &Db, invoice_id: i64, user_id: i64, intent_id:
           signature_key_id, signature_value, required_outputs, canonical_intent, expires_at, created_at, updated_at) \
          VALUES ($1, $2, $3, 'created', 'tn10', 'KAS', 1000, 100, 10, 'kaspatest:merchant', 'kaspatest:fee', \
           'covenant-v1', '1', $4, $5, $6, $7, 'ed25519', 'key-1', 'sig', $8, '{}', \
-          '2026-12-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00') RETURNING id",
+          $9, '2026-01-01T00:00:00.000+00:00', '2026-01-01T00:00:00.000+00:00') RETURNING id",
     )
     .bind(invoice_id)
     .bind(user_id)
@@ -264,6 +269,7 @@ pub async fn seed_kpr1_intent(db: &Db, invoice_id: i64, user_id: i64, intent_id:
     .bind(format!("kaspa:?address=kaspatest:merchant&intent={intent_id}"))
     .bind(format!("https://pay.kasway.test/i/{intent_id}"))
     .bind(outputs)
+    .bind(&expires_at)
     .fetch_one(&db.pool)
     .await
     .expect("seed intent")
