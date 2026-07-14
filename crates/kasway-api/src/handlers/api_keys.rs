@@ -116,7 +116,7 @@ pub async fn index(
 
     let rows = sqlx::query_as::<_, ApiKeyRow>(&format!(
         "SELECT {SELECT_COLS} FROM api_keys WHERE user_id = $1 \
-         ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+         ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
     ))
     .bind(auth.user_id)
     .bind(per_page)

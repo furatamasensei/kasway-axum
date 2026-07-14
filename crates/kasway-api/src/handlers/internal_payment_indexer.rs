@@ -33,7 +33,7 @@ pub async fn healthz(
         "SELECT id, network, asset_id, source, checkpoint, metadata, created_at, updated_at \
          FROM payment_indexer_checkpoints \
          WHERE network = 'tn10' AND asset_id = 'KAS' AND source = 'rusty-kaspa-node' \
-         ORDER BY updated_at DESC LIMIT 1",
+         ORDER BY updated_at DESC, id DESC LIMIT 1",
     )
     .fetch_optional(&state.db.pool)
     .await?;
@@ -56,7 +56,7 @@ pub async fn checkpoints(
 ) -> AppResult<Json<Value>> {
     let rows = sqlx::query_as::<_, CheckpointRow>(
         "SELECT id, network, asset_id, source, checkpoint, metadata, created_at, updated_at \
-         FROM payment_indexer_checkpoints WHERE network = 'tn10' ORDER BY updated_at DESC",
+         FROM payment_indexer_checkpoints WHERE network = 'tn10' ORDER BY updated_at DESC, id DESC",
     )
     .fetch_all(&state.db.pool)
     .await?;

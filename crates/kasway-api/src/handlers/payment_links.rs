@@ -103,7 +103,7 @@ pub async fn index(
 
     let links = sqlx::query_as::<_, LinkRow>(&format!(
         "SELECT {LINK_COLS} FROM payment_links WHERE user_id = $1 AND store_id = $2 \
-         ORDER BY created_at DESC LIMIT $3 OFFSET $4"
+         ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4"
     ))
     .bind(auth.user_id)
     .bind(store_id)

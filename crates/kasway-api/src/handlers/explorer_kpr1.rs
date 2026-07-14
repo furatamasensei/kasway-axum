@@ -146,7 +146,7 @@ async fn find_observation(state: &AppState, intent: &IntentRow, tx_id: Option<&s
     let tx = match tx_id.or(intent.tx_id.as_deref()) { Some(t) => t.to_string(), None => return Ok(None) };
     Ok(sqlx::query_as::<_, ObsRow>(&format!(
         "SELECT {OBS_COLS} FROM payment_observations WHERE tx_id = $1 AND network = $2 AND asset_id = $3 \
-         AND (invoice_id = $4 OR invoice_id IS NULL) ORDER BY created_at DESC LIMIT 1"
+         AND (invoice_id = $4 OR invoice_id IS NULL) ORDER BY created_at DESC, id DESC LIMIT 1"
     ))
     .bind(&tx).bind(&intent.network).bind(&intent.asset_id).bind(intent.invoice_id)
     .fetch_optional(&state.db.pool).await?)
@@ -155,10 +155,10 @@ async fn find_observation(state: &AppState, intent: &IntentRow, tx_id: Option<&s
 async fn find_credit(state: &AppState, intent: &IntentRow, obs: &Option<ObsRow>) -> AppResult<Option<(i64, Option<String>)>> {
     let row = match obs {
         Some(o) => sqlx::query_as::<_, (i64, Option<String>)>(
-            "SELECT amount, credited_at FROM payment_credits WHERE invoice_id = $1 OR payment_observation_id = $2 ORDER BY credited_at DESC LIMIT 1",
+            "SELECT amount, credited_at FROM payment_credits WHERE invoice_id = $1 OR payment_observation_id = $2 ORDER BY credited_at DESC, id DESC LIMIT 1",
         ).bind(intent.invoice_id).bind(o.id),
         None => sqlx::query_as::<_, (i64, Option<String>)>(
-            "SELECT amount, credited_at FROM payment_credits WHERE invoice_id = $1 ORDER BY credited_at DESC LIMIT 1",
+            "SELECT amount, credited_at FROM payment_credits WHERE invoice_id = $1 ORDER BY credited_at DESC, id DESC LIMIT 1",
         ).bind(intent.invoice_id),
     };
     Ok(row.fetch_optional(&state.db.pool).await?)
