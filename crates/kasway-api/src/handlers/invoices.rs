@@ -607,7 +607,7 @@ pub async fn index(
         .await?;
 
     let invoices = sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE {filter} ORDER BY created_at DESC LIMIT $3 OFFSET $4"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE {filter} ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4"
     ))
     .bind(auth.user_id)
     .bind(store_id)

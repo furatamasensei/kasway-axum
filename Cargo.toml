@@ -2,6 +2,14 @@
 resolver = "2"
 members = ["crates/kasway-db", "crates/kasway-api", "crates/kasway-covenant"]
 
+# Dependencies are compiled optimized even in dev/test. scrypt's default params
+# are deliberately expensive (~128 MiB, log_n=17); unoptimized it runs for
+# seconds per hash, and every integration test registers a merchant — which
+# pushed requests past the router's 30s timeout and made tests fail at random.
+# Workspace crates stay unoptimized, so rebuilds and debugging are unaffected.
+[profile.dev.package."*"]
+opt-level = 3
+
 [workspace.package]
 edition = "2021"
 license = "UNLICENSED"
