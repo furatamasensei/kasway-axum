@@ -245,3 +245,35 @@ async fn create_then_show_roundtrip() {
         .unwrap();
     assert_eq!(shown["kpr1PaymentIntent"]["canonicalHash"], hash);
 }
+
+// A caller asking for a far-future expiry gets clamped: an intent commits to a
+// fixed payout set, so it is never payable for more than 15 minutes.
+#[tokio::test]
+async fn intent_expiry_is_clamped_to_15_minutes() {
+    let app = common::spawn_app().await;
+    let token = common::merchant_with_setup(&app, "cinvexp@example.com").await;
+
+    let far_future = (chrono::Utc::now() + chrono::Duration::days(30)).to_rfc3339();
+    let body: Value = app
+        .client
+        .post(app.url("/api/invoices"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }],
+            "expiresAt": far_future,
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let expires_at = body["kpr1PaymentIntent"]["expiresAt"].as_str().expect("intent expiresAt");
+    let expires_at = chrono::DateTime::parse_from_rfc3339(expires_at).expect("rfc3339 expiresAt");
+    let minutes_out = (expires_at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_minutes();
+    assert!(
+        (13..=15).contains(&minutes_out),
+        "expiry should be clamped to ~15 minutes, got {minutes_out}m ({expires_at})"
+    );
+}

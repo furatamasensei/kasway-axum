@@ -24,6 +24,8 @@ const KPR1_VERSION: &str = "kpr-1";
 const TEMPLATE_ID: &str = "split_settlement";
 const TEMPLATE_VERSION: &str = "v1";
 const SIGNATURE_ALGORITHM: &str = "ed25519";
+/// Hard ceiling on how long a KPR-1 payment intent stays payable.
+const MAX_INTENT_EXPIRY_MINUTES: i64 = 15;
 pub(crate) const MAX_BPS: i128 = 10_000;
 pub(crate) const MAX_SPLIT_ADDRESSES: usize = 5;
 
@@ -475,10 +477,17 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id_bytes);
     let intent_id: String = format!("kpr1_{}", encode_hex(&id_bytes));
 
-    let expires_at = ctx
-        .expires_at
-        .clone()
-        .unwrap_or_else(|| to_iso(chrono::Utc::now() + chrono::Duration::minutes(30)));
+    // The intent commits to a fixed payout set, so a long-lived one is a stale
+    // quote. Callers (e.g. an invoice's own `expiresAt`) may ask for less, never
+    // more: anything longer — or unparseable — is clamped to the cap.
+    let max_expires_at = chrono::Utc::now() + chrono::Duration::minutes(MAX_INTENT_EXPIRY_MINUTES);
+    let expires_at = to_iso(
+        ctx.expires_at
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc).min(max_expires_at))
+            .unwrap_or(max_expires_at),
+    );
 
     // outputs: merchant_net, [tax], splits..., kasway_fee
     let mut outputs: Vec<Value> = vec![json!({

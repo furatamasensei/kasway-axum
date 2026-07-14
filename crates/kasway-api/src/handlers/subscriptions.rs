@@ -75,7 +75,7 @@ pub async fn plans_index(auth: AuthMerchant, State(state): State<AppState>, Quer
     let page = q.page.unwrap_or(1).clamp(1, 100_000);
     let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_plans WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
+    let rows = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_plan).collect::<Vec<_>>() })))
 }
@@ -219,7 +219,7 @@ pub async fn customers_index(auth: AuthMerchant, State(state): State<AppState>, 
     let page = q.page.unwrap_or(1).clamp(1, 100_000);
     let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscription_customers WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
+    let rows = sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": rows.iter().map(serialize_customer).collect::<Vec<_>>() })))
 }
@@ -419,7 +419,7 @@ async fn serialize_subscription(state: &AppState, s: &SubRow, with_cycles: bool)
     });
     if with_cycles {
         let cycles = sqlx::query_as::<_, CycleRow>(&format!(
-            "SELECT {CYCLE_COLS} FROM subscription_cycles WHERE subscription_id = $1 ORDER BY period_start DESC LIMIT 20"
+            "SELECT {CYCLE_COLS} FROM subscription_cycles WHERE subscription_id = $1 ORDER BY period_start DESC, id DESC LIMIT 20"
         )).bind(s.id).fetch_all(&state.db.pool).await?;
         let mut arr = Vec::new();
         for c in &cycles { arr.push(serialize_cycle(state, c).await?); }
@@ -522,7 +522,7 @@ pub async fn subs_index(auth: AuthMerchant, State(state): State<AppState>, Query
     let page = q.page.unwrap_or(1).clamp(1, 100_000);
     let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let rows = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"))
+    let rows = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     let mut data = Vec::new();
     for s in &rows { data.push(serialize_subscription(&state, s, false).await?); }
@@ -642,7 +642,7 @@ pub async fn subs_invoices(auth: AuthMerchant, State(state): State<AppState>, Pa
     let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE user_id = $1 AND subscription_id = $2")
         .bind(auth.user_id).bind(sub.id).fetch_one(&state.db.pool).await?;
-    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = $1 AND subscription_id = $2 ORDER BY created_at DESC LIMIT $3 OFFSET $4")
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = $1 AND subscription_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4")
         .bind(auth.user_id).bind(sub.id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
     let mut data = Vec::new();
     for id in ids {
@@ -655,7 +655,7 @@ pub async fn subs_invoices(auth: AuthMerchant, State(state): State<AppState>, Pa
 
 pub async fn subs_retry_invoice(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
     let sub = load_subscription(&state, auth.user_id, &public_id).await?;
-    let cycle_id: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_cycles WHERE subscription_id = $1 AND status = 'past_due' ORDER BY period_start DESC LIMIT 1")
+    let cycle_id: Option<i64> = sqlx::query_scalar("SELECT id FROM subscription_cycles WHERE subscription_id = $1 AND status = 'past_due' ORDER BY period_start DESC, id DESC LIMIT 1")
         .bind(sub.id).fetch_optional(&state.db.pool).await?;
     let Some(cycle_id) = cycle_id else {
         return Err(AppError::commerce(422, "Subscription does not have a past due cycle to retry"));

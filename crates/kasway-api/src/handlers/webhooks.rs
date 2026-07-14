@@ -288,7 +288,7 @@ pub async fn endpoints_index(
     // list: user_id=$1, optional store=$2, then LIMIT/OFFSET follow in bind order
     let (limit_ph, offset_ph) = if bind_store { ("$3", "$4") } else { ("$2", "$3") };
     let list_sql = format!(
-        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = $1{filter} ORDER BY created_at DESC LIMIT {limit_ph} OFFSET {offset_ph}"
+        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = $1{filter} ORDER BY created_at DESC, id DESC LIMIT {limit_ph} OFFSET {offset_ph}"
     );
     let mut lq = sqlx::query_as::<_, EndpointRow>(&list_sql).bind(auth.user_id);
     if bind_store { lq = lq.bind(q.store_id.unwrap()); }
@@ -349,7 +349,7 @@ pub async fn endpoints_show(
 ) -> AppResult<Json<Value>> {
     let e = find_endpoint(&state, auth.user_id, id, q.store_id).await?;
     let deliveries = sqlx::query_as::<_, DeliveryRow>(&format!(
-        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_endpoint_id = $1 ORDER BY created_at DESC LIMIT 20"
+        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_endpoint_id = $1 ORDER BY created_at DESC, id DESC LIMIT 20"
     ))
     .bind(e.id)
     .fetch_all(&state.db.pool)
@@ -623,7 +623,7 @@ pub async fn deliveries_index(
     // fetch delivery ids (then load rows + relations); LIMIT/OFFSET continue the counter
     let limit_ph = n;
     let offset_ph = n + 1;
-    let id_sql = format!("SELECT d.id {where_sql} ORDER BY d.created_at DESC LIMIT ${limit_ph} OFFSET ${offset_ph}");
+    let id_sql = format!("SELECT d.id {where_sql} ORDER BY d.created_at DESC, d.id DESC LIMIT ${limit_ph} OFFSET ${offset_ph}");
     let mut id_query = sqlx::query_scalar::<_, i64>(&id_sql);
     id_query = id_query.bind(auth.user_id);
     if let Some(s) = q.store_id { id_query = id_query.bind(s); }
@@ -718,7 +718,7 @@ pub async fn events_index(
 
     let (limit_ph, offset_ph) = if bind_store { ("$3", "$4") } else { ("$2", "$3") };
     let list_sql = format!(
-        "SELECT {EVENT_COLS} FROM webhook_events WHERE user_id = $1{filter} ORDER BY created_at DESC LIMIT {limit_ph} OFFSET {offset_ph}"
+        "SELECT {EVENT_COLS} FROM webhook_events WHERE user_id = $1{filter} ORDER BY created_at DESC, id DESC LIMIT {limit_ph} OFFSET {offset_ph}"
     );
     let mut lq = sqlx::query_as::<_, EventRow>(&list_sql).bind(auth.user_id);
     if bind_store { lq = lq.bind(q.store_id.unwrap()); }
@@ -734,7 +734,7 @@ pub async fn events_index(
 
 async fn load_event_deliveries(state: &AppState, event_id: i64) -> AppResult<Vec<(DeliveryRow, Option<EndpointRow>)>> {
     let ds = sqlx::query_as::<_, DeliveryRow>(&format!(
-        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_event_id = $1 ORDER BY created_at DESC"
+        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_event_id = $1 ORDER BY created_at DESC, id DESC"
     ))
     .bind(event_id)
     .fetch_all(&state.db.pool)
