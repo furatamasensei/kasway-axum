@@ -547,26 +547,32 @@ pub(crate) async fn fetch_kpr1_intent(state: &AppState, public_id: &str) -> AppR
         return Err(kpr1_err("KPR1_INTENT_NOT_FOUND", "KPR-1 payment intent not found"));
     };
 
-    if invoice.status != "open" {
-        return Err(kpr1_err(
-            "KPR1_INVOICE_NOT_OPEN",
-            "KPR-1 payment intent is only available for open invoices",
-        ));
-    }
-    // assertInvoiceStoreAcceptsPublicPayment: included default store always accepts.
+    // The signed intent is public, self-contained, tamper-proof data. Serve it for
+    // ANY invoice status — open, expired, paid, or cancelled — so the wallet can
+    // always show the payer the merchant, amount and items. Refusing a not-open or
+    // expired invoice only produced a blank 0-KAS wall; a paid/expired request
+    // instead renders as a reference/receipt. Payment stays gated at submit and by
+    // the wallet's own expiry check; the covenant enforces the terms on-chain.
+    let signed_intent: Value = serde_json::from_str(&intent.canonical_intent).unwrap_or(json!({}));
 
-    let expired = intent
-        .expires_at
-        .as_deref()
+    // Bookkeeping only (never gates the response): flag an intent that lapsed by
+    // its signed `expiresAt` — the value we return, never the separate `expires_at`
+    // column that can drift from it. Leave intents already advanced past the wallet
+    // hand-off (submitted/settled/…) untouched.
+    let time_expired = signed_intent
+        .get("expiresAt")
+        .and_then(|e| e.as_str())
         .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
         .map(|dt| dt <= chrono::Utc::now())
         .unwrap_or(false);
-    if expired {
-        sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = $1")
-            .bind(intent.id)
-            .execute(&state.db.pool)
-            .await?;
-        return Err(kpr1_err("KPR1_INTENT_EXPIRED", "KPR-1 payment intent has expired"));
+    if time_expired {
+        if matches!(intent.status.as_str(), "created" | "fetched") {
+            sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = $1")
+                .bind(intent.id)
+                .execute(&state.db.pool)
+                .await?;
+        }
+        return Ok(signed_intent);
     }
 
     if intent.status == "created" {
@@ -578,7 +584,7 @@ pub(crate) async fn fetch_kpr1_intent(state: &AppState, public_id: &str) -> AppR
             .await?;
     }
 
-    Ok(serde_json::from_str(&intent.canonical_intent).unwrap_or(json!({})))
+    Ok(signed_intent)
 }
 
 /// `GET /api/invoices`
