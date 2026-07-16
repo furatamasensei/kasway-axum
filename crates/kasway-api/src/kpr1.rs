@@ -184,32 +184,6 @@ pub fn compute_config_commitment(
     sha256_hex(canonicalize(&config).as_bytes())
 }
 
-fn url_host(app_url: &str) -> String {
-    let no_scheme = app_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(app_url);
-    no_scheme
-        .split(['/', ':'])
-        .next()
-        .unwrap_or(no_scheme)
-        .to_string()
-}
-
-fn form_encode(value: &str) -> String {
-    let mut out = String::new();
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
 // --- setup-driven tax/split config ---
 
 #[derive(sqlx::FromRow)]
@@ -352,14 +326,69 @@ fn settlement_storage_mass(payout_values: &[i128]) -> u128 {
         .sum()
 }
 
-/// Mint and persist a KPR-1 intent for an invoice; returns the intentId.
-pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> AppResult<String> {
-    let cfg = &state.config.kpr1;
-    if !cfg.enabled {
-        return Err(err("KPR-1 covenant payments are disabled"));
+/// The merchant's per-payment payout split for a given gross `amount`: the same
+/// ordered outputs (merchant_net, [tax], splits…, kasway_fee) a KPR-1 intent
+/// pins. Shared by the invoice intent minter and the subscription autopay cell
+/// (whose covenant snapshots exactly this split per claim period).
+pub(crate) struct SplitPlan {
+    pub(crate) merchant_address: String,
+    pub(crate) platform_fee_address: String,
+    tax: TaxConfig,
+    split_outs: Vec<SplitOut>,
+    split_amounts: Vec<i128>,
+    pub(crate) platform_fee: i128,
+    pub(crate) tax_amount: i128,
+    merchant_net: i128,
+}
+
+impl SplitPlan {
+    pub(crate) fn commitment_splits(&self) -> Vec<(String, String, i64)> {
+        self.split_outs.iter().map(|s| (s.identifier.clone(), s.address.clone(), s.bps)).collect()
     }
 
-    // Reject small invoices up front, with a number a merchant can act on. The
+    /// The ordered outputs JSON (`[{ role, address, amountSompi, ... }]`) stored
+    /// in `required_outputs` and parseable by `parse_required_outputs`.
+    pub(crate) fn outputs_json(&self) -> Vec<Value> {
+        let mut outputs: Vec<Value> = vec![json!({
+            "role": "merchant_net",
+            "address": self.merchant_address,
+            "amountSompi": self.merchant_net.to_string(),
+        })];
+        if self.tax.enabled && self.tax_amount > 0 {
+            if let Some(addr) = &self.tax.address {
+                outputs.push(json!({ "role": "tax", "address": addr, "amountSompi": self.tax_amount.to_string() }));
+            }
+        }
+        for (s, amt) in self.split_outs.iter().zip(self.split_amounts.iter()) {
+            outputs.push(json!({
+                "role": "split",
+                "address": s.address,
+                "amountSompi": amt.to_string(),
+                "identifier": s.identifier,
+                "percentage": s.percentage,
+            }));
+        }
+        outputs.push(json!({
+            "role": "kasway_fee",
+            "address": self.platform_fee_address,
+            "amountSompi": self.platform_fee.to_string(),
+        }));
+        outputs
+    }
+}
+
+/// Resolve the merchant's setup (payout address, tax, splits) and compute the
+/// payout split for `amount`, with every validation the intent minter enforces
+/// (min amount, positive slices, bps cap, KIP-9 storage-mass guard).
+pub(crate) async fn compute_split_plan(
+    state: &AppState,
+    user_id: i64,
+    store_id: Option<i64>,
+    amount: i128,
+) -> AppResult<SplitPlan> {
+    let cfg = &state.config.kpr1;
+
+    // Reject small amounts up front, with a number a merchant can act on. The
     // storage-mass guard below already refuses them — but only after the fact and
     // in terms of "smallest payout" and KIP-9 mass, which says nothing a merchant
     // can price against. The floor exists because the covenant splits the payment
@@ -367,22 +396,22 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     // fee slice of a tiny invoice is tiny, and a tiny output is expensive. At 2%
     // the hard technical limit is ~1.13 KAS; this floor keeps ~2x headroom so that
     // adding a tax or split output does not silently push an invoice over the cap.
-    if ctx.total_amount < cfg.min_invoice_sompi {
+    if amount < cfg.min_invoice_sompi as i128 {
         return Err(err(&format!(
             "KPR-1 invoices must be at least {} KAS (got {} KAS): below this the covenant's payout slices are too small to settle on-chain.",
             cfg.min_invoice_sompi as f64 / 100_000_000.0,
-            ctx.total_amount as f64 / 100_000_000.0,
+            amount as f64 / 100_000_000.0,
         )));
     }
 
     // Setup lookup: (user, store) then fall back to (user, store IS NULL).
     let mut setup: Option<SetupRow> = None;
-    if let Some(store_id) = ctx.store_id {
+    if let Some(store_id) = store_id {
         setup = sqlx::query_as::<_, SetupRow>(
             "SELECT kaspa_main_address, kaspa_tax_enabled, kaspa_tax_address, kaspa_tax_percentage, \
              kaspa_split_enabled, kaspa_split_addresses FROM setups WHERE user_id = $1 AND store_id = $2",
         )
-        .bind(ctx.user_id)
+        .bind(user_id)
         .bind(store_id)
         .fetch_optional(&state.db.pool)
         .await?;
@@ -392,7 +421,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
             "SELECT kaspa_main_address, kaspa_tax_enabled, kaspa_tax_address, kaspa_tax_percentage, \
              kaspa_split_enabled, kaspa_split_addresses FROM setups WHERE user_id = $1 AND store_id IS NULL",
         )
-        .bind(ctx.user_id)
+        .bind(user_id)
         .fetch_optional(&state.db.pool)
         .await?;
     }
@@ -424,24 +453,6 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     let tax = resolve_tax_config(&setup)?;
     let (split_total_bps, split_outs) = resolve_split_config(&setup)?;
 
-    // Commit to the merchant's rate configuration (payout/tax/splits/platform
-    // fee) so the customer can verify it was not swapped before this intent was
-    // minted. Bound into the signed intent below (and thus into its canonical
-    // hash and the covenant the customer funds).
-    let commitment_splits: Vec<(String, String, i64)> =
-        split_outs.iter().map(|s| (s.identifier.clone(), s.address.clone(), s.bps)).collect();
-    let config_commitment = compute_config_commitment(
-        &merchant_address,
-        tax.enabled,
-        tax.bps,
-        tax.address.as_deref(),
-        &commitment_splits,
-        cfg.platform_fee_bps,
-        cfg.platform_fee_flat_sompi,
-        &platform_fee_address,
-    );
-
-    let amount = ctx.total_amount as i128;
     let platform_fee = platform_fee_total(amount, cfg.platform_fee_bps, cfg.platform_fee_flat_sompi)?;
     let tax_amount = bps_amount(amount, tax.bps, "KPR-1 tax bps invalid")?;
     let mut split_amounts = Vec::new();
@@ -488,6 +499,43 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         )));
     }
 
+    Ok(SplitPlan {
+        merchant_address,
+        platform_fee_address,
+        tax,
+        split_outs,
+        split_amounts,
+        platform_fee,
+        tax_amount,
+        merchant_net,
+    })
+}
+
+/// Mint and persist a KPR-1 intent for an invoice; returns the intentId.
+pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> AppResult<String> {
+    let cfg = &state.config.kpr1;
+    if !cfg.enabled {
+        return Err(err("KPR-1 covenant payments are disabled"));
+    }
+
+    let amount = ctx.total_amount as i128;
+    let plan = compute_split_plan(state, ctx.user_id, ctx.store_id, amount).await?;
+
+    // Commit to the merchant's rate configuration (payout/tax/splits/platform
+    // fee) so the customer can verify it was not swapped before this intent was
+    // minted. Bound into the signed intent below (and thus into its canonical
+    // hash and the covenant the customer funds).
+    let config_commitment = compute_config_commitment(
+        &plan.merchant_address,
+        plan.tax.enabled,
+        plan.tax.bps,
+        plan.tax.address.as_deref(),
+        &plan.commitment_splits(),
+        cfg.platform_fee_bps,
+        cfg.platform_fee_flat_sompi,
+        &plan.platform_fee_address,
+    );
+
     // intentId: kpr1_<16 random bytes hex>
     let mut id_bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut id_bytes);
@@ -506,30 +554,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     );
 
     // outputs: merchant_net, [tax], splits..., kasway_fee
-    let mut outputs: Vec<Value> = vec![json!({
-        "role": "merchant_net",
-        "address": merchant_address,
-        "amountSompi": merchant_net.to_string(),
-    })];
-    if tax.enabled && tax_amount > 0 {
-        if let Some(addr) = &tax.address {
-            outputs.push(json!({ "role": "tax", "address": addr, "amountSompi": tax_amount.to_string() }));
-        }
-    }
-    for (s, amt) in split_outs.iter().zip(split_amounts.iter()) {
-        outputs.push(json!({
-            "role": "split",
-            "address": s.address,
-            "amountSompi": amt.to_string(),
-            "identifier": s.identifier,
-            "percentage": s.percentage,
-        }));
-    }
-    outputs.push(json!({
-        "role": "kasway_fee",
-        "address": platform_fee_address,
-        "amountSompi": platform_fee.to_string(),
-    }));
+    let outputs = plan.outputs_json();
 
     // Covenant settlement (the only path). The covenant P2SH address is derived
     // at finalize once the payer supplies a refund address, so it and the real
@@ -601,7 +626,10 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         // The merchant is the STORE, not the platform. This used to be
         // `cfg.app_name`, so every payment request in every wallet claimed to
         // come from "Kasway".
-        "merchant": { "name": merchant_name, "domain": url_host(&cfg.app_url) },
+        "merchant": {
+            "name": merchant_name,
+            "domain": url::Url::parse(&cfg.app_url).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default(),
+        },
         // Items ride INSIDE the signature. The review screen is what the payer
         // consents to, so what they are buying must be as tamper-proof as the
         // amount — otherwise a compromised API could show one basket and have the
@@ -632,11 +660,12 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     let expires_epoch = chrono::DateTime::parse_from_rfc3339(&expires_at)
         .map(|dt| dt.timestamp())
         .unwrap_or(0);
+    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
     let payment_request_uri = format!(
         "kaspa-payment:v1?request={}&hash={}&network={}&expires={}",
-        form_encode(&payment_intent_url),
-        form_encode(&canonical_hash),
-        form_encode(&ctx.payment_network),
+        enc(&payment_intent_url),
+        enc(&canonical_hash),
+        enc(&ctx.payment_network),
         expires_epoch
     );
 
@@ -668,12 +697,12 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     .bind(&ctx.payment_asset)
     .bind(amount as i64)
     .bind(cfg.platform_fee_bps)
-    .bind(platform_fee as i64)
-    .bind(tax.bps)
-    .bind(tax_amount as i64)
-    .bind(&tax.address)
-    .bind(&merchant_address)
-    .bind(&platform_fee_address)
+    .bind(plan.platform_fee as i64)
+    .bind(plan.tax.bps)
+    .bind(plan.tax_amount as i64)
+    .bind(&plan.tax.address)
+    .bind(&plan.merchant_address)
+    .bind(&plan.platform_fee_address)
     .bind(TEMPLATE_ID)
     .bind(TEMPLATE_VERSION)
     .bind(script_hash)

@@ -52,7 +52,7 @@ const KEEPER_CHANGE_FLOOR_SOMPI: u64 = 100_000_000;
 /// Taking the largest keeps the change big and its mass ~1k, and leaves the dust
 /// untouched instead of feeding on it. Still deterministic — prepare and submit
 /// must build the identical transaction — with (txid, index) breaking ties.
-fn pick_fee_utxo<T: Ord>(mut utxos: Vec<(T, u32, u64)>, min_fee: u64) -> Option<(T, u32, u64)> {
+pub(crate) fn pick_fee_utxo<T: Ord>(mut utxos: Vec<(T, u32, u64)>, min_fee: u64) -> Option<(T, u32, u64)> {
     // Covering the fee is not enough: the change left over must ALSO be big
     // enough that its own storage mass stays negligible (1 KAS => ~10k mass).
     // Below this floor the transaction is born rejectable, so refuse to build it
@@ -154,7 +154,7 @@ struct Funded {
     gross_amount: Option<i64>,
     expiry_ts: Option<i64>,
     /// Snapshot of the EscrowV2 arbiter panel (JSON array of 32-byte pubkey hex)
-    /// baked at finalize. NULL for pre-0034 rows → settlement falls back to config.
+    /// baked at finalize. NULL for legacy rows → settlement falls back to config.
     arbiter_panel_json: Option<String>,
     arbiter_threshold: Option<i32>,
 }
@@ -225,14 +225,14 @@ pub async fn run_tick(state: &AppState, client: &KaspaWrpcClient) -> Result<usiz
     Ok(acted)
 }
 
-fn keeper_key(state: &AppState) -> Option<KeeperKey> {
+pub(crate) fn keeper_key(state: &AppState) -> Option<KeeperKey> {
     let hex = state.config.covenant.keeper_fee_secret_hex.as_deref()?;
     let bytes = decode_hex32(hex.trim())?;
     KeeperKey::from_secret_bytes(&bytes).ok()
 }
 
 /// Box a message as the keeper's error for a single settlement (Display = the message).
-fn kerr(msg: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
+pub(crate) fn kerr(msg: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     msg.into().into()
 }
 
@@ -277,23 +277,26 @@ async fn settle_one(
     let tx_id = client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| kerr(e.to_string()))?;
 
     mark_settled_paid(state, c.intent_pk, c.invoice_id, "captured", &tx_id).await?;
-    emit_invoice_event(state, c, "invoice.paid", &tx_id).await?;
+    emit_invoice_event(state, c.invoice_id, &c.public_id, c.user_id, c.store_id, "invoice.paid", &tx_id).await?;
 
     tracing::info!("covenant keeper: intent {} auto-captured to merchant via tx {tx_id}", c.intent_pk);
     Ok(())
 }
 
-async fn emit_invoice_event(
+pub(crate) async fn emit_invoice_event(
     state: &AppState,
-    c: &Funded,
+    invoice_id: i64,
+    public_id: &str,
+    user_id: i64,
+    store_id: Option<i64>,
     event: &str,
     tx_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut payload = invoice_payload(state, c.invoice_id).await.unwrap_or_else(|| json!({ "publicId": c.public_id }));
+    let mut payload = invoice_payload(state, invoice_id).await.unwrap_or_else(|| json!({ "publicId": public_id }));
     if let serde_json::Value::Object(map) = &mut payload {
         map.insert("settlementTxId".into(), json!(tx_id));
     }
-    webhooks::emit_event(state, c.user_id, c.store_id, event, "invoice", &c.public_id, &payload)
+    webhooks::emit_event(state, user_id, store_id, event, "invoice", public_id, &payload)
         .await
         .map_err(|e| kerr(e.to_string()))?;
     Ok(())
@@ -307,8 +310,11 @@ async fn invoice_payload(state: &AppState, invoice_id: i64) -> Option<serde_json
 }
 
 /// Mark the intent settled (with its terminal `covenant_state`) and the invoice
-/// paid. Shared by every merchant-payout settlement path.
-async fn mark_settled_paid(
+/// paid. Shared by every merchant-payout settlement path. When the invoice
+/// belongs to a subscription cycle, the cycle is marked paid too (and the
+/// subscription restored from past_due), so autopay AND manually-paid
+/// subscription invoices both close their cycle.
+pub async fn mark_settled_paid(
     state: &AppState,
     intent_pk: i64,
     invoice_id: i64,
@@ -331,16 +337,30 @@ async fn mark_settled_paid(
         .bind(invoice_id)
         .execute(&state.db.pool)
         .await?;
-    // Notify the watchers from the funnel, so every settlement path (keeper
-    // capture, customer release, arbitrated, mutual) publishes without each one
-    // having to remember to.
-    let public_id: Option<String> =
-        sqlx::query_scalar("SELECT public_id FROM invoices WHERE id = $1")
+    mark_cycle_paid(state, invoice_id, &now).await?;
+    Ok(())
+}
+
+/// If `invoice_id` belongs to a subscription cycle, mark the cycle paid and
+/// restore the subscription (defensively) from past_due to active.
+pub(crate) async fn mark_cycle_paid(state: &AppState, invoice_id: i64, now: &str) -> Result<(), sqlx::Error> {
+    let ids: Option<(Option<i64>, Option<i64>)> =
+        sqlx::query_as("SELECT subscription_id, subscription_cycle_id FROM invoices WHERE id = $1")
             .bind(invoice_id)
             .fetch_optional(&state.db.pool)
             .await?;
-    if let Some(public_id) = public_id {
-        state.events.publish(&public_id, covenant_state);
+    let Some((sub_id, Some(cycle_id))) = ids else { return Ok(()) };
+    sqlx::query("UPDATE subscription_cycles SET status = 'paid', paid_at = COALESCE(paid_at, $1), past_due_at = NULL, updated_at = $1 WHERE id = $2 AND status != 'paid'")
+        .bind(now)
+        .bind(cycle_id)
+        .execute(&state.db.pool)
+        .await?;
+    if let Some(sub_id) = sub_id {
+        sqlx::query("UPDATE subscriptions SET status = 'active', updated_at = $1 WHERE id = $2 AND status = 'past_due'")
+            .bind(now)
+            .bind(sub_id)
+            .execute(&state.db.pool)
+            .await?;
     }
     Ok(())
 }
@@ -439,7 +459,7 @@ fn rebuild_params(state: &AppState, c: &Funded) -> AppResult<(EscrowV2Params, ka
     let prefix = network_prefix(&c.network).map_err(|e| rerr(e.to_string()))?;
     let customer_refund = Destination::parse(&refund_addr).map_err(|e| rerr(e.to_string()))?;
     // Prefer the panel snapshot baked at finalize (robust to config changes);
-    // fall back to the configured panel for pre-0034 intents.
+    // fall back to the configured panel for legacy intents without a snapshot.
     let (arbiter_panel, arbiter_threshold) = match (&c.arbiter_panel_json, c.arbiter_threshold) {
         (Some(json), Some(th)) => {
             let hexes: Vec<String> = serde_json::from_str(json).map_err(|e| rerr(format!("bad arbiter panel snapshot: {e}")))?;
@@ -558,8 +578,7 @@ pub(crate) async fn customer_release_submit(state: &AppState, public_id: &str, s
             mark_settled_paid(state, ctx.intent_pk, ctx.invoice_id, "released", &tx_id)
                 .await
                 .map_err(AppError::Database)?;
-            let target = webhook_target(ctx.intent_pk, ctx.invoice_id, ctx.user_id, ctx.store_id, ctx.public_id.clone());
-            let _ = emit_invoice_event(state, &target, "invoice.paid", &tx_id).await;
+            let _ = emit_invoice_event(state, ctx.invoice_id, &ctx.public_id, ctx.user_id, ctx.store_id, "invoice.paid", &tx_id).await;
             tracing::info!(
                 "covenant release: invoice {} released to merchant by the customer via tx {tx_id}",
                 ctx.public_id
@@ -625,25 +644,6 @@ async fn restore_funded(state: &AppState, intent_pk: i64, from_state: &str) {
     .bind(from_state)
     .execute(&state.db.pool)
     .await;
-}
-
-/// Minimal `Funded` carrying just the identity fields needed to emit a webhook.
-fn webhook_target(intent_pk: i64, invoice_id: i64, user_id: i64, store_id: Option<i64>, public_id: String) -> Funded {
-    Funded {
-        intent_pk,
-        invoice_id,
-        user_id,
-        store_id,
-        public_id,
-        network: String::new(),
-        required_outputs: String::new(),
-        customer_refund_address: None,
-        covenant_address: None,
-        gross_amount: None,
-        expiry_ts: None,
-        arbiter_panel_json: None,
-        arbiter_threshold: None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -773,8 +773,7 @@ async fn finalize_refund(state: &AppState, ctx: &RefundCtx, tx_id: &str) -> AppR
         .execute(&state.db.pool)
         .await
         .map_err(AppError::Database)?;
-    let target = webhook_target(ctx.intent_pk, ctx.invoice_id, ctx.user_id, ctx.store_id, ctx.public_id.clone());
-    let _ = emit_invoice_event(state, &target, "invoice.refunded", tx_id).await;
+    let _ = emit_invoice_event(state, ctx.invoice_id, &ctx.public_id, ctx.user_id, ctx.store_id, "invoice.refunded", tx_id).await;
     Ok(json!({ "refunded": true, "refundTxId": tx_id, "invoiceStatus": "refunded" }))
 }
 
@@ -897,8 +896,7 @@ pub(crate) async fn arbiter_release(
             mark_settled_paid(state, ctx.intent_pk, ctx.invoice_id, "arbitrated", &tx_id)
                 .await
                 .map_err(AppError::Database)?;
-            let target = webhook_target(ctx.intent_pk, ctx.invoice_id, ctx.user_id, ctx.store_id, ctx.public_id.clone());
-            let _ = emit_invoice_event(state, &target, "invoice.paid", &tx_id).await;
+            let _ = emit_invoice_event(state, ctx.invoice_id, &ctx.public_id, ctx.user_id, ctx.store_id, "invoice.paid", &tx_id).await;
             Ok(json!({ "released": true, "resolution": "arbitrated", "releaseTxId": tx_id, "invoiceStatus": "paid" }))
         }
         Err(e) => {
@@ -987,7 +985,7 @@ pub(crate) async fn arbiter_refund_submit(
 }
 
 /// Decode a 65-byte covenant signature (schnorr signature || sighash-type byte).
-fn decode_sig65(hex: &str) -> AppResult<Vec<u8>> {
+pub(crate) fn decode_sig65(hex: &str) -> AppResult<Vec<u8>> {
     decode_hex(hex.trim())
         .filter(|s| s.len() == 65)
         .ok_or_else(|| rerr("signature must be 65-byte hex (schnorr signature || sighash-type byte)"))
@@ -1078,8 +1076,7 @@ pub(crate) async fn mutual_settle_submit(
             mark_settled_paid(state, ctx.intent_pk, ctx.invoice_id, "settled_mutual", &tx_id)
                 .await
                 .map_err(AppError::Database)?;
-            let target = webhook_target(ctx.intent_pk, ctx.invoice_id, ctx.user_id, ctx.store_id, ctx.public_id.clone());
-            let _ = emit_invoice_event(state, &target, "invoice.paid", &tx_id).await;
+            let _ = emit_invoice_event(state, ctx.invoice_id, &ctx.public_id, ctx.user_id, ctx.store_id, "invoice.paid", &tx_id).await;
             Ok(json!({ "settled": true, "resolution": "mutual", "settleTxId": tx_id, "invoiceStatus": "paid" }))
         }
         Err(e) => {

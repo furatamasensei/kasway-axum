@@ -1,6 +1,7 @@
 pub mod api_keys;
 pub mod auth;
 pub mod checkout;
+pub mod checkout_subscriptions;
 pub mod commerce;
 pub mod currencies;
 pub mod explorer_kpr1;
@@ -13,7 +14,6 @@ pub mod payment_ops_settings;
 pub mod payments_networks;
 pub mod public_misc;
 pub mod regional_pricing;
-pub mod transmit;
 pub mod payment_links;
 pub mod setups;
 pub mod stores;

@@ -5,12 +5,13 @@
 //! see that module). Response is the serialized invoice incl. the intent.
 
 use crate::auth::AuthMerchant;
-use crate::error::{AppError, AppResult, ValidationFailure};
+use crate::error::{AppError, AppResult};
 use crate::handlers::payment_ops_settings::required_confirmations_for;
 use crate::kpr1::{self, IntentInvoiceCtx};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
 use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_amount_opt, ser_json, ser_json_arr, ser_json_obj};
+use crate::validate::{opt_string, vpush};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -251,6 +252,51 @@ pub(crate) async fn load_relations(
     .await?;
 
     Ok((items, intent))
+}
+
+/// `load_relations` for a whole page of invoices in two queries instead of 2N.
+pub(crate) async fn load_relations_many(
+    state: &AppState,
+    invoice_ids: &[i64],
+) -> AppResult<(
+    std::collections::HashMap<i64, Vec<ItemRow>>,
+    std::collections::HashMap<i64, IntentRow>,
+)> {
+    let items = sqlx::query_as::<_, ItemRow>(
+        "SELECT id, invoice_id, name, quantity, unit_amount, total_amount, pricing_country_code, \
+         pricing_currency, pricing_source, metadata, created_at, updated_at \
+         FROM invoice_items WHERE invoice_id = ANY($1) ORDER BY id ASC",
+    )
+    .bind(invoice_ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let mut items_by: std::collections::HashMap<i64, Vec<ItemRow>> = std::collections::HashMap::new();
+    for item in items {
+        items_by.entry(item.invoice_id).or_default().push(item);
+    }
+
+    let intents = sqlx::query_as::<_, IntentRow>(&format!(
+        "SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE invoice_id = ANY($1)"
+    ))
+    .bind(invoice_ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let intents_by = intents.into_iter().map(|i| (i.invoice_id, i)).collect();
+
+    Ok((items_by, intents_by))
+}
+
+/// Load invoices by id, preserving the order of `ids` (one query for a page).
+pub(crate) async fn load_many_by_ids(state: &AppState, ids: &[i64]) -> AppResult<Vec<InvoiceRow>> {
+    let rows = sqlx::query_as::<_, InvoiceRow>(&format!(
+        "SELECT {INVOICE_COLS} FROM invoices WHERE id = ANY($1)"
+    ))
+    .bind(ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let mut by_id: std::collections::HashMap<i64, InvoiceRow> =
+        rows.into_iter().map(|r| (r.id, r)).collect();
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
 /// expireIfNeeded: flip open->expired when past `expires_at`.
@@ -622,11 +668,12 @@ pub async fn index(
     .fetch_all(&state.db.pool)
     .await?;
 
-    let mut data = Vec::with_capacity(invoices.len());
-    for inv in &invoices {
-        let (items, intent) = load_relations(&state, inv.id).await?;
-        data.push(serialize_invoice(inv, &items, intent.as_ref()));
-    }
+    let ids: Vec<i64> = invoices.iter().map(|i| i.id).collect();
+    let (items_by, intents_by) = load_relations_many(&state, &ids).await?;
+    let data: Vec<Value> = invoices
+        .iter()
+        .map(|inv| serialize_invoice(inv, items_by.get(&inv.id).map(Vec::as_slice).unwrap_or(&[]), intents_by.get(&inv.id)))
+        .collect();
 
     Ok(Json(json!({
         "meta": paginator_meta(total, per_page, page),
@@ -654,14 +701,8 @@ struct CreateInput {
     items: Vec<ItemInput>,
 }
 
-fn vpush(errors: &mut Vec<ValidationFailure>, field: &str, rule: &str, message: &str) {
-    errors.push(ValidationFailure::new(field, rule, message));
-}
-
 fn validate_create(body: &Value) -> AppResult<CreateInput> {
     let mut errors = Vec::new();
-
-    let opt_string = |key: &str| body.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string());
 
     let fee_delegation = match body.get("feeDelegation") {
         None | Some(Value::Null) => None,
@@ -736,16 +777,14 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
     }
 
     Ok(CreateInput {
-        external_id: opt_string("externalId").filter(|s| !s.is_empty()),
+        external_id: opt_string(body, "externalId"),
         metadata: body.get("metadata").filter(|v| !v.is_null()).cloned(),
-        expires_at: opt_string("expiresAt").filter(|s| !s.is_empty()),
-        payment_network: opt_string("paymentNetwork").filter(|s| !s.is_empty()),
-        payment_asset: opt_string("paymentAsset").filter(|s| !s.is_empty()),
+        expires_at: opt_string(body, "expiresAt"),
+        payment_network: opt_string(body, "paymentNetwork"),
+        payment_asset: opt_string(body, "paymentAsset"),
         fee_delegation,
         store_id: body.get("storeId").and_then(|v| v.as_i64()),
-        customer_country_code: opt_string("customerCountryCode")
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_uppercase()),
+        customer_country_code: opt_string(body, "customerCountryCode").map(|s| s.to_uppercase()),
         items,
     })
 }

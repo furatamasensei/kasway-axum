@@ -13,7 +13,12 @@ ALTER TABLE kpr1_payment_intents
   ADD COLUMN expiry_ts BIGINT,
   ADD COLUMN covenant_state TEXT NOT NULL DEFAULT 'pending',
   ADD COLUMN release_tx_id TEXT,
-  ADD COLUMN refund_tx_id TEXT;
+  ADD COLUMN refund_tx_id TEXT,
+  -- Snapshot of the EscrowV2 arbiter panel (JSON array of 32-byte pubkey hex)
+  -- baked at finalize, so settlement can rebuild the exact covenant even if the
+  -- configured panel later changes. NULL -> settlement falls back to config.
+  ADD COLUMN arbiter_panel_json TEXT,
+  ADD COLUMN arbiter_threshold INTEGER;
 
 ALTER TABLE kpr1_payment_intents ALTER COLUMN script_hash DROP NOT NULL;
 

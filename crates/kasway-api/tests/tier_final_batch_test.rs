@@ -1,5 +1,4 @@
-//! Final batch port (slim rail): price (#72), checkout kpr1-payments (#58),
-//! transmit SSE (#1).
+//! Final batch port (slim rail): price (#72), checkout kpr1-payments (#58).
 
 mod common;
 
@@ -62,46 +61,4 @@ async fn kpr1_payment_proof_required() {
     assert_eq!(res.status(), 422);
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["code"], "KPR1_PAYMENT_PROOF_REQUIRED");
-}
-
-// --- #1 transmit ------------------------------------------------------------
-#[tokio::test]
-async fn transmit_events_stream_opens() {
-    let app = common::spawn_app().await;
-    let res = app.client.get(app.url("/__transmit/events")).send().await.unwrap();
-    assert_eq!(res.status(), 200);
-    let ct = res.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
-    assert!(ct.starts_with("text/event-stream"));
-}
-
-#[tokio::test]
-async fn transmit_subscribe_public_channel() {
-    let app = common::spawn_app().await;
-    let res = app.client.post(app.url("/__transmit/subscribe"))
-        .json(&json!({ "uid": "u1", "channel": "public/announcements" })).send().await.unwrap();
-    assert_eq!(res.status(), 204);
-}
-
-#[tokio::test]
-async fn transmit_private_channel_authorization() {
-    let app = common::spawn_app().await;
-    let token = common::register_merchant(&app, "transmit@test.io", "secret123").await;
-    let uid = common::merchant_user_id(&app.db, "transmit@test.io").await;
-    let channel = format!("merchant/{uid}/client/online");
-
-    // without bearer → forbidden
-    let res = app.client.post(app.url("/__transmit/subscribe"))
-        .json(&json!({ "uid": "u1", "channel": channel })).send().await.unwrap();
-    assert_eq!(res.status(), 403);
-
-    // with the matching merchant bearer → 204
-    let res = app.client.post(app.url("/__transmit/subscribe"))
-        .bearer_auth(&token)
-        .json(&json!({ "uid": "u1", "channel": format!("merchant/{uid}/client/online") })).send().await.unwrap();
-    assert_eq!(res.status(), 204);
-
-    // unsubscribe is always 204
-    let res = app.client.post(app.url("/__transmit/unsubscribe"))
-        .json(&json!({ "uid": "u1", "channel": format!("merchant/{uid}/client/online") })).send().await.unwrap();
-    assert_eq!(res.status(), 204);
 }

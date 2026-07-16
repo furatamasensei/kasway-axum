@@ -25,7 +25,7 @@ async fn create_without_setup_address_422() {
         .client
         .post(app.url("/api/invoices"))
         .bearer_auth(&token)
-        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "1000" }] }))
+        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "200000000" }] }))
         .send()
         .await
         .unwrap();
@@ -115,16 +115,16 @@ async fn create_success_merchant_subsidized() {
     let intent = &body["kpr1PaymentIntent"];
     assert!(intent["intentId"].as_str().unwrap().starts_with("kpr1_"));
     assert_eq!(intent["amountSompi"], "500000000");
-    // platform fee = 1% of 500000000 = 5000000
-    assert_eq!(body["platformFee"]["bps"], 100);
-    assert_eq!(body["platformFee"]["amountSompi"], "5000000");
-    // requiredOutputs: merchant_net (495000000) + kasway_fee (5000000)
+    // platform fee = 2% of 500000000 = 10000000
+    assert_eq!(body["platformFee"]["bps"], 200);
+    assert_eq!(body["platformFee"]["amountSompi"], "10000000");
+    // requiredOutputs: merchant_net (490000000) + kasway_fee (10000000)
     let outs = body["requiredOutputs"].as_array().unwrap();
     assert_eq!(outs.len(), 2);
     let net = outs.iter().find(|o| o["role"] == "merchant_net").unwrap();
-    assert_eq!(net["amountSompi"], "495000000");
+    assert_eq!(net["amountSompi"], "490000000");
     let fee = outs.iter().find(|o| o["role"] == "kasway_fee").unwrap();
-    assert_eq!(fee["amountSompi"], "5000000");
+    assert_eq!(fee["amountSompi"], "10000000");
     // canonical hash + request uri present
     assert!(intent["canonicalHash"].as_str().unwrap().len() == 64);
     assert!(intent["paymentRequestUri"].as_str().unwrap().starts_with("kaspa-payment:v1?request="));

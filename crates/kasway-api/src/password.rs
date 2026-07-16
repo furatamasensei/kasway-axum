@@ -1,6 +1,6 @@
 //! Password hashing. Adonis uses `hash.use('scrypt')`; we use the RustCrypto
 //! scrypt PHC implementation. Self-consistent (hash on register, verify on
-//! login) — the new SQLite DB has no Adonis-minted hashes to interoperate with.
+//! login) — the new database has no Adonis-minted hashes to interoperate with.
 
 use scrypt::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,

@@ -56,7 +56,7 @@ async fn indexer_healthz_ok_empty() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["network"], "tn10");
     assert_eq!(body["assetId"], "KAS");
-    assert_eq!(body["source"], "rusty-kaspa-node");
+    assert_eq!(body["source"], "chain_observer");
     assert!(body["checkpoint"].is_null());
 }
 
@@ -68,7 +68,7 @@ async fn indexer_healthz_returns_latest_checkpoint() {
         &app.db,
         "tn10",
         "KAS",
-        "rusty-kaspa-node",
+        "chain_observer",
         Some("12345"),
         Some(r#"{"height":12345}"#),
         "2026-01-01T00:00:00.000Z",
@@ -96,9 +96,9 @@ async fn indexer_healthz_returns_latest_checkpoint() {
 #[tokio::test]
 async fn indexer_checkpoints_lists_tn10() {
     let app = common::spawn_app().await;
-    common::seed_checkpoint(&app.db, "tn10", "KAS", "rusty-kaspa-node", Some("100"), None, "2026-01-01T00:00:00.000Z").await;
+    common::seed_checkpoint(&app.db, "tn10", "KAS", "chain_observer", Some("100"), None, "2026-01-01T00:00:00.000Z").await;
     common::seed_checkpoint(&app.db, "tn10", "KAS", "other-source", Some("200"), None, "2026-02-01T00:00:00.000Z").await;
-    common::seed_checkpoint(&app.db, "mainnet", "KAS", "rusty-kaspa-node", Some("300"), None, "2026-03-01T00:00:00.000Z").await;
+    common::seed_checkpoint(&app.db, "mainnet", "KAS", "chain_observer", Some("300"), None, "2026-03-01T00:00:00.000Z").await;
 
     let res = app
         .client

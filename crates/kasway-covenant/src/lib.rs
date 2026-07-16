@@ -17,6 +17,10 @@ pub use silverscript_lang::compiler::CompiledContract;
 /// Escrow — tiered dispute-resolution covenant (optimistic release/capture +
 /// mutual settlement + M-of-N arbiter panel); see `escrow_v2.sil`.
 pub mod escrow_v2;
+/// Subscription — non-custodial recurring-claim autopay covenant (periodic
+/// keeper claim + self-replicating remainder + customer withdraw); see
+/// `subscription_v1.sil`.
+pub mod subscription_v1;
 
 /// Map a Kasway network label to the Kaspa address prefix. Keeps rusty-kaspa's
 /// `Prefix` out of the rest of the backend.
@@ -54,6 +58,10 @@ pub enum CovenantError {
     UnsupportedAddressKind(String),
     #[error("payout values ({sum}) do not sum to gross_amount ({gross})")]
     PayoutSumMismatch { sum: u128, gross: u128 },
+    #[error("covenant value ({value}) cannot cover the claim total ({claim_total})")]
+    InsufficientCovenantValue { value: u64, claim_total: u64 },
+    #[error("claim period must be 1..=u32::MAX DAA scores, got {0}")]
+    InvalidPeriod(u64),
 }
 
 impl From<CompilerError> for CovenantError {
@@ -108,12 +116,6 @@ impl Destination {
     pub fn script_public_key(&self) -> ScriptPublicKey {
         pay_to_address_script(&self.address)
     }
-
-    /// The scriptPubKey bytes funds to this destination carry — the exact bytes
-    /// the covenant reconstructs and compares against `tx.outputs[i].scriptPubKey`.
-    pub fn script_public_key_bytes(&self) -> Vec<u8> {
-        self.script_public_key().script().to_vec()
-    }
 }
 
 /// One ordered release payout, in transaction-output order.
@@ -126,22 +128,6 @@ pub struct Payout {
 
 fn to_i64(v: u64) -> Result<i64, CovenantError> {
     i64::try_from(v).map_err(|_| CovenantError::AmountOverflow(v))
-}
-
-/// Verify a 64-byte BIP340 schnorr `datasig` over a 32-byte `digest` against an
-/// x-only pubkey. Pure and infallible: returns `false` on any parse error or a
-/// wrong-length signature. Used to authenticate a party (customer/merchant) who
-/// signs a domain-separated request digest off-chain — it commits to `digest`
-/// directly (like [`KeeperKey::sign_datasig`]), not to a transaction sighash.
-pub fn verify_datasig(pubkey_xonly: &[u8; 32], digest: &[u8; 32], sig64: &[u8]) -> bool {
-    let Ok(sig) = secp256k1::schnorr::Signature::from_slice(sig64) else {
-        return false;
-    };
-    let Ok(pubkey) = secp256k1::XOnlyPublicKey::from_slice(pubkey_xonly) else {
-        return false;
-    };
-    let msg = Message::from_digest(*digest);
-    Secp256k1::new().verify_schnorr(&sig, &msg, &pubkey).is_ok()
 }
 
 /// The P2SH scriptPubKey that locks funds into this covenant.
@@ -243,6 +229,16 @@ impl KeeperKey {
     }
 }
 
+/// Verify a 64-byte BIP340 schnorr signature over a 32-byte digest against an
+/// x-only pubkey (e.g. a schnorr P2PK address payload). Used by the backend to
+/// authenticate customer actions (e.g. autopay cancel) without a transaction.
+pub fn verify_schnorr_digest(pubkey: &[u8; 32], digest: &[u8; 32], sig: &[u8]) -> bool {
+    let Ok(pk) = secp256k1::XOnlyPublicKey::from_slice(pubkey) else { return false };
+    let Ok(sig) = secp256k1::schnorr::Signature::from_slice(sig) else { return false };
+    let Ok(msg) = Message::from_digest_slice(digest) else { return false };
+    Secp256k1::verification_only().verify_schnorr(&sig, &msg, &pk).is_ok()
+}
+
 /// A signed release/refund transaction plus the UTXO entries it spends (needed
 /// for local verification and for RPC submission).
 pub struct SignedSpend {
@@ -273,11 +269,16 @@ fn fee_signature_script(fee_sig: &[u8]) -> Result<Vec<u8>, CovenantError> {
 /// are final regardless of the order the two inputs are later signed in — which
 /// is what lets the covenant authorizer and the fee payer be different parties
 /// signing independently.
+///
+/// `covenant_sequence` is the covenant input's sequence number: 0 for untimed
+/// branches, or the CSV relative lock (in DAA-score delta) for branches gated by
+/// `this.age >= N` — OP_CHECKSEQUENCEVERIFY requires the spend's sequence >= N.
 fn assemble_unsigned(
     redeem: &[u8],
     outputs: Vec<TransactionOutput>,
     lock_time: u64,
     covenant_utxo: &Utxo,
+    covenant_sequence: u64,
     fee_utxo: &Utxo,
     fee_payer_spk: ScriptPublicKey,
 ) -> (Transaction, Vec<UtxoEntry>, [u8; 32], [u8; 32]) {
@@ -287,7 +288,7 @@ fn assemble_unsigned(
             index: covenant_utxo.index,
         },
         signature_script: vec![],
-        sequence: 0,
+        sequence: covenant_sequence,
         compute_commit: ComputeCommit::ComputeBudget(ComputeBudget(COVENANT_COMPUTE_BUDGET)),
     };
     let fee_input = TransactionInput {
@@ -320,13 +321,14 @@ fn build_fee_signed_tx(
     outputs: Vec<TransactionOutput>,
     lock_time: u64,
     covenant_utxo: &Utxo,
+    covenant_sequence: u64,
     fee_utxo: &Utxo,
     keeper: &KeeperKey,
     prefix: Prefix,
 ) -> Result<(Transaction, Vec<UtxoEntry>, [u8; 32]), CovenantError> {
     let fee_spk = pay_to_address_script(&keeper.address(prefix));
     let (mut tx, entries, cov_sighash, fee_sighash) =
-        assemble_unsigned(redeem, outputs, lock_time, covenant_utxo, fee_utxo, fee_spk);
+        assemble_unsigned(redeem, outputs, lock_time, covenant_utxo, covenant_sequence, fee_utxo, fee_spk);
     let fee_sig = keeper.sign_sighash(&fee_sighash)?;
     tx.inputs[1].signature_script = fee_signature_script(&fee_sig)?;
     Ok((tx, entries, cov_sighash))

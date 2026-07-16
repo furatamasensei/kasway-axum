@@ -35,24 +35,6 @@ struct SetupRow {
     kaspa_split_enabled: Option<i64>,
     #[serde(serialize_with = "ser_json")]
     kaspa_split_addresses: Option<String>,
-    igra_main_address: Option<String>,
-    #[serde(serialize_with = "ser_bool_opt")]
-    igra_tax_enabled: Option<i64>,
-    igra_tax_address: Option<String>,
-    igra_tax_percentage: Option<String>,
-    #[serde(serialize_with = "ser_bool_opt")]
-    igra_split_enabled: Option<i64>,
-    #[serde(serialize_with = "ser_json")]
-    igra_split_addresses: Option<String>,
-    kasplex_main_address: Option<String>,
-    #[serde(serialize_with = "ser_bool_opt")]
-    kasplex_tax_enabled: Option<i64>,
-    kasplex_tax_address: Option<String>,
-    kasplex_tax_percentage: Option<String>,
-    #[serde(serialize_with = "ser_bool_opt")]
-    kasplex_split_enabled: Option<i64>,
-    #[serde(serialize_with = "ser_json")]
-    kasplex_split_addresses: Option<String>,
     redirect_url: Option<String>,
     webhook_url: Option<String>,
     created_at: Option<String>,
@@ -61,10 +43,7 @@ struct SetupRow {
 
 const SETUP_COLS: &str = "id, user_id, store_id, tos_agreed, kaspa_main_address, kaspa_tax_enabled, \
     kaspa_tax_address, kaspa_tax_percentage, kaspa_split_enabled, kaspa_split_addresses, \
-    igra_main_address, igra_tax_enabled, igra_tax_address, igra_tax_percentage, igra_split_enabled, \
-    igra_split_addresses, kasplex_main_address, kasplex_tax_enabled, kasplex_tax_address, \
-    kasplex_tax_percentage, kasplex_split_enabled, kasplex_split_addresses, redirect_url, \
-    webhook_url, created_at, updated_at";
+    redirect_url, webhook_url, created_at, updated_at";
 
 /// Commitment to this store's Kaspa rate config, matching the `configCommitment`
 /// the KPR-1 minter bakes into every intent. A merchant publishes this so a
@@ -553,18 +532,6 @@ fn new_setup_row(user_id: i64, store_id: i64) -> SetupRow {
         kaspa_tax_percentage: None,
         kaspa_split_enabled: Some(0),
         kaspa_split_addresses: None,
-        igra_main_address: None,
-        igra_tax_enabled: Some(0),
-        igra_tax_address: None,
-        igra_tax_percentage: None,
-        igra_split_enabled: Some(0),
-        igra_split_addresses: None,
-        kasplex_main_address: None,
-        kasplex_tax_enabled: Some(0),
-        kasplex_tax_address: None,
-        kasplex_tax_percentage: None,
-        kasplex_split_enabled: Some(0),
-        kasplex_split_addresses: None,
         redirect_url: None,
         webhook_url: None,
         created_at: None,
@@ -577,27 +544,15 @@ fn apply_sections(source: &SetupRow, target: &mut SetupRow, sections: &[String])
         match section.as_str() {
             "payout" => {
                 target.kaspa_main_address = source.kaspa_main_address.clone();
-                target.igra_main_address = source.igra_main_address.clone();
-                target.kasplex_main_address = source.kasplex_main_address.clone();
             }
             "tax" => {
                 target.kaspa_tax_enabled = source.kaspa_tax_enabled;
                 target.kaspa_tax_address = source.kaspa_tax_address.clone();
                 target.kaspa_tax_percentage = source.kaspa_tax_percentage.clone();
-                target.igra_tax_enabled = source.igra_tax_enabled;
-                target.igra_tax_address = source.igra_tax_address.clone();
-                target.igra_tax_percentage = source.igra_tax_percentage.clone();
-                target.kasplex_tax_enabled = source.kasplex_tax_enabled;
-                target.kasplex_tax_address = source.kasplex_tax_address.clone();
-                target.kasplex_tax_percentage = source.kasplex_tax_percentage.clone();
             }
             "split" => {
                 target.kaspa_split_enabled = source.kaspa_split_enabled;
                 target.kaspa_split_addresses = source.kaspa_split_addresses.clone();
-                target.igra_split_enabled = source.igra_split_enabled;
-                target.igra_split_addresses = source.igra_split_addresses.clone();
-                target.kasplex_split_enabled = source.kasplex_split_enabled;
-                target.kasplex_split_addresses = source.kasplex_split_addresses.clone();
             }
             "redirects" => target.redirect_url = source.redirect_url.clone(),
             "webhook" => target.webhook_url = source.webhook_url.clone(),
@@ -613,33 +568,22 @@ async fn upsert_full_setup(state: &AppState, t: &SetupRow, existing_id: Option<i
         sqlx::query(
             "UPDATE setups SET kaspa_main_address=$1, kaspa_tax_enabled=$2, kaspa_tax_address=$3, \
              kaspa_tax_percentage=$4, kaspa_split_enabled=$5, kaspa_split_addresses=$6, \
-             igra_main_address=$7, igra_tax_enabled=$8, igra_tax_address=$9, igra_tax_percentage=$10, \
-             igra_split_enabled=$11, igra_split_addresses=$12, kasplex_main_address=$13, kasplex_tax_enabled=$14, \
-             kasplex_tax_address=$15, kasplex_tax_percentage=$16, kasplex_split_enabled=$17, kasplex_split_addresses=$18, \
-             redirect_url=$19, webhook_url=$20, updated_at=$21 WHERE id=$22",
+             redirect_url=$7, webhook_url=$8, updated_at=$9 WHERE id=$10",
         )
         .bind(&t.kaspa_main_address).bind(b(t.kaspa_tax_enabled)).bind(&t.kaspa_tax_address)
         .bind(&t.kaspa_tax_percentage).bind(b(t.kaspa_split_enabled)).bind(&t.kaspa_split_addresses)
-        .bind(&t.igra_main_address).bind(b(t.igra_tax_enabled)).bind(&t.igra_tax_address).bind(&t.igra_tax_percentage)
-        .bind(b(t.igra_split_enabled)).bind(&t.igra_split_addresses).bind(&t.kasplex_main_address).bind(b(t.kasplex_tax_enabled))
-        .bind(&t.kasplex_tax_address).bind(&t.kasplex_tax_percentage).bind(b(t.kasplex_split_enabled)).bind(&t.kasplex_split_addresses)
         .bind(&t.redirect_url).bind(&t.webhook_url).bind(&now).bind(id)
         .execute(&state.db.pool).await?;
     } else {
         sqlx::query(
             "INSERT INTO setups (user_id, store_id, tos_agreed, kaspa_main_address, kaspa_tax_enabled, \
              kaspa_tax_address, kaspa_tax_percentage, kaspa_split_enabled, kaspa_split_addresses, \
-             igra_main_address, igra_tax_enabled, igra_tax_address, igra_tax_percentage, igra_split_enabled, \
-             igra_split_addresses, kasplex_main_address, kasplex_tax_enabled, kasplex_tax_address, \
-             kasplex_tax_percentage, kasplex_split_enabled, kasplex_split_addresses, redirect_url, webhook_url, \
-             created_at, updated_at) VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)",
+             redirect_url, webhook_url, created_at, updated_at) \
+             VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(t.user_id).bind(t.store_id)
         .bind(&t.kaspa_main_address).bind(b(t.kaspa_tax_enabled)).bind(&t.kaspa_tax_address)
         .bind(&t.kaspa_tax_percentage).bind(b(t.kaspa_split_enabled)).bind(&t.kaspa_split_addresses)
-        .bind(&t.igra_main_address).bind(b(t.igra_tax_enabled)).bind(&t.igra_tax_address).bind(&t.igra_tax_percentage)
-        .bind(b(t.igra_split_enabled)).bind(&t.igra_split_addresses).bind(&t.kasplex_main_address).bind(b(t.kasplex_tax_enabled))
-        .bind(&t.kasplex_tax_address).bind(&t.kasplex_tax_percentage).bind(b(t.kasplex_split_enabled)).bind(&t.kasplex_split_addresses)
         .bind(&t.redirect_url).bind(&t.webhook_url).bind(&now).bind(&now)
         .execute(&state.db.pool).await?;
     }
