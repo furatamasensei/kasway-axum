@@ -1,6 +1,7 @@
 pub mod api_keys;
 pub mod auth;
 pub mod checkout;
+pub mod checkout_subscriptions;
 pub mod commerce;
 pub mod currencies;
 pub mod explorer_kpr1;

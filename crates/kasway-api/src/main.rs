@@ -45,6 +45,23 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("covenant keeper disabled (COVENANT_KEEPER_ENABLED / fee key / KASPA_NODE_URL unset)");
     }
 
+    // Background subscription biller (SUBSCRIPTION_BILLER_ENABLED, default on).
+    // Mints due subscription cycles/invoices; needs no chain access.
+    if kasway_api::subscription_biller::enabled_from_env() {
+        kasway_api::subscription_biller::spawn(state.clone());
+    } else {
+        tracing::info!("subscription biller disabled via SUBSCRIPTION_BILLER_ENABLED");
+    }
+
+    // Background subscription autopay keeper (SUBSCRIPTION_KEEPER_ENABLED;
+    // default on only when a keeper fee key and KASPA_NODE_URL are configured).
+    // Recognizes cell funding and claims one period per due cycle.
+    if kasway_api::subscription_keeper::enabled_from_env() {
+        kasway_api::subscription_keeper::spawn(state.clone());
+    } else {
+        tracing::info!("subscription keeper disabled (SUBSCRIPTION_KEEPER_ENABLED / fee key / KASPA_NODE_URL unset)");
+    }
+
     let app = kasway_api::build_router(state);
 
     let addr = std::env::var("HOST_PORT").unwrap_or_else(|_| "0.0.0.0:3333".to_string());

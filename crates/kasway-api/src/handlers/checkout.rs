@@ -16,7 +16,7 @@ use axum::Json;
 use serde_json::{json, Value};
 
 /// `body[key]` as a trimmed, non-empty string.
-fn body_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
+pub(crate) fn body_str<'a>(body: &'a Value, key: &str) -> Option<&'a str> {
     body.get(key)
         .and_then(|v| v.as_str())
         .map(str::trim)
