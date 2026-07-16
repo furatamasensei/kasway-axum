@@ -476,9 +476,9 @@ async fn create_delivery(state: &AppState, event_id: i64, endpoint_id: i64, is_r
 
 /// Emit a webhook event: insert the `webhook_events` row and fan out pending
 /// deliveries to every active, non-paused endpoint subscribed to `event_type`
-/// (same store scoping as `events_replay`: the event's store, or endpoints
-/// with no store when the event has none). Deliveries are picked up by the
-/// background worker. Returns the event id.
+/// (same store scoping as `events_replay`: the event's store, or every
+/// endpoint when the event is account-level and has none). Deliveries are
+/// picked up by the background worker. Returns the event id.
 pub(crate) async fn emit_event(
     state: &AppState,
     user_id: i64,
@@ -503,8 +503,12 @@ pub(crate) async fn emit_event(
 
 /// Fan out pending deliveries for an event to every active, non-paused
 /// endpoint subscribed to `event_type` — scoped to the event's store, or to
-/// endpoints with no store when the event has none. Shared by `emit_event`
-/// and `events_replay` (createDeliveries).
+/// ALL of the user's endpoints when the event has none (account-level events
+/// like the subscription lifecycle: subscriptions are not store-scoped).
+/// Endpoints registered via the API always get a store assigned
+/// (`resolve_request_store`), so matching store-less events only against
+/// store-less endpoints would make those events silently undeliverable.
+/// Shared by `emit_event` and `events_replay` (createDeliveries).
 async fn fan_out(
     state: &AppState,
     user_id: i64,
@@ -517,7 +521,7 @@ async fn fan_out(
     let mut sql = format!(
         "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = $1 AND is_active = 1 AND paused_at IS NULL"
     );
-    if store_id.is_some() { sql.push_str(" AND store_id = $2"); } else { sql.push_str(" AND store_id IS NULL"); }
+    if store_id.is_some() { sql.push_str(" AND store_id = $2"); }
     let mut q = sqlx::query_as::<_, EndpointRow>(&sql).bind(user_id);
     if let Some(s) = store_id { q = q.bind(s); }
     let endpoints = q.fetch_all(&state.db.pool).await?;
