@@ -184,7 +184,7 @@ pub fn prepare_settlement(
     let outputs = settlement_outputs(split, fee_utxo, miner_fee, fee_payer_address);
     let fee_spk = pay_to_address_script(fee_payer_address);
     let (transaction, entries, covenant_sighash, fee_sighash) =
-        assemble_unsigned(&compiled.script, outputs, 0, covenant_utxo, fee_utxo, fee_spk);
+        assemble_unsigned(&compiled.script, outputs, 0, covenant_utxo, 0, fee_utxo, fee_spk);
     Ok(SettlementDraft { transaction, entries, covenant_sighash, fee_sighash })
 }
 
@@ -267,7 +267,7 @@ pub fn prepare_refund_by_arbiter(
     let outputs = customer_refund_outputs(&params.customer_refund, params.gross_amount, fee_utxo, miner_fee, fee_payer_address);
     let fee_spk = pay_to_address_script(fee_payer_address);
     let (transaction, entries, covenant_sighash, fee_sighash) =
-        assemble_unsigned(&compiled.script, outputs, 0, covenant_utxo, fee_utxo, fee_spk);
+        assemble_unsigned(&compiled.script, outputs, 0, covenant_utxo, 0, fee_utxo, fee_spk);
     Ok(ArbiterRefundDraft { transaction, entries, covenant_sighash, fee_sighash })
 }
 
@@ -304,7 +304,7 @@ pub fn prepare_release(
 ) -> Result<ArbiterReleaseDraft, CovenantError> {
     let outputs = merchant_split_outputs(&params.payouts, fee_utxo, miner_fee, &keeper.address(prefix));
     let (transaction, entries, covenant_sighash) =
-        build_fee_signed_tx(&compiled.script, outputs, lock_time, covenant_utxo, fee_utxo, keeper, prefix)?;
+        build_fee_signed_tx(&compiled.script, outputs, lock_time, covenant_utxo, 0, fee_utxo, keeper, prefix)?;
     Ok(ArbiterReleaseDraft { transaction, entries, covenant_sighash })
 }
 

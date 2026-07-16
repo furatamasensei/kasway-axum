@@ -1,0 +1,64 @@
+pragma silverscript ^0.1.0;
+
+// Kasway subscription V1 — non-custodial recurring-claim autopay (Mecenas pattern).
+//
+// The customer funds one P2SH covenant cell with several periods' worth of value.
+// The split (merchant/fee/tax/splits) is snapshotted into the cell at creation as
+// pinned payouts — exactly the escrow_v2 payout encoding.
+//
+//   claim(sig)    — the keeper, once per `period_daa` (CSV relative lock, in DAA
+//                   score delta), pays every pinned payout its exact scriptPubKey
+//                   and value, and returns the remainder to the covenant's own
+//                   scriptPubKey (self-replicating cell). When the remainder falls
+//                   below `sweep_threshold` the remainder output may be omitted
+//                   (the dust becomes miner fee, bounded by the threshold).
+//   withdraw(sig) — the customer, any time, spends freely (cancel / top-down exit).
+//
+// Destinations carry a 32-byte payload + kind (0 = schnorr P2PK, 1 = P2SH); the
+// scriptPubKey is rebuilt in-script. keeper/customer keys are 32-byte schnorr keys.
+contract SubscriptionV1(
+    byte[32][] payout_payloads,
+    int[] payout_kinds,
+    int[] payout_values,
+    int payout_count,
+    byte[32] keeper_pubkey,
+    byte[32] customer_pubkey,
+    int claim_total,
+    int period_daa,
+    int sweep_threshold
+) {
+    // One period's charge: keeper-signed, rate-limited by CSV, outputs pinned.
+    entrypoint function claim(sig keeper_sig) {
+        require(checkSig(keeper_sig, pubkey(keeper_pubkey)));
+        // Relative lock: the spend's input sequence must be >= period_daa, and
+        // consensus enforces the UTXO is at least that many DAA scores old.
+        require(this.age >= period_daa);
+
+        // Every pinned payout at its exact scriptPubKey and value (escrow_v2 pattern).
+        for (i, 0, payout_count, 8) {
+            byte[] spk = payout_kinds[i] == 0
+                ? byte[](new ScriptPubKeyP2PK(pubkey(payout_payloads[i])))
+                : byte[](new ScriptPubKeyP2SH(payout_payloads[i]));
+            require(tx.outputs[i].scriptPubKey == spk);
+            require(tx.outputs[i].value == payout_values[i]);
+        }
+
+        // The remainder must come back to this covenant's own scriptPubKey, so
+        // the cell replicates itself for the next period — unless what's left is
+        // below the sweep threshold, in which case the cell may terminate and the
+        // dust (< sweep_threshold) is surrendered as miner fee.
+        int remainder = tx.inputs[this.activeInputIndex].value - claim_total;
+        require(remainder >= 0);
+        if (remainder >= sweep_threshold) {
+            byte[] self_spk = tx.inputs[this.activeInputIndex].scriptPubKey;
+            require(tx.outputs[payout_count].scriptPubKey == self_spk);
+            require(tx.outputs[payout_count].value == remainder);
+        }
+    }
+
+    // The customer can exit any time, to anywhere: their SIG_HASH_ALL signature
+    // alone endorses the exact output set, so nothing else is constrained.
+    entrypoint function withdraw(sig customer_sig) {
+        require(checkSig(customer_sig, pubkey(customer_pubkey)));
+    }
+}
