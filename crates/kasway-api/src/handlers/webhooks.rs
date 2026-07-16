@@ -25,6 +25,7 @@ const WEBHOOK_EVENT_TYPES: &[&str] = &[
     "invoice.expired",
     "payment.confirmed",
     "invoice.paid",
+    "invoice.refunded",
     "subscription.created",
     "subscription.updated",
     "subscription.paused",
