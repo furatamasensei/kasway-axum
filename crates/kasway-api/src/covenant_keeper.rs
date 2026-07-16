@@ -104,10 +104,11 @@ mod fee_utxo_tests {
     }
 }
 
-/// `COVENANT_KEEPER_ENABLED` gate. Defaults on only when a keeper fee key and a
-/// node URL are configured; `0`/`false`/`off` force-disable.
-pub fn enabled_from_env() -> bool {
-    match std::env::var("COVENANT_KEEPER_ENABLED").ok().as_deref().map(str::trim) {
+/// Keeper enable gate (`COVENANT_KEEPER_ENABLED` / `SUBSCRIPTION_KEEPER_ENABLED`).
+/// Defaults on only when a keeper fee key and a node URL are configured;
+/// `0`/`false`/`off` force-disable.
+pub fn keeper_enabled(toggle_var: &str) -> bool {
+    match std::env::var(toggle_var).ok().as_deref().map(str::trim) {
         Some("0") | Some("false") | Some("off") | Some("FALSE") | Some("Off") => false,
         Some(v) if !v.is_empty() => true,
         _ => {
@@ -117,27 +118,38 @@ pub fn enabled_from_env() -> bool {
     }
 }
 
-/// Spawn the keeper loop. Idle when no node/key is configured.
-pub fn spawn(state: AppState) -> JoinHandle<()> {
+/// One keeper pass, boxed: returns how many rows were acted on (0 → idle).
+type KeeperTick = for<'a> fn(
+    &'a AppState,
+    &'a KaspaWrpcClient,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize, sqlx::Error>> + Send + 'a>>;
+
+/// Spawn a keeper poll loop around `tick`. Idle when no node is configured.
+pub(crate) fn spawn_keeper(name: &'static str, state: AppState, tick: KeeperTick) -> JoinHandle<()> {
     tokio::spawn(async move {
         let Some(client) = KaspaWrpcClient::from_env() else {
-            tracing::warn!("covenant keeper: KASPA_NODE_URL not set; keeper idle");
+            tracing::warn!("{name}: KASPA_NODE_URL not set; keeper idle");
             return;
         };
         // Say so on the way up, like the observer does — a keeper that only ever
         // logs on failure is indistinguishable from a keeper that never started.
-        tracing::info!("covenant keeper started");
+        tracing::info!("{name} started");
         loop {
-            match run_tick(&state, &client).await {
+            match tick(&state, &client).await {
                 Ok(0) => tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await,
                 Ok(_) => {}
                 Err(err) => {
-                    tracing::warn!("covenant keeper tick error: {err}");
+                    tracing::warn!("{name} tick error: {err}");
                     tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
                 }
             }
         }
     })
+}
+
+/// Spawn the keeper loop. Idle when no node/key is configured.
+pub fn spawn(state: AppState) -> JoinHandle<()> {
+    spawn_keeper("covenant keeper", state, |s, c| Box::pin(run_tick(s, c)))
 }
 
 #[derive(sqlx::FromRow)]
@@ -332,13 +344,19 @@ pub async fn mark_settled_paid(
     .bind(covenant_state)
     .execute(&state.db.pool)
     .await?;
+    mark_invoice_paid(state, invoice_id, &now).await
+}
+
+/// Flip an open invoice to `paid` and close its subscription cycle (if any).
+/// The tail of `mark_settled_paid`, also used directly when an invoice settles
+/// without a KPR-1 intent.
+pub(crate) async fn mark_invoice_paid(state: &AppState, invoice_id: i64, now: &str) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE invoices SET status = 'paid', paid_at = COALESCE(paid_at, $1), updated_at = $1 WHERE id = $2 AND status = 'open'")
-        .bind(&now)
+        .bind(now)
         .bind(invoice_id)
         .execute(&state.db.pool)
         .await?;
-    mark_cycle_paid(state, invoice_id, &now).await?;
-    Ok(())
+    mark_cycle_paid(state, invoice_id, now).await
 }
 
 /// If `invoice_id` belongs to a subscription cycle, mark the cycle paid and
@@ -375,7 +393,8 @@ pub(crate) async fn mark_cycle_paid(state: &AppState, invoice_id: i64, now: &str
 // server-side draft state is stored between the two calls.
 // ---------------------------------------------------------------------------
 
-fn rerr(msg: impl AsRef<str>) -> AppError {
+/// Shorthand for `AppError::unprocessable` (shared by the keeper/checkout modules).
+pub(crate) fn rerr(msg: impl AsRef<str>) -> AppError {
     AppError::unprocessable(msg.as_ref())
 }
 

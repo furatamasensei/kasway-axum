@@ -41,11 +41,7 @@ async fn autopay_app() -> common::TestApp {
 /// Merchant with a REAL (bech32-parseable) payout address, needed once a
 /// covenant is compiled from the payout split.
 async fn merchant_with_real_setup(app: &common::TestApp, email: &str) -> String {
-    let token = common::register_merchant(app, email, "secret123").await;
-    let uid = common::merchant_user_id(&app.db, email).await;
-    let store = common::seed_default_store(&app.db, uid).await;
-    common::seed_setup(&app.db, uid, store, &addr(0x44)).await;
-    token
+    common::merchant_with_setup_at(app, email, &addr(0x44)).await
 }
 
 async fn create_plan(app: &common::TestApp, token: &str, unit: &str) -> String {
