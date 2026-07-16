@@ -20,55 +20,21 @@
 //! Env: `SUBSCRIPTION_KEEPER_ENABLED` — like the covenant keeper, defaults on
 //! only when `COVENANT_KEEPER_FEE_SECRET` and `KASPA_NODE_URL` are configured.
 
-use crate::covenant_keeper::{keeper_key, kerr, mark_cycle_paid, mark_settled_paid, pick_fee_utxo};
+use crate::covenant_keeper::{keeper_key, kerr, mark_invoice_paid, mark_settled_paid, pick_fee_utxo, rerr, spawn_keeper};
 use crate::error::{AppError, AppResult};
 use crate::kaspa_wrpc::KaspaWrpcClient;
 use crate::kpr1::parse_required_outputs;
 use crate::state::AppState;
-use crate::util::{decode_hex32, encode_hex, now_iso, to_iso};
+use crate::util::{decode_hex32, encode_hex, now_iso};
 use kasway_covenant::subscription_v1::{compile_subscription_v1, complete_claim, prepare_claim, SubscriptionV1Params};
 use kasway_covenant::{covenant_address, network_prefix, rpc_submit_params, Destination, KeeperKey, Payout, Prefix, Utxo};
 use serde_json::json;
 
-const POLL_INTERVAL_SECS: u64 = 5;
 const SCAN_BATCH: i64 = 20;
-
-fn perr(msg: impl AsRef<str>) -> AppError {
-    AppError::unprocessable(msg.as_ref())
-}
-
-/// `SUBSCRIPTION_KEEPER_ENABLED` gate. Defaults on only when a keeper fee key
-/// and a node URL are configured; `0`/`false`/`off` force-disable.
-pub fn enabled_from_env() -> bool {
-    match std::env::var("SUBSCRIPTION_KEEPER_ENABLED").ok().as_deref().map(str::trim) {
-        Some("0") | Some("false") | Some("off") | Some("FALSE") | Some("Off") => false,
-        Some(v) if !v.is_empty() => true,
-        _ => {
-            std::env::var("COVENANT_KEEPER_FEE_SECRET").ok().filter(|s| !s.trim().is_empty()).is_some()
-                && std::env::var("KASPA_NODE_URL").ok().filter(|s| !s.trim().is_empty()).is_some()
-        }
-    }
-}
 
 /// Spawn the keeper loop. Idle when no node/key is configured.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let Some(client) = KaspaWrpcClient::from_env() else {
-            tracing::warn!("subscription keeper: KASPA_NODE_URL not set; keeper idle");
-            return;
-        };
-        tracing::info!("subscription keeper started");
-        loop {
-            match run_tick(&state, &client).await {
-                Ok(0) => tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await,
-                Ok(_) => {}
-                Err(err) => {
-                    tracing::warn!("subscription keeper tick error: {err}");
-                    tokio::time::sleep(std::time::Duration::from_secs(POLL_INTERVAL_SECS)).await;
-                }
-            }
-        }
-    })
+    spawn_keeper("subscription keeper", state, |s, c| Box::pin(run_tick(s, c)))
 }
 
 // ---------------------------------------------------------------------------
@@ -109,22 +75,22 @@ pub(crate) async fn load_cell(state: &AppState, subscription_id: i64) -> AppResu
 /// `params_json` snapshot. The caller must cross-check the derived covenant
 /// address against the stored one before spending.
 pub(crate) fn cell_params(params_json: &str) -> AppResult<(SubscriptionV1Params, Prefix)> {
-    let v: serde_json::Value = serde_json::from_str(params_json).map_err(|e| perr(format!("bad cell params: {e}")))?;
+    let v: serde_json::Value = serde_json::from_str(params_json).map_err(|e| rerr(format!("bad cell params: {e}")))?;
     let network = v["network"].as_str().unwrap_or_default();
-    let prefix = network_prefix(network).map_err(|e| perr(e.to_string()))?;
+    let prefix = network_prefix(network).map_err(|e| rerr(e.to_string()))?;
     let outs = parse_required_outputs(&v["payouts"].to_string());
     if outs.is_empty() {
-        return Err(perr("cell params have no payouts"));
+        return Err(rerr("cell params have no payouts"));
     }
     let mut payouts = Vec::with_capacity(outs.len());
     for out in &outs {
-        let destination = Destination::parse(&out.address).map_err(|e| perr(e.to_string()))?;
-        let value = u64::try_from(out.amount_sompi).map_err(|_| perr("bad payout amount"))?;
+        let destination = Destination::parse(&out.address).map_err(|e| rerr(e.to_string()))?;
+        let value = u64::try_from(out.amount_sompi).map_err(|_| rerr("bad payout amount"))?;
         payouts.push(Payout { destination, value });
     }
-    let keeper_pubkey = v["keeperPubkey"].as_str().and_then(decode_hex32).ok_or_else(|| perr("bad keeper pubkey"))?;
-    let customer = Destination::parse(v["customer"].as_str().unwrap_or_default()).map_err(|e| perr(e.to_string()))?;
-    let period_daa = v["periodDaa"].as_u64().filter(|p| *p > 0).ok_or_else(|| perr("bad periodDaa"))?;
+    let keeper_pubkey = v["keeperPubkey"].as_str().and_then(decode_hex32).ok_or_else(|| rerr("bad keeper pubkey"))?;
+    let customer = Destination::parse(v["customer"].as_str().unwrap_or_default()).map_err(|e| rerr(e.to_string()))?;
+    let period_daa = v["periodDaa"].as_u64().filter(|p| *p > 0).ok_or_else(|| rerr("bad periodDaa"))?;
     let sweep_threshold = v["sweepThreshold"].as_u64().unwrap_or(0);
     Ok((SubscriptionV1Params { payouts, keeper_pubkey, customer, period_daa, sweep_threshold }, prefix))
 }
@@ -238,7 +204,7 @@ struct DueCycle {
 
 /// Claim every active, sufficiently-funded cell whose earliest cycle is due.
 async fn claim_due(state: &AppState, client: &KaspaWrpcClient, keeper: &KeeperKey) -> Result<usize, sqlx::Error> {
-    let now_s = to_iso(chrono::Utc::now());
+    let now_s = now_iso();
     let due = sqlx::query_as::<_, DueCycle>(
         "SELECT DISTINCT ON (c.id) c.id AS cell_id, c.covenant_address, c.params_json, c.claim_total, \
                 c.active_outpoint_txid, c.active_outpoint_index, c.active_amount, \
@@ -362,14 +328,7 @@ async fn claim_one(
         .await?;
     match intent_pk {
         Some(pk) => mark_settled_paid(state, pk, d.invoice_id, "captured", &tx_id).await?,
-        None => {
-            sqlx::query("UPDATE invoices SET status = 'paid', paid_at = COALESCE(paid_at, $1), updated_at = $1 WHERE id = $2 AND status = 'open'")
-                .bind(&now)
-                .bind(d.invoice_id)
-                .execute(&state.db.pool)
-                .await?;
-            mark_cycle_paid(state, d.invoice_id, &now).await?;
-        }
+        None => mark_invoice_paid(state, d.invoice_id, &now).await?,
     }
     let _ = crate::covenant_keeper::emit_invoice_event(
         state, d.invoice_id, &d.invoice_public_id, d.user_id, d.store_id, "subscription.invoice.paid", &tx_id,
@@ -394,7 +353,7 @@ pub async fn mark_underfunded_past_due(state: &AppState) -> Result<usize, sqlx::
         active_amount: Option<i64>,
         invoice_public_id: Option<String>,
     }
-    let now_s = to_iso(chrono::Utc::now());
+    let now_s = now_iso();
     let rows = sqlx::query_as::<_, Underfunded>(
         "SELECT c.id AS cell_id, cy.id AS cycle_id, cy.public_id AS cycle_public_id, \
                 s.public_id AS sub_public_id, s.user_id, c.claim_total, c.active_amount, \

@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     // Background covenant keeper (COVENANT_KEEPER_ENABLED; default on only when a
     // keeper fee key and KASPA_NODE_URL are configured). Releases funded covenants
     // before expiry and auto-refunds after.
-    if kasway_api::covenant_keeper::enabled_from_env() {
+    if kasway_api::covenant_keeper::keeper_enabled("COVENANT_KEEPER_ENABLED") {
         kasway_api::covenant_keeper::spawn(state.clone());
     } else {
         tracing::info!("covenant keeper disabled (COVENANT_KEEPER_ENABLED / fee key / KASPA_NODE_URL unset)");
@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     // Background subscription autopay keeper (SUBSCRIPTION_KEEPER_ENABLED;
     // default on only when a keeper fee key and KASPA_NODE_URL are configured).
     // Recognizes cell funding and claims one period per due cycle.
-    if kasway_api::subscription_keeper::enabled_from_env() {
+    if kasway_api::covenant_keeper::keeper_enabled("SUBSCRIPTION_KEEPER_ENABLED") {
         kasway_api::subscription_keeper::spawn(state.clone());
     } else {
         tracing::info!("subscription keeper disabled (SUBSCRIPTION_KEEPER_ENABLED / fee key / KASPA_NODE_URL unset)");

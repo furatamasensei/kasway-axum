@@ -10,7 +10,7 @@
 //! `withdraw` lets the customer exit any time (it does NOT cancel the
 //! subscription — the next cycle simply goes past due); `cancel` stops billing.
 
-use crate::covenant_keeper::{decode_sig65, keeper_key, pick_fee_utxo};
+use crate::covenant_keeper::{decode_sig65, keeper_key, pick_fee_utxo, rerr};
 use crate::error::{AppError, AppResult};
 use crate::handlers::checkout::body_str;
 use crate::handlers::subscriptions::cancel_subscription;
@@ -27,10 +27,6 @@ use kasway_covenant::subscription_v1::{compile_subscription_v1, complete_withdra
 use kasway_covenant::{covenant_address, network_prefix, rpc_submit_params, verify_schnorr_digest, Destination, Payout, Utxo};
 use serde_json::{json, Value};
 use sha2::Digest;
-
-fn serr(msg: impl AsRef<str>) -> AppError {
-    AppError::unprocessable(msg.as_ref())
-}
 
 /// One DAA score ≈ one block ≈ 0.1s on Kaspa: 864_000 per day.
 const DAA_PER_DAY: u64 = 864_000;
@@ -130,25 +126,25 @@ pub async fn autopay_prepare(
     Json(body): Json<Value>,
 ) -> AppResult<Json<Value>> {
     let Some(refund_address) = body_str(&body, "refundAddress") else {
-        return Err(serr("A refundAddress (the customer's schnorr P2PK address) is required"));
+        return Err(rerr("A refundAddress (the customer's schnorr P2PK address) is required"));
     };
     let customer = Destination::parse(refund_address)
-        .map_err(|e| serr(format!("refundAddress is not a supported Kaspa address: {e}")))?;
+        .map_err(|e| rerr(format!("refundAddress is not a supported Kaspa address: {e}")))?;
 
     let sub = load_public_sub(&state, &public_id).await?;
     if sub.status == "cancelled" {
-        return Err(serr("Subscription is cancelled"));
+        return Err(rerr("Subscription is cancelled"));
     }
     let cell = load_cell(&state, sub.id).await?;
     if let Some(cell) = &cell {
         // A funded cell is a live covenant; re-deriving would strand its value.
         if !recorded_txids(cell).is_empty() && !matches!(cell.state.as_str(), "withdrawn" | "cancelled") {
-            return Err(serr("Autopay cell already exists; withdraw it before re-preparing"));
+            return Err(rerr("Autopay cell already exists; withdraw it before re-preparing"));
         }
     }
 
     let Some(keeper) = keeper_key(&state) else {
-        return Err(serr("Subscription autopay is not available (keeper is not configured)"));
+        return Err(rerr("Subscription autopay is not available (keeper is not configured)"));
     };
 
     let snap = snapshot(&sub);
@@ -156,12 +152,12 @@ pub async fn autopay_prepare(
         .as_str()
         .and_then(|s| s.parse().ok())
         .filter(|a| *a > 0)
-        .ok_or_else(|| serr("Subscription plan snapshot has no valid amount"))?;
+        .ok_or_else(|| rerr("Subscription plan snapshot has no valid amount"))?;
     let network = snap["paymentNetwork"]
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| state.config.kpr1.default_network.clone());
-    let prefix = network_prefix(&network).map_err(|e| serr(e.to_string()))?;
+    let prefix = network_prefix(&network).map_err(|e| rerr(e.to_string()))?;
 
     // The exact per-claim payout split the KPR-1 intent minter would pin for an
     // invoice of this amount (merchant_net, [tax], splits…, kasway_fee).
@@ -173,8 +169,8 @@ pub async fn autopay_prepare(
         let role = out["role"].as_str().unwrap_or_default();
         let addr = out["address"].as_str().unwrap_or_default();
         let destination = Destination::parse(addr)
-            .map_err(|e| serr(format!("{role} payout address is not covenant-compatible: {e}")))?;
-        let value: u64 = out["amountSompi"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| serr("bad payout amount"))?;
+            .map_err(|e| rerr(format!("{role} payout address is not covenant-compatible: {e}")))?;
+        let value: u64 = out["amountSompi"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| rerr("bad payout amount"))?;
         payouts.push(Payout { destination, value });
     }
 
@@ -192,27 +188,26 @@ pub async fn autopay_prepare(
     };
     let period_daa = (days * DAA_PER_DAY * 9 / 10).clamp(1, u32::MAX as u64);
 
-    let params = SubscriptionV1Params {
+    let mut params = SubscriptionV1Params {
         payouts,
         keeper_pubkey: keeper.x_only_pubkey(),
         customer,
         period_daa,
-        sweep_threshold: 0, // set below from claim_total
+        sweep_threshold: 0, // claim_total ignores it; set right below
     };
-    let claim_total = params.claim_total().map_err(|e| serr(e.to_string()))?;
+    let claim_total = params.claim_total().map_err(|e| rerr(e.to_string()))?;
     // Sweep leftovers below 10% of one claim: too small to ever fund a period.
-    let sweep_threshold = (claim_total / 10).max(1);
-    let params = SubscriptionV1Params { sweep_threshold, ..params };
+    params.sweep_threshold = (claim_total / 10).max(1);
 
-    let compiled = compile_subscription_v1(&params).map_err(|e| serr(e.to_string()))?;
-    let address = covenant_address(&compiled, prefix).map_err(|e| serr(e.to_string()))?.to_string();
+    let compiled = compile_subscription_v1(&params).map_err(|e| rerr(e.to_string()))?;
+    let address = covenant_address(&compiled, prefix).map_err(|e| rerr(e.to_string()))?.to_string();
     let redeem_hex = encode_hex(&compiled.script);
 
     let params_json = json!({
         "network": network,
         "payouts": outputs,
         "periodDaa": period_daa,
-        "sweepThreshold": sweep_threshold,
+        "sweepThreshold": params.sweep_threshold,
         "keeperPubkey": encode_hex(&params.keeper_pubkey),
         "customer": refund_address,
     });
@@ -264,23 +259,23 @@ pub async fn autopay_record(
     let tx_id = body_str(&body, "txId")
         .filter(|t| decode_hex32(t).is_some())
         .map(str::to_lowercase)
-        .ok_or_else(|| serr("txId must be a 64-char hex transaction id"))?;
+        .ok_or_else(|| rerr("txId must be a 64-char hex transaction id"))?;
 
     let sub = load_public_sub(&state, &public_id).await?;
     if sub.status == "cancelled" {
-        return Err(serr("Subscription is cancelled"));
+        return Err(rerr("Subscription is cancelled"));
     }
     let cell = load_cell(&state, sub.id)
         .await?
-        .ok_or_else(|| serr("Prepare the autopay covenant first (POST /autopay/prepare)"))?;
+        .ok_or_else(|| rerr("Prepare the autopay covenant first (POST /autopay/prepare)"))?;
     if cell.state == "cancelled" {
-        return Err(serr("Autopay cell is cancelled"));
+        return Err(rerr("Autopay cell is cancelled"));
     }
 
     let mut txids = recorded_txids(&cell);
     if !txids.iter().any(|t| t.eq_ignore_ascii_case(&tx_id)) {
         if txids.len() >= 50 {
-            return Err(serr("Too many recorded funding txids for this cell"));
+            return Err(rerr("Too many recorded funding txids for this cell"));
         }
         txids.push(tx_id);
     }
@@ -335,9 +330,9 @@ pub async fn cancel(
         let pubkey: [u8; 32] = Destination::parse(&cell.refund_address)
             .ok()
             .and_then(|d| d.address().payload.as_slice().try_into().ok())
-            .ok_or_else(|| serr("Cell refund address is invalid"))?;
+            .ok_or_else(|| rerr("Cell refund address is invalid"))?;
         if !verify_schnorr_digest(&pubkey, &challenge, &sig[..64]) {
-            return Err(serr("Cancel signature does not verify against the refund key"));
+            return Err(rerr("Cancel signature does not verify against the refund key"));
         }
     }
     cancel_subscription(&state, sub.user_id, &public_id).await?;
@@ -349,12 +344,12 @@ async fn withdrawable_cell(state: &AppState, public_id: &str) -> AppResult<(Publ
     let sub = load_public_sub(state, public_id).await?;
     let cell = load_cell(state, sub.id)
         .await?
-        .ok_or_else(|| serr("Subscription has no autopay cell"))?;
+        .ok_or_else(|| rerr("Subscription has no autopay cell"))?;
     if cell.state == "claiming" {
-        return Err(serr("A claim is in flight; retry shortly"));
+        return Err(rerr("A claim is in flight; retry shortly"));
     }
     if cell.active_outpoint_txid.is_none() || cell.active_amount.unwrap_or(0) <= 0 {
-        return Err(serr("Autopay cell has no recognized funds to withdraw"));
+        return Err(rerr("Autopay cell has no recognized funds to withdraw"));
     }
     Ok((sub, cell))
 }
@@ -366,26 +361,26 @@ async fn build_withdraw_draft(
     destination: &str,
 ) -> AppResult<(kasway_covenant::CompiledContract<'static>, kasway_covenant::subscription_v1::SubscriptionDraft)> {
     let dest = Destination::parse(destination)
-        .map_err(|e| serr(format!("destinationAddress is not a supported Kaspa address: {e}")))?;
+        .map_err(|e| rerr(format!("destinationAddress is not a supported Kaspa address: {e}")))?;
     let (params, prefix) = cell_params(&cell.params_json)?;
-    let compiled = compile_subscription_v1(&params).map_err(|e| serr(e.to_string()))?;
-    let derived = covenant_address(&compiled, prefix).map_err(|e| serr(e.to_string()))?.to_string();
+    let compiled = compile_subscription_v1(&params).map_err(|e| rerr(e.to_string()))?;
+    let derived = covenant_address(&compiled, prefix).map_err(|e| rerr(e.to_string()))?.to_string();
     if derived != cell.covenant_address {
-        return Err(serr("covenant address mismatch"));
+        return Err(rerr("covenant address mismatch"));
     }
-    let keeper = keeper_key(state).ok_or_else(|| serr("covenant keeper fee key is not configured"))?;
-    let client = KaspaWrpcClient::from_env().ok_or_else(|| serr("Kaspa node is not configured"))?;
+    let keeper = keeper_key(state).ok_or_else(|| rerr("covenant keeper fee key is not configured"))?;
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
     let min_fee = state.config.covenant.keeper_min_fee_sompi;
     let fee_utxos = client
         .fetch_utxos(&keeper.address(prefix).to_string())
         .await
-        .map_err(|e| serr(e.to_string()))?;
+        .map_err(|e| rerr(e.to_string()))?;
     let fee_utxo = pick_fee_utxo(fee_utxos, min_fee)
         .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
-        .ok_or_else(|| serr("no keeper fee UTXO available for withdraw"))?;
+        .ok_or_else(|| rerr("no keeper fee UTXO available for withdraw"))?;
     let amount = cell.active_amount.unwrap_or(0) as u64;
     let covenant_utxo = Utxo {
-        transaction_id: cell.active_outpoint_txid.as_deref().and_then(decode_hex32).ok_or_else(|| serr("bad cell outpoint"))?,
+        transaction_id: cell.active_outpoint_txid.as_deref().and_then(decode_hex32).ok_or_else(|| rerr("bad cell outpoint"))?,
         index: cell.active_outpoint_index.unwrap_or(0) as u32,
         value: amount,
     };
@@ -393,7 +388,7 @@ async fn build_withdraw_draft(
     // miner fee from its own input (the covenant does not constrain this split —
     // the customer's SIG_HASH_ALL signature does).
     let draft = prepare_withdraw(&compiled, &[(dest, amount)], &covenant_utxo, &fee_utxo, min_fee, &keeper, prefix)
-        .map_err(|e| serr(e.to_string()))?;
+        .map_err(|e| rerr(e.to_string()))?;
     Ok((compiled, draft))
 }
 
@@ -406,7 +401,7 @@ pub async fn withdraw_prepare(
     Json(body): Json<Value>,
 ) -> AppResult<Json<Value>> {
     let Some(destination) = body_str(&body, "destinationAddress") else {
-        return Err(serr("A destinationAddress is required"));
+        return Err(rerr("A destinationAddress is required"));
     };
     let (_sub, cell) = withdrawable_cell(&state, &public_id).await?;
     let (_compiled, draft) = build_withdraw_draft(&state, &cell, destination).await?;
@@ -443,14 +438,14 @@ pub async fn withdraw_submit(
     let destination = cell
         .withdraw_destination
         .clone()
-        .ok_or_else(|| serr("No withdraw draft prepared; call /autopay/withdraw/prepare first"))?;
+        .ok_or_else(|| rerr("No withdraw draft prepared; call /autopay/withdraw/prepare first"))?;
     let (compiled, draft) = build_withdraw_draft(&state, &cell, &destination).await?;
     if cell.withdraw_sighash.as_deref() != Some(encode_hex(&draft.covenant_sighash).as_str()) {
-        return Err(serr("Withdraw draft is stale (chain state changed); prepare again"));
+        return Err(rerr("Withdraw draft is stale (chain state changed); prepare again"));
     }
-    let spend = complete_withdraw(&compiled, draft, &sig).map_err(|e| serr(e.to_string()))?;
-    let client = KaspaWrpcClient::from_env().ok_or_else(|| serr("Kaspa node is not configured"))?;
-    let tx_id = client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| serr(e.to_string()))?;
+    let spend = complete_withdraw(&compiled, draft, &sig).map_err(|e| rerr(e.to_string()))?;
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
+    let tx_id = client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))?;
 
     sqlx::query(
         "UPDATE subscription_cells SET state = 'withdrawn', active_outpoint_txid = NULL, active_outpoint_index = NULL, \

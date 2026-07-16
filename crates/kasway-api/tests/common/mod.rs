@@ -309,9 +309,15 @@ pub async fn merchant(app: &TestApp, email: &str) -> String {
 
 /// Register a merchant plus a default store and payout setup; returns the token.
 pub async fn merchant_with_setup(app: &TestApp, email: &str) -> String {
+    merchant_with_setup_at(app, email, "kaspatest:merchantpayout00001").await
+}
+
+/// `merchant_with_setup` with an explicit payout address (e.g. a REAL
+/// bech32-parseable one for tests that compile covenants from the split).
+pub async fn merchant_with_setup_at(app: &TestApp, email: &str, payout_address: &str) -> String {
     let token = register_merchant(app, email, "secret123").await;
     let uid = merchant_user_id(&app.db, email).await;
     let store = seed_default_store(&app.db, uid).await;
-    seed_setup(&app.db, uid, store, "kaspatest:merchantpayout00001").await;
+    seed_setup(&app.db, uid, store, payout_address).await;
     token
 }
