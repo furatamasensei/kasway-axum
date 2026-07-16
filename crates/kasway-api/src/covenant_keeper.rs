@@ -52,7 +52,7 @@ const KEEPER_CHANGE_FLOOR_SOMPI: u64 = 100_000_000;
 /// Taking the largest keeps the change big and its mass ~1k, and leaves the dust
 /// untouched instead of feeding on it. Still deterministic — prepare and submit
 /// must build the identical transaction — with (txid, index) breaking ties.
-fn pick_fee_utxo<T: Ord>(mut utxos: Vec<(T, u32, u64)>, min_fee: u64) -> Option<(T, u32, u64)> {
+pub(crate) fn pick_fee_utxo<T: Ord>(mut utxos: Vec<(T, u32, u64)>, min_fee: u64) -> Option<(T, u32, u64)> {
     // Covering the fee is not enough: the change left over must ALSO be big
     // enough that its own storage mass stays negligible (1 KAS => ~10k mass).
     // Below this floor the transaction is born rejectable, so refuse to build it
@@ -225,14 +225,14 @@ pub async fn run_tick(state: &AppState, client: &KaspaWrpcClient) -> Result<usiz
     Ok(acted)
 }
 
-fn keeper_key(state: &AppState) -> Option<KeeperKey> {
+pub(crate) fn keeper_key(state: &AppState) -> Option<KeeperKey> {
     let hex = state.config.covenant.keeper_fee_secret_hex.as_deref()?;
     let bytes = decode_hex32(hex.trim())?;
     KeeperKey::from_secret_bytes(&bytes).ok()
 }
 
 /// Box a message as the keeper's error for a single settlement (Display = the message).
-fn kerr(msg: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
+pub(crate) fn kerr(msg: impl Into<String>) -> Box<dyn std::error::Error + Send + Sync> {
     msg.into().into()
 }
 
@@ -283,7 +283,7 @@ async fn settle_one(
     Ok(())
 }
 
-async fn emit_invoice_event(
+pub(crate) async fn emit_invoice_event(
     state: &AppState,
     invoice_id: i64,
     public_id: &str,
@@ -310,8 +310,11 @@ async fn invoice_payload(state: &AppState, invoice_id: i64) -> Option<serde_json
 }
 
 /// Mark the intent settled (with its terminal `covenant_state`) and the invoice
-/// paid. Shared by every merchant-payout settlement path.
-async fn mark_settled_paid(
+/// paid. Shared by every merchant-payout settlement path. When the invoice
+/// belongs to a subscription cycle, the cycle is marked paid too (and the
+/// subscription restored from past_due), so autopay AND manually-paid
+/// subscription invoices both close their cycle.
+pub async fn mark_settled_paid(
     state: &AppState,
     intent_pk: i64,
     invoice_id: i64,
@@ -334,6 +337,31 @@ async fn mark_settled_paid(
         .bind(invoice_id)
         .execute(&state.db.pool)
         .await?;
+    mark_cycle_paid(state, invoice_id, &now).await?;
+    Ok(())
+}
+
+/// If `invoice_id` belongs to a subscription cycle, mark the cycle paid and
+/// restore the subscription (defensively) from past_due to active.
+pub(crate) async fn mark_cycle_paid(state: &AppState, invoice_id: i64, now: &str) -> Result<(), sqlx::Error> {
+    let ids: Option<(Option<i64>, Option<i64>)> =
+        sqlx::query_as("SELECT subscription_id, subscription_cycle_id FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_optional(&state.db.pool)
+            .await?;
+    let Some((sub_id, Some(cycle_id))) = ids else { return Ok(()) };
+    sqlx::query("UPDATE subscription_cycles SET status = 'paid', paid_at = COALESCE(paid_at, $1), past_due_at = NULL, updated_at = $1 WHERE id = $2 AND status != 'paid'")
+        .bind(now)
+        .bind(cycle_id)
+        .execute(&state.db.pool)
+        .await?;
+    if let Some(sub_id) = sub_id {
+        sqlx::query("UPDATE subscriptions SET status = 'active', updated_at = $1 WHERE id = $2 AND status = 'past_due'")
+            .bind(now)
+            .bind(sub_id)
+            .execute(&state.db.pool)
+            .await?;
+    }
     Ok(())
 }
 
@@ -957,7 +985,7 @@ pub(crate) async fn arbiter_refund_submit(
 }
 
 /// Decode a 65-byte covenant signature (schnorr signature || sighash-type byte).
-fn decode_sig65(hex: &str) -> AppResult<Vec<u8>> {
+pub(crate) fn decode_sig65(hex: &str) -> AppResult<Vec<u8>> {
     decode_hex(hex.trim())
         .filter(|s| s.len() == 65)
         .ok_or_else(|| rerr("signature must be 65-byte hex (schnorr signature || sighash-type byte)"))

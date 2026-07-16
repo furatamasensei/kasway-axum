@@ -410,8 +410,10 @@ fn add_interval(start: chrono::DateTime<chrono::Utc>, unit: &str, count: i64) ->
     }
 }
 
-/// generateInvoiceForCycle.
-async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, is_retry: bool) -> AppResult<i64> {
+/// generateInvoiceForCycle. Emits `subscription.invoice.created` whenever a new
+/// invoice is minted (creation, biller catch-up, and retry all route through
+/// here, so every path emits consistently).
+pub(crate) async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, is_retry: bool) -> AppResult<i64> {
     let cycle = sqlx::query_as::<_, CycleRow>(&format!("SELECT {CYCLE_COLS} FROM subscription_cycles WHERE id = $1"))
         .bind(cycle_id).fetch_optional(&state.db.pool).await?
         .ok_or_else(|| AppError::commerce(404, "Subscription cycle not found"))?;
@@ -440,21 +442,36 @@ async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, is_retry: b
     if let (Value::Object(m), Some(exp)) = (&mut body, expires_at) {
         m.insert("expiresAt".into(), json!(exp));
     }
-    let (invoice_id, _store) = invoices::create_for_merchant(state, sub.user_id, &body, None, Some(sub.id), Some(cycle.id)).await?;
+    let (invoice_id, store_id) = invoices::create_for_merchant(state, sub.user_id, &body, None, Some(sub.id), Some(cycle.id)).await?;
 
     let now = now_iso();
     sqlx::query("UPDATE subscription_cycles SET invoice_id = $1, status = 'invoiced', attempt_count = $2, invoiced_at = $3, past_due_at = NULL, updated_at = $4 WHERE id = $5")
         .bind(invoice_id).bind(attempt).bind(&now).bind(&now).bind(cycle.id).execute(&state.db.pool).await?;
+
+    // Webhook: a delivery failure must never fail the billing itself.
+    if let Ok(inv) = invoices::load_by_id(state, invoice_id).await {
+        if let Ok((items, intent)) = invoices::load_relations(state, invoice_id).await {
+            let payload = invoices::serialize_invoice(&inv, &items, intent.as_ref());
+            let resource_id = payload["publicId"].as_str().unwrap_or_default().to_string();
+            if let Err(e) = crate::handlers::webhooks::emit_event(
+                state, sub.user_id, Some(store_id), "subscription.invoice.created", "invoice", &resource_id, &payload,
+            ).await {
+                tracing::warn!("subscription.invoice.created emit failed for invoice {invoice_id}: {e}");
+            }
+        }
+    }
     Ok(invoice_id)
 }
 
-/// generateDueInvoiceForSubscription.
-async fn generate_due_invoice(state: &AppState, sub_id: i64, now: chrono::DateTime<chrono::Utc>) -> AppResult<()> {
+/// generateDueInvoiceForSubscription. Bills ONE due period (advancing
+/// `next_billing_at` one interval); returns whether it billed anything, so the
+/// biller can loop until the subscription is caught up.
+pub(crate) async fn generate_due_invoice(state: &AppState, sub_id: i64, now: chrono::DateTime<chrono::Utc>) -> AppResult<bool> {
     let sub = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE id = $1"))
         .bind(sub_id).fetch_one(&state.db.pool).await?;
     let next = sub.next_billing_at.as_deref().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.with_timezone(&chrono::Utc));
-    let Some(next) = next else { return Ok(()); };
-    if sub.status != "active" || next > now { return Ok(()); }
+    let Some(next) = next else { return Ok(false); };
+    if sub.status != "active" || next > now { return Ok(false); }
 
     let snap: Value = serde_json::from_str(&sub.plan_snapshot).unwrap_or(json!({}));
     let unit = snap["intervalUnit"].as_str().unwrap_or("month");
@@ -480,7 +497,7 @@ async fn generate_due_invoice(state: &AppState, sub_id: i64, now: chrono::DateTi
     sqlx::query("UPDATE subscriptions SET current_period_start = $1, current_period_end = $2, next_billing_at = $3, updated_at = $4 WHERE id = $5")
         .bind(&ps).bind(&pe).bind(&pe).bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
     generate_invoice_for_cycle(state, cycle_id, false).await?;
-    Ok(())
+    Ok(true)
 }
 
 pub async fn subs_index(auth: AuthMerchant, State(state): State<AppState>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {
@@ -510,9 +527,6 @@ pub async fn subs_index(auth: AuthMerchant, State(state): State<AppState>, Query
 
 pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(body): Json<Value>) -> AppResult<(StatusCode, Json<Value>)> {
     let payment_mode = body.get("paymentMode").and_then(|v| v.as_str()).unwrap_or("recurring_invoice").to_string();
-    if payment_mode == "wallet_autopay" {
-        return Err(AppError::commerce(422, "wallet_autopay is not supported yet"));
-    }
     if !SUPPORTED_PAYMENT_MODES.contains(&payment_mode.as_str()) {
         return Err(AppError::commerce(422, "Unsupported subscription payment mode"));
     }
@@ -573,7 +587,16 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
     }
 
     let sub = load_subscription(&state, auth.user_id, &public_id).await?;
-    Ok((StatusCode::CREATED, Json(serialize_subscription(&state, &sub, true).await?)))
+    let out = serialize_subscription(&state, &sub, true).await?;
+    emit_subscription_event(&state, auth.user_id, "subscription.created", &public_id, &out).await;
+    Ok((StatusCode::CREATED, Json(out)))
+}
+
+/// Emit a subscription lifecycle webhook event (failures are logged, never fatal).
+async fn emit_subscription_event(state: &AppState, user_id: i64, event: &str, public_id: &str, payload: &Value) {
+    if let Err(e) = crate::handlers::webhooks::emit_event(state, user_id, None, event, "subscription", public_id, payload).await {
+        tracing::warn!("{event} emit failed for subscription {public_id}: {e}");
+    }
 }
 
 pub async fn subs_show(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
@@ -581,24 +604,26 @@ pub async fn subs_show(auth: AuthMerchant, State(state): State<AppState>, Path(p
     Ok(Json(serialize_subscription(&state, &sub, true).await?))
 }
 
-async fn set_sub_status(state: &AppState, user_id: i64, public_id: &str, set: impl FnOnce(&SubRow) -> Result<String, AppError>) -> AppResult<Json<Value>> {
+async fn set_sub_status(state: &AppState, user_id: i64, public_id: &str, event: &str, set: impl FnOnce(&SubRow) -> Result<String, AppError>) -> AppResult<Json<Value>> {
     let sub = load_subscription(state, user_id, public_id).await?;
     let sql_set = set(&sub)?;
     sqlx::query(&format!("UPDATE subscriptions SET {sql_set}, updated_at = $1 WHERE id = $2"))
         .bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
     let sub = load_subscription(state, user_id, public_id).await?;
-    Ok(Json(serialize_subscription(state, &sub, true).await?))
+    let out = serialize_subscription(state, &sub, true).await?;
+    emit_subscription_event(state, user_id, event, public_id, &out).await;
+    Ok(Json(out))
 }
 
 pub async fn subs_pause(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
-    set_sub_status(&state, auth.user_id, &public_id, |s| {
+    set_sub_status(&state, auth.user_id, &public_id, "subscription.paused", |s| {
         if s.status == "cancelled" { return Err(AppError::commerce(422, "Cancelled subscriptions cannot be paused")); }
         Ok(format!("status = 'paused', paused_at = '{}'", now_iso()))
     }).await
 }
 
 pub async fn subs_resume(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
-    set_sub_status(&state, auth.user_id, &public_id, |s| {
+    set_sub_status(&state, auth.user_id, &public_id, "subscription.resumed", |s| {
         if s.status != "paused" { return Err(AppError::commerce(422, "Only paused subscriptions can be resumed")); }
         let nb = if s.next_billing_at.is_none() { format!(", next_billing_at = '{}'", now_iso()) } else { String::new() };
         Ok(format!("status = 'active', paused_at = NULL{nb}"))
@@ -606,13 +631,28 @@ pub async fn subs_resume(auth: AuthMerchant, State(state): State<AppState>, Path
 }
 
 pub async fn subs_cancel(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
-    let sub = load_subscription(&state, auth.user_id, &public_id).await?;
-    if sub.status != "cancelled" {
+    Ok(Json(cancel_subscription(&state, auth.user_id, &public_id).await?))
+}
+
+/// Cancel a subscription: status/cell flips + `subscription.cancelled` emit.
+/// Shared by the merchant endpoint and the public checkout cancel (which
+/// authenticates via publicId capability / refund-key signature instead).
+pub(crate) async fn cancel_subscription(state: &AppState, user_id: i64, public_id: &str) -> AppResult<Value> {
+    let sub = load_subscription(state, user_id, public_id).await?;
+    let transitioned = sub.status != "cancelled";
+    if transitioned {
         sqlx::query("UPDATE subscriptions SET status = 'cancelled', cancelled_at = $1, next_billing_at = NULL, updated_at = $2 WHERE id = $3")
             .bind(now_iso()).bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
+        // The autopay cell (if any) stops claiming; funds stay customer-withdrawable.
+        sqlx::query("UPDATE subscription_cells SET state = 'cancelled', updated_at = $1 WHERE subscription_id = $2 AND state != 'withdrawn'")
+            .bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
     }
-    let sub = load_subscription(&state, auth.user_id, &public_id).await?;
-    Ok(Json(serialize_subscription(&state, &sub, true).await?))
+    let sub = load_subscription(state, user_id, public_id).await?;
+    let out = serialize_subscription(state, &sub, true).await?;
+    if transitioned {
+        emit_subscription_event(state, user_id, "subscription.cancelled", public_id, &out).await;
+    }
+    Ok(out)
 }
 
 pub async fn subs_invoices(auth: AuthMerchant, State(state): State<AppState>, Path(public_id): Path<String>, Query(q): Query<PageQuery>) -> AppResult<Json<Value>> {

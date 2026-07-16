@@ -229,6 +229,16 @@ impl KeeperKey {
     }
 }
 
+/// Verify a 64-byte BIP340 schnorr signature over a 32-byte digest against an
+/// x-only pubkey (e.g. a schnorr P2PK address payload). Used by the backend to
+/// authenticate customer actions (e.g. autopay cancel) without a transaction.
+pub fn verify_schnorr_digest(pubkey: &[u8; 32], digest: &[u8; 32], sig: &[u8]) -> bool {
+    let Ok(pk) = secp256k1::XOnlyPublicKey::from_slice(pubkey) else { return false };
+    let Ok(sig) = secp256k1::schnorr::Signature::from_slice(sig) else { return false };
+    let Ok(msg) = Message::from_digest_slice(digest) else { return false };
+    Secp256k1::verification_only().verify_schnorr(&sig, &msg, &pk).is_ok()
+}
+
 /// A signed release/refund transaction plus the UTXO entries it spends (needed
 /// for local verification and for RPC submission).
 pub struct SignedSpend {
