@@ -31,14 +31,14 @@ async fn endpoint_store_returns_signing_secret() {
         .client
         .post(app.url("/api/webhook-endpoints"))
         .bearer_auth(&token)
-        .json(&json!({ "url": "https://hooks.test/wh", "events": ["invoice.created", "invoice.paid"] }))
+        .json(&json!({ "url": "https://hooks.test/wh", "events": ["invoice.created", "invoice.paid", "invoice.refunded"] }))
         .send()
         .await
         .unwrap();
     assert_eq!(res.status(), 201);
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["url"], "https://hooks.test/wh");
-    assert_eq!(body["events"], json!(["invoice.created", "invoice.paid"]));
+    assert_eq!(body["events"], json!(["invoice.created", "invoice.paid", "invoice.refunded"]));
     assert_eq!(body["isActive"], true);
     assert!(body["signingSecret"].as_str().unwrap().starts_with("whsec_"));
 }

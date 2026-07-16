@@ -19,12 +19,16 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+/// Subscribable event types. Only `invoice.paid` and `invoice.refunded` are
+/// emitted today (both from `crate::covenant_keeper`); the rest are reserved
+/// names kept subscribable so existing endpoint rows keep validating on update.
 const WEBHOOK_EVENT_TYPES: &[&str] = &[
     "invoice.created",
     "invoice.cancelled",
     "invoice.expired",
     "payment.confirmed",
     "invoice.paid",
+    "invoice.refunded",
     "subscription.created",
     "subscription.updated",
     "subscription.paused",
