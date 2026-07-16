@@ -12,13 +12,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://kasway.db".to_string());
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@db:5432/kasway".to_string());
     let db = Db::connect(&db_url).await?;
 
     let state = AppState {
         db,
         config: Arc::new(AppConfig::from_env()),
-        events: kasway_api::events::InvoiceEvents::new(),
     };
 
     // Background webhook delivery worker (WEBHOOK_WORKER_ENABLED, default on).

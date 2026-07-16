@@ -37,7 +37,7 @@ const WEBHOOK_EVENT_TYPES: &[&str] = &[
 
 // ---------- rows + serialization ----------
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, Clone)]
 #[serde(rename_all = "camelCase")]
 struct EndpointRow {
     id: i64,
@@ -634,11 +634,46 @@ pub async fn deliveries_index(
     if let Some(v) = &q.event_type { id_query = id_query.bind(v.clone()); }
     let ids: Vec<i64> = id_query.bind(per_page).bind(offset).fetch_all(&state.db.pool).await?;
 
-    let mut data = Vec::with_capacity(ids.len());
-    for did in ids {
-        data.push(load_delivery_full(&state, did).await?);
-    }
+    // Load the page's deliveries + their endpoints/events in three queries
+    // instead of 3N. Re-running the same ORDER BY on the id subset preserves
+    // the page order.
+    let deliveries = sqlx::query_as::<_, DeliveryRow>(&format!(
+        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE id = ANY($1) ORDER BY created_at DESC, id DESC"
+    ))
+    .bind(&ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let endpoint_ids: Vec<i64> = deliveries.iter().map(|d| d.webhook_endpoint_id).collect();
+    let event_ids: Vec<i64> = deliveries.iter().map(|d| d.webhook_event_id).collect();
+    let endpoints = endpoints_by_ids(&state, &endpoint_ids).await?;
+    let events: std::collections::HashMap<i64, EventRow> = sqlx::query_as::<_, EventRow>(&format!(
+        "SELECT {EVENT_COLS} FROM webhook_events WHERE id = ANY($1)"
+    ))
+    .bind(&event_ids)
+    .fetch_all(&state.db.pool)
+    .await?
+    .into_iter()
+    .map(|e| (e.id, e))
+    .collect();
+
+    let data: Vec<Value> = deliveries
+        .iter()
+        .map(|d| serialize_delivery(d, endpoints.get(&d.webhook_endpoint_id), events.get(&d.webhook_event_id)))
+        .collect();
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": data })))
+}
+
+/// Endpoints by id, one query for a whole page.
+async fn endpoints_by_ids(state: &AppState, ids: &[i64]) -> AppResult<std::collections::HashMap<i64, EndpointRow>> {
+    Ok(sqlx::query_as::<_, EndpointRow>(&format!(
+        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = ANY($1)"
+    ))
+    .bind(ids)
+    .fetch_all(&state.db.pool)
+    .await?
+    .into_iter()
+    .map(|e| (e.id, e))
+    .collect())
 }
 
 async fn load_delivery_full(state: &AppState, id: i64) -> AppResult<Value> {
@@ -724,30 +759,40 @@ pub async fn events_index(
     if bind_store { lq = lq.bind(q.store_id.unwrap()); }
     let rows = lq.bind(per_page).bind(offset).fetch_all(&state.db.pool).await?;
 
-    let mut data = Vec::with_capacity(rows.len());
-    for ev in &rows {
-        let ds = load_event_deliveries(&state, ev.id).await?;
-        data.push(serialize_event(ev, Some(&ds)));
-    }
+    let event_ids: Vec<i64> = rows.iter().map(|e| e.id).collect();
+    let mut ds_by_event = load_events_deliveries(&state, &event_ids).await?;
+    let data: Vec<Value> = rows
+        .iter()
+        .map(|ev| serialize_event(ev, Some(&ds_by_event.remove(&ev.id).unwrap_or_default())))
+        .collect();
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": data })))
 }
 
-async fn load_event_deliveries(state: &AppState, event_id: i64) -> AppResult<Vec<(DeliveryRow, Option<EndpointRow>)>> {
+/// Deliveries (+ their endpoints) for a set of events, grouped by event id —
+/// two queries for a whole page instead of one per delivery.
+async fn load_events_deliveries(
+    state: &AppState,
+    event_ids: &[i64],
+) -> AppResult<std::collections::HashMap<i64, Vec<(DeliveryRow, Option<EndpointRow>)>>> {
     let ds = sqlx::query_as::<_, DeliveryRow>(&format!(
-        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_event_id = $1 ORDER BY created_at DESC, id DESC"
+        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_event_id = ANY($1) ORDER BY created_at DESC, id DESC"
     ))
-    .bind(event_id)
+    .bind(event_ids)
     .fetch_all(&state.db.pool)
     .await?;
-    let mut out = Vec::with_capacity(ds.len());
+    let endpoint_ids: Vec<i64> = ds.iter().map(|d| d.webhook_endpoint_id).collect();
+    let endpoints = endpoints_by_ids(state, &endpoint_ids).await?;
+    let mut out: std::collections::HashMap<i64, Vec<(DeliveryRow, Option<EndpointRow>)>> =
+        std::collections::HashMap::new();
     for d in ds {
-        let ep = sqlx::query_as::<_, EndpointRow>(&format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = $1"))
-            .bind(d.webhook_endpoint_id)
-            .fetch_optional(&state.db.pool)
-            .await?;
-        out.push((d, ep));
+        let ep = endpoints.get(&d.webhook_endpoint_id).cloned();
+        out.entry(d.webhook_event_id).or_default().push((d, ep));
     }
     Ok(out)
+}
+
+async fn load_event_deliveries(state: &AppState, event_id: i64) -> AppResult<Vec<(DeliveryRow, Option<EndpointRow>)>> {
+    Ok(load_events_deliveries(state, &[event_id]).await?.remove(&event_id).unwrap_or_default())
 }
 
 async fn load_event_owned(state: &AppState, user_id: i64, id: i64, store_id: Option<i64>) -> AppResult<EventRow> {

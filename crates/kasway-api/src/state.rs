@@ -8,8 +8,6 @@ use std::sync::Arc;
 pub struct AppState {
     pub db: Db,
     pub config: Arc<AppConfig>,
-    /// Invoice state changes, for the SSE watchers. Cloned freely; it is a sender.
-    pub events: crate::events::InvoiceEvents,
 }
 
 #[derive(Clone, Debug)]

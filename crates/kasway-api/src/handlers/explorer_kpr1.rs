@@ -106,12 +106,6 @@ fn str_at(v: &Value, path: &[&str]) -> Option<String> {
 fn arr_at(v: &Value, path: &[&str]) -> Vec<Value> {
     match at(v, path) { Value::Array(a) => a.clone(), _ => vec![] }
 }
-fn rec_nonempty(v: &Value, path: &[&str]) -> Value {
-    match at(v, path) { Value::Object(m) if !m.is_empty() => Value::Object(m.clone()), _ => json!({}) }
-}
-fn str_val(v: &Value) -> Value {
-    match v { Value::String(s) if !s.is_empty() => json!(s), _ => Value::Null }
-}
 fn safe_reason(v: Option<&str>) -> Value {
     match v {
         Some(s) if !s.is_empty() => {
@@ -272,21 +266,9 @@ async fn serialize(
     };
     let top_reason = if !verification["reasonCode"].is_null() { verification["reasonCode"].clone() } else { state_reason };
 
-    // covenant
-    let artifact = rec_nonempty(&meta, &["covenant", "artifact"]);
-    let compiled_cov = rec_nonempty(&meta, &["compiledCovenant"]);
-    let compiled = rec_nonempty(&meta, &["compiledArtifact"]);
-    let source = if artifact.as_object().map(|m| !m.is_empty()).unwrap_or(false) { artifact }
-        else if compiled_cov.as_object().map(|m| !m.is_empty()).unwrap_or(false) { compiled_cov }
-        else { compiled };
+    // covenant: only the fields the minter actually writes (kpr1.rs).
     let covenant = json!({
         "templateId": intent.template_id, "templateVersion": intent.template_version, "scriptHash": intent.script_hash,
-        "artifactId": str_val(at(&source, &["artifactId"])), "artifactScope": str_val(at(&source, &["artifactScope"])),
-        "sourceHash": str_val(at(&source, &["sourceHash"])), "compilerCommit": str_val(at(&source, &["compilerCommit"])),
-        "compilerOutputHash": str_val(at(&source, &["compilerOutputHash"])), "templateStatus": str_val(at(&source, &["templateStatus"])),
-        "approvedSourceHash": str_val(at(&source, &["approvedSourceHash"])),
-        "productionApproved": if source.get("productionApproved").map(|v| v.is_boolean()).unwrap_or(false) { source["productionApproved"].clone() } else { Value::Null },
-        "networkTarget": str_val(at(&source, &["networkTarget"])), "generatedAt": str_val(at(&source, &["generatedAt"])),
     });
 
     // observation summary
@@ -417,7 +399,7 @@ fn build_settlement_proof(state: &AppState, row: &ProofRow, lookup_type: &str, l
     // 3. On-chain settlement facts anyone can independently check.
     let covenant_state = row.covenant_state.clone().unwrap_or_else(|| "pending".into());
     let settled = covenant_state == "settled"
-        || matches!(covenant_state.as_str(), "released" | "captured" | "arbitrated" | "settled_mutual" | "settled_jury")
+        || matches!(covenant_state.as_str(), "released" | "captured" | "arbitrated" | "settled_mutual")
         || row.release_tx_id.is_some();
     let refunded = covenant_state == "refunded" || row.refund_tx_id.is_some();
     let settlement_tx_id = row.release_tx_id.clone().or_else(|| row.refund_tx_id.clone());

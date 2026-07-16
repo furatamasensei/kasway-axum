@@ -32,7 +32,7 @@ pub async fn healthz(
     let row = sqlx::query_as::<_, CheckpointRow>(
         "SELECT id, network, asset_id, source, checkpoint, metadata, created_at, updated_at \
          FROM payment_indexer_checkpoints \
-         WHERE network = 'tn10' AND asset_id = 'KAS' AND source = 'rusty-kaspa-node' \
+         WHERE network = 'tn10' AND asset_id = 'KAS' AND source = 'chain_observer' \
          ORDER BY updated_at DESC, id DESC LIMIT 1",
     )
     .fetch_optional(&state.db.pool)
@@ -44,7 +44,7 @@ pub async fn healthz(
         "status": "ok",
         "network": "tn10",
         "assetId": "KAS",
-        "source": "rusty-kaspa-node",
+        "source": "chain_observer",
         "checkpoint": checkpoint,
     })))
 }

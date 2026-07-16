@@ -7,6 +7,7 @@ use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::handlers::invoices;
 use crate::state::AppState;
 use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_json, to_iso};
+use crate::validate::{atomic_amount, opt_string, parse_atomic_i64, req_int, req_string, validate_enum};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -262,47 +263,6 @@ pub async fn customers_update(auth: AuthMerchant, State(state): State<AppState>,
     Ok(Json(serialize_customer(&load_customer(&state, auth.user_id, &public_id).await?)))
 }
 
-// ---------------- validation helpers ----------------
-
-fn opt_string(body: &Value, key: &str) -> Option<String> {
-    body.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-
-fn req_string(body: &Value, key: &str, min: usize, max: usize, errors: &mut Vec<ValidationFailure>) -> Option<String> {
-    match body.get(key).and_then(|v| v.as_str()) {
-        Some(s) if s.trim().chars().count() >= min && s.trim().chars().count() <= max => Some(s.trim().to_string()),
-        _ => { errors.push(ValidationFailure { message: format!("The {key} field is required"), rule: "required".into(), field: key.into() }); None }
-    }
-}
-
-fn atomic_amount(body: &Value, key: &str, errors: &mut Vec<ValidationFailure>) -> Option<String> {
-    match body.get(key) {
-        Some(Value::String(s)) if is_atomic_amount(s) => Some(s.clone()),
-        _ => { errors.push(ValidationFailure { message: format!("The {key} field format is invalid"), rule: "regex".into(), field: key.into() }); None }
-    }
-}
-
-/// Parse an already-format-validated atomic string, enforcing the i64 range so
-/// an over-range value can't silently become a free (0) plan via `as i64`.
-fn parse_atomic_i64(s: &str) -> Option<i64> {
-    s.parse::<i128>().ok().filter(|v| *v <= i64::MAX as i128).map(|v| v as i64)
-}
-
-fn req_int(body: &Value, key: &str, min: i64, max: i64, errors: &mut Vec<ValidationFailure>) -> Option<i64> {
-    match body.get(key).and_then(|v| v.as_i64()) {
-        Some(n) if n >= min && n <= max => Some(n),
-        _ => { errors.push(ValidationFailure { message: format!("The {key} field is invalid"), rule: "range".into(), field: key.into() }); None }
-    }
-}
-
-fn validate_enum(body: &Value, key: &str, allowed: &[&str], required: bool, errors: &mut Vec<ValidationFailure>) {
-    match body.get(key).and_then(|v| v.as_str()) {
-        Some(s) if allowed.contains(&s) => {}
-        None if !required => {}
-        _ => errors.push(ValidationFailure { message: format!("The selected {key} is invalid"), rule: "enum".into(), field: key.into() }),
-    }
-}
-
 // ================= subscriptions-proper =================
 
 const SUPPORTED_PAYMENT_MODES: &[&str] = &["recurring_invoice", "wallet_autopay"];
@@ -388,15 +348,9 @@ async fn serialize_cycle(state: &AppState, c: &CycleRow) -> AppResult<Value> {
     }))
 }
 
-async fn serialize_subscription(state: &AppState, s: &SubRow, with_cycles: bool) -> AppResult<Value> {
-    let plan = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE id = $1"))
-        .bind(s.subscription_plan_id).fetch_optional(&state.db.pool).await?;
-    let customer = match s.subscription_customer_id {
-        Some(cid) => sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE id = $1"))
-            .bind(cid).fetch_optional(&state.db.pool).await?,
-        None => None,
-    };
-    let mut obj = json!({
+/// The subscription JSON shape shared by the single-row and batched paths.
+fn sub_json(s: &SubRow, plan: Option<&PlanRow>, customer: Option<&CustomerRow>) -> Value {
+    json!({
         "id": s.id,
         "userId": s.user_id,
         "subscriptionPlanId": s.subscription_plan_id,
@@ -414,9 +368,20 @@ async fn serialize_subscription(state: &AppState, s: &SubRow, with_cycles: bool)
         "cancelledAt": s.cancelled_at,
         "createdAt": s.created_at,
         "updatedAt": s.updated_at,
-        "plan": plan.map(|p| serialize_plan(&p)).unwrap_or(Value::Null),
-        "customer": customer.map(|c| serialize_customer(&c)).unwrap_or(Value::Null),
-    });
+        "plan": plan.map(serialize_plan).unwrap_or(Value::Null),
+        "customer": customer.map(serialize_customer).unwrap_or(Value::Null),
+    })
+}
+
+async fn serialize_subscription(state: &AppState, s: &SubRow, with_cycles: bool) -> AppResult<Value> {
+    let plan = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE id = $1"))
+        .bind(s.subscription_plan_id).fetch_optional(&state.db.pool).await?;
+    let customer = match s.subscription_customer_id {
+        Some(cid) => sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE id = $1"))
+            .bind(cid).fetch_optional(&state.db.pool).await?,
+        None => None,
+    };
+    let mut obj = sub_json(s, plan.as_ref(), customer.as_ref());
     if with_cycles {
         let cycles = sqlx::query_as::<_, CycleRow>(&format!(
             "SELECT {CYCLE_COLS} FROM subscription_cycles WHERE subscription_id = $1 ORDER BY period_start DESC, id DESC LIMIT 20"
@@ -524,8 +489,22 @@ pub async fn subs_index(auth: AuthMerchant, State(state): State<AppState>, Query
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions WHERE user_id = $1").bind(auth.user_id).fetch_one(&state.db.pool).await?;
     let rows = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"))
         .bind(auth.user_id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
-    let mut data = Vec::new();
-    for s in &rows { data.push(serialize_subscription(&state, s, false).await?); }
+
+    // Preload the page's plans + customers in two queries instead of 2N.
+    let plan_ids: Vec<i64> = rows.iter().map(|s| s.subscription_plan_id).collect();
+    let customer_ids: Vec<i64> = rows.iter().filter_map(|s| s.subscription_customer_id).collect();
+    let plans: std::collections::HashMap<i64, PlanRow> =
+        sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE id = ANY($1)"))
+            .bind(&plan_ids).fetch_all(&state.db.pool).await?
+            .into_iter().map(|p| (p.id, p)).collect();
+    let customers: std::collections::HashMap<i64, CustomerRow> =
+        sqlx::query_as::<_, CustomerRow>(&format!("SELECT {CUSTOMER_COLS} FROM subscription_customers WHERE id = ANY($1)"))
+            .bind(&customer_ids).fetch_all(&state.db.pool).await?
+            .into_iter().map(|c| (c.id, c)).collect();
+
+    let data: Vec<Value> = rows.iter()
+        .map(|s| sub_json(s, plans.get(&s.subscription_plan_id), s.subscription_customer_id.and_then(|cid| customers.get(&cid))))
+        .collect();
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": data })))
 }
 
@@ -644,12 +623,11 @@ pub async fn subs_invoices(auth: AuthMerchant, State(state): State<AppState>, Pa
         .bind(auth.user_id).bind(sub.id).fetch_one(&state.db.pool).await?;
     let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = $1 AND subscription_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4")
         .bind(auth.user_id).bind(sub.id).bind(per_page).bind((page - 1) * per_page).fetch_all(&state.db.pool).await?;
-    let mut data = Vec::new();
-    for id in ids {
-        let inv = invoices::load_by_id(&state, id).await?;
-        let (items, intent) = invoices::load_relations(&state, inv.id()).await?;
-        data.push(invoices::serialize_invoice(&inv, &items, intent.as_ref()));
-    }
+    let invs = invoices::load_many_by_ids(&state, &ids).await?;
+    let (items_by, intents_by) = invoices::load_relations_many(&state, &ids).await?;
+    let data: Vec<Value> = invs.iter()
+        .map(|inv| invoices::serialize_invoice(inv, items_by.get(&inv.id()).map(Vec::as_slice).unwrap_or(&[]), intents_by.get(&inv.id())))
+        .collect();
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": data })))
 }
 

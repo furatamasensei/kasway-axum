@@ -48,7 +48,6 @@ pub async fn spawn_with_config(mutate: impl FnOnce(&mut AppConfig), clear_intern
     let state = AppState {
         db: db.clone(),
         config: Arc::new(config),
-        events: kasway_api::events::InvoiceEvents::new(),
     };
 
     let app = kasway_api::build_router(state.clone());

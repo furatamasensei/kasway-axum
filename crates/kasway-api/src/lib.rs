@@ -1,8 +1,7 @@
 //! Kasway API — Axum port of the AdonisJS `kasway-v2-api` HTTP surface.
 //!
 //! `build_router` assembles the full route tree (mirroring `start/routes.ts`),
-//! grouped by the same auth tiers. Endpoints are ported tier by tier; see
-//! `ENDPOINTS.md` for the live coverage map.
+//! grouped by the same auth tiers.
 
 pub mod auth;
 pub mod auth_token;
@@ -10,7 +9,6 @@ pub mod chain_observer;
 pub mod chain_source;
 pub mod covenant_keeper;
 pub mod error;
-pub mod events;
 pub mod handlers;
 pub mod kaspa_wrpc;
 pub mod kpr1;
@@ -19,6 +17,7 @@ pub mod rate_limit;
 pub mod state;
 pub mod store_context;
 pub mod util;
+pub(crate) mod validate;
 pub mod webhook_worker;
 
 use axum::extract::DefaultBodyLimit;
@@ -90,8 +89,6 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/media/:id", delete(handlers::medias::destroy))
         // --- Public misc (price) ---
         .route("/api/price", get(handlers::public_misc::price))
-        // Transmit (SSE) routes are added AFTER the global timeout layer below so
-        // the long-lived event stream is exempt from the request timeout.
         // --- Public KPR-1 explorer ---
         .route("/api/explorer/kpr1/intents/:intentId", get(handlers::explorer_kpr1::show_intent))
         .route("/api/explorer/kpr1/intents/:intentId/wallet-verification", get(handlers::explorer_kpr1::wallet_verification))
@@ -249,16 +246,6 @@ pub fn build_router(state: AppState) -> Router {
             axum::http::StatusCode::REQUEST_TIMEOUT,
             std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS),
         ))
-        // SSE routes: merged AFTER the timeout layer so the keep-alive event
-        // stream is never cut by the global request timeout. They still get the
-        // body cap and the outer CORS layer.
-        .merge(
-            Router::new()
-                .route("/__transmit/events", get(handlers::transmit::events))
-                .route("/__transmit/subscribe", post(handlers::transmit::subscribe))
-                .route("/__transmit/unsubscribe", post(handlers::transmit::unsubscribe))
-                .layer(DefaultBodyLimit::max(GLOBAL_BODY_LIMIT)),
-        )
         // Rate limit the whole surface. The public checkout routes are the ones
         // that need it (unauthenticated, keyed only by an invoice id), and there
         // is no reason for an authenticated caller to exceed the budget either.

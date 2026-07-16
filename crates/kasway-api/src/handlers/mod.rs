@@ -13,7 +13,6 @@ pub mod payment_ops_settings;
 pub mod payments_networks;
 pub mod public_misc;
 pub mod regional_pricing;
-pub mod transmit;
 pub mod payment_links;
 pub mod setups;
 pub mod stores;

@@ -1,7 +1,5 @@
-//! Auth extractors mirroring the AdonisJS middleware in `app/middleware/`.
-//!
-//! Phase 1 implements the `internalApiToken()` tier. The merchant (Bearer
-//! access token) and API-key tiers follow as their endpoints are ported.
+//! Auth extractors mirroring the AdonisJS middleware in `app/middleware/`:
+//! the `internalApiToken()` tier and the merchant (Bearer access token) tier.
 
 use crate::auth_token;
 use crate::error::AppError;

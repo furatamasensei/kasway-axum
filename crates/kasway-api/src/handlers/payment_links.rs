@@ -2,11 +2,12 @@
 //! Reusable link templates; each checkout spawns a fresh invoice.
 
 use crate::auth::AuthMerchant;
-use crate::error::{AppError, AppResult, ValidationFailure};
+use crate::error::{AppError, AppResult};
 use crate::handlers::invoices::{self, FEE_DELEGATIONS};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
 use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_json};
+use crate::validate::{opt_string, vpush};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -360,10 +361,6 @@ struct CreateLinkInput {
     customer_country_code: Option<String>,
 }
 
-fn vpush(errors: &mut Vec<ValidationFailure>, field: &str, rule: &str, message: &str) {
-    errors.push(ValidationFailure::new(field, rule, message));
-}
-
 fn validate_create(body: &Value) -> AppResult<CreateLinkInput> {
     let mut errors = Vec::new();
 
@@ -393,16 +390,14 @@ fn validate_create(body: &Value) -> AppResult<CreateLinkInput> {
         return Err(AppError::Validation(errors));
     }
 
-    let opt_string = |key: &str| body.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-
     Ok(CreateLinkInput {
         title: title.unwrap(),
         amount: amount.unwrap(),
         metadata: body.get("metadata").filter(|v| !v.is_null()).cloned(),
-        payment_network: opt_string("paymentNetwork"),
-        payment_asset: opt_string("paymentAsset"),
+        payment_network: opt_string(body, "paymentNetwork"),
+        payment_asset: opt_string(body, "paymentAsset"),
         fee_delegation,
         store_id: body.get("storeId").and_then(|v| v.as_i64()),
-        customer_country_code: opt_string("customerCountryCode").map(|s| s.to_uppercase()),
+        customer_country_code: opt_string(body, "customerCountryCode").map(|s| s.to_uppercase()),
     })
 }

@@ -1,7 +1,5 @@
-//! `/api/payments/ops/{settings,capabilities,confirmation-policy,network-capabilities}`
-//! — PaymentTenantSettingsController + PaymentConfirmationPolicyController +
-//! PaymentNetworkCapabilitiesController.networkCapabilities. Merchant owner
-//! always holds the payments.ops.* permissions.
+//! `/api/payments/ops/confirmation-policy` — PaymentConfirmationPolicyController.
+//! Merchant owner always holds the payments.ops.* permissions.
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult};
@@ -13,76 +11,18 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-const MODULES: &[&str] = &["adjustments", "exports", "webhooks", "notifications", "exceptions", "anomalies", "evidence_packs", "analytics"];
-const NOTIF_CATEGORIES: &[&str] = &["payment_exception_created", "payment_exception_resolved", "payment_anomaly_detected", "webhook_delivery_failed", "webhook_endpoint_paused", "export_succeeded", "export_failed"];
-const ADJUSTMENT_KINDS: &[&str] = &["manual_credit", "write_off", "refund_record", "correction"];
 const POLICY_KEYS: &[&str] = &["version", "defaultConfirmations", "overrides", "riskBoostConfirmations"];
 const PLATFORM_MIN_CONFIRMATIONS: i64 = 10;
 
-#[derive(sqlx::FromRow)]
-struct SettingsRow {
-    enabled_payment_modules: String,
-    allowed_networks: String,
-    allowed_assets: String,
-    default_export_retention_days: i64,
-    webhook_retry_profile: String,
-    exception_notification_categories: String,
-    allowed_manual_adjustment_kinds: String,
-    confirmation_policy: Option<String>,
-}
-
-fn default_exception_categories() -> Value {
-    let mut m = serde_json::Map::new();
-    for c in NOTIF_CATEGORIES { m.insert((*c).into(), json!(true)); }
-    Value::Object(m)
-}
-
-fn settings_view(row: Option<&SettingsRow>) -> Value {
-    match row {
-        None => json!({
-            "enabledPaymentModules": MODULES,
-            "allowedNetworks": ["tn10"],
-            "allowedAssets": ["KAS"],
-            "defaultExportRetentionDays": 7,
-            "webhookRetryProfile": "balanced",
-            "exceptionNotificationCategories": default_exception_categories(),
-            "allowedManualAdjustmentKinds": ADJUSTMENT_KINDS,
-        }),
-        Some(r) => json!({
-            "enabledPaymentModules": parse_arr(&r.enabled_payment_modules),
-            "allowedNetworks": parse_arr(&r.allowed_networks),
-            "allowedAssets": parse_arr(&r.allowed_assets),
-            "defaultExportRetentionDays": r.default_export_retention_days,
-            "webhookRetryProfile": r.webhook_retry_profile,
-            "exceptionNotificationCategories": normalize_categories(&r.exception_notification_categories),
-            "allowedManualAdjustmentKinds": parse_arr(&r.allowed_manual_adjustment_kinds),
-        }),
-    }
-}
-
-fn parse_arr(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| json!([]))
-}
-
-fn normalize_categories(raw: &str) -> Value {
-    let parsed: Value = serde_json::from_str(raw).unwrap_or_else(|_| json!({}));
-    let mut out = serde_json::Map::new();
-    for c in NOTIF_CATEGORIES {
-        let v = parsed.get(*c).and_then(|x| x.as_bool()).unwrap_or(true);
-        out.insert((*c).into(), json!(v));
-    }
-    Value::Object(out)
-}
-
-async fn load_settings(state: &AppState, user_id: i64) -> AppResult<Option<SettingsRow>> {
-    Ok(sqlx::query_as::<_, SettingsRow>(
-        "SELECT enabled_payment_modules, allowed_networks, allowed_assets, default_export_retention_days, \
-         webhook_retry_profile, exception_notification_categories, allowed_manual_adjustment_kinds, confirmation_policy \
-         FROM payment_tenant_settings WHERE user_id = $1",
+/// Stored confirmation policy JSON for a tenant, if any.
+async fn load_policy(state: &AppState, user_id: i64) -> Result<Option<String>, sqlx::Error> {
+    let raw: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT confirmation_policy FROM payment_tenant_settings WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.db.pool)
-    .await?)
+    .await?;
+    Ok(raw.flatten())
 }
 
 // ---------------- confirmation policy ----------------
@@ -167,13 +107,8 @@ pub(crate) async fn required_confirmations_for(
     currency: &str,
     invoice_amount: i128,
 ) -> Result<i64, sqlx::Error> {
-    let raw: Option<Option<String>> = sqlx::query_scalar(
-        "SELECT confirmation_policy FROM payment_tenant_settings WHERE user_id = $1",
-    )
-    .bind(user_id)
-    .fetch_optional(&state.db.pool)
-    .await?;
-    let policy = normalize_policy(raw.flatten().as_deref());
+    let raw = load_policy(state, user_id).await?;
+    let policy = normalize_policy(raw.as_deref());
     let resolved = resolve_policy(&policy, network, asset_id, currency, invoice_amount);
     Ok(resolved
         .get("requiredConfirmations")
@@ -187,8 +122,8 @@ pub async fn confirmation_policy(
     State(state): State<AppState>,
     Query(q): Query<PolicyQuery>,
 ) -> AppResult<Json<Value>> {
-    let row = load_settings(&state, auth.user_id).await?;
-    let policy = normalize_policy(row.as_ref().and_then(|r| r.confirmation_policy.as_deref()));
+    let raw = load_policy(&state, auth.user_id).await?;
+    let policy = normalize_policy(raw.as_deref());
     let network = q.network.clone().unwrap_or_else(|| "tn10".into());
     let asset_id = q.asset_id.clone().unwrap_or_else(|| "KAS".into());
     let currency = q.currency.clone().unwrap_or_else(|| "KAS".into());
@@ -223,8 +158,8 @@ pub async fn update_confirmation_policy(
         return Err(AppError::commerce(422, &format!("Confirmation policy minimum confirmations must be at least {PLATFORM_MIN_CONFIRMATIONS}")));
     }
 
-    let current_row = load_settings(&state, auth.user_id).await?;
-    let current = normalize_policy(current_row.as_ref().and_then(|r| r.confirmation_policy.as_deref()));
+    let raw = load_policy(&state, auth.user_id).await?;
+    let current = normalize_policy(raw.as_deref());
     let next = normalize_policy(Some(&body.to_string()));
     // merge: next fields override current
     let mut merged = current.as_object().cloned().unwrap_or_default();
@@ -235,23 +170,14 @@ pub async fn update_confirmation_policy(
     let merged = Value::Object(merged);
 
     let now = now_iso();
-    let current_view = settings_view(current_row.as_ref());
+    // Every other column has a SQL DEFAULT; only the policy is written here.
     sqlx::query(
-        "INSERT INTO payment_tenant_settings (user_id, enabled_payment_modules, allowed_networks, allowed_assets, \
-         default_export_retention_days, webhook_retry_profile, exception_notification_categories, allowed_manual_adjustment_kinds, confirmation_policy, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+        "INSERT INTO payment_tenant_settings (user_id, confirmation_policy, created_at, updated_at) \
+         VALUES ($1, $2, $3, $3) \
          ON CONFLICT(user_id) DO UPDATE SET confirmation_policy = excluded.confirmation_policy, updated_at = excluded.updated_at",
     )
     .bind(auth.user_id)
-    .bind(current_view["enabledPaymentModules"].to_string())
-    .bind(current_view["allowedNetworks"].to_string())
-    .bind(current_view["allowedAssets"].to_string())
-    .bind(current_view["defaultExportRetentionDays"].as_i64().unwrap_or(7))
-    .bind(current_view["webhookRetryProfile"].as_str().unwrap_or("balanced"))
-    .bind(current_view["exceptionNotificationCategories"].to_string())
-    .bind(current_view["allowedManualAdjustmentKinds"].to_string())
     .bind(merged.to_string())
-    .bind(&now)
     .bind(&now)
     .execute(&state.db.pool)
     .await?;

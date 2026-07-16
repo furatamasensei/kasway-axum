@@ -376,9 +376,6 @@ async fn mark_funded(state: &AppState, c: &Candidate, now: &str) -> Result<(), s
     .bind(c.intent_pk)
     .execute(&state.db.pool)
     .await?;
-    // Publish from the funnel, not from each caller — every path that writes this
-    // state notifies the watchers, and a new path cannot forget to.
-    state.events.publish(&c.public_id, "funded");
     Ok(())
 }
 
@@ -398,7 +395,6 @@ async fn fail_intent(state: &AppState, c: &Candidate, reason: &str, now: &str) -
     .bind(c.intent_pk)
     .execute(&state.db.pool)
     .await?;
-    state.events.publish(&c.public_id, "failed");
 
     let metadata = json!({
         "txId": c.tx_id,

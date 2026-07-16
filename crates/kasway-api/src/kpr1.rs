@@ -184,32 +184,6 @@ pub fn compute_config_commitment(
     sha256_hex(canonicalize(&config).as_bytes())
 }
 
-fn url_host(app_url: &str) -> String {
-    let no_scheme = app_url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(app_url);
-    no_scheme
-        .split(['/', ':'])
-        .next()
-        .unwrap_or(no_scheme)
-        .to_string()
-}
-
-fn form_encode(value: &str) -> String {
-    let mut out = String::new();
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
 // --- setup-driven tax/split config ---
 
 #[derive(sqlx::FromRow)]
@@ -601,7 +575,10 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         // The merchant is the STORE, not the platform. This used to be
         // `cfg.app_name`, so every payment request in every wallet claimed to
         // come from "Kasway".
-        "merchant": { "name": merchant_name, "domain": url_host(&cfg.app_url) },
+        "merchant": {
+            "name": merchant_name,
+            "domain": url::Url::parse(&cfg.app_url).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default(),
+        },
         // Items ride INSIDE the signature. The review screen is what the payer
         // consents to, so what they are buying must be as tamper-proof as the
         // amount — otherwise a compromised API could show one basket and have the
@@ -632,11 +609,12 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     let expires_epoch = chrono::DateTime::parse_from_rfc3339(&expires_at)
         .map(|dt| dt.timestamp())
         .unwrap_or(0);
+    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
     let payment_request_uri = format!(
         "kaspa-payment:v1?request={}&hash={}&network={}&expires={}",
-        form_encode(&payment_intent_url),
-        form_encode(&canonical_hash),
-        form_encode(&ctx.payment_network),
+        enc(&payment_intent_url),
+        enc(&canonical_hash),
+        enc(&ctx.payment_network),
         expires_epoch
     );
 
