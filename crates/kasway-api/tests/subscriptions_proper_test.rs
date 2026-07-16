@@ -48,9 +48,14 @@ async fn subscription_validation_and_archived_plan() {
     assert_eq!(bad.json::<Value>().await.unwrap()["errors"][0]["field"], "planPublicId");
 
     let plan = create_plan(&app, &token).await;
+    // wallet_autopay is a supported creation mode (Subscription Pocket).
     let wa = app.client.post(app.url("/api/commerce/subscriptions")).bearer_auth(&token).json(&json!({ "planPublicId": plan, "paymentMode": "wallet_autopay", "customer": { "email": "a@x.com" } })).send().await.unwrap();
-    assert_eq!(wa.status(), 422);
-    assert_eq!(wa.json::<Value>().await.unwrap()["message"], "wallet_autopay is not supported yet");
+    assert_eq!(wa.status(), 201);
+    assert_eq!(wa.json::<Value>().await.unwrap()["paymentMode"], "wallet_autopay");
+
+    let um = app.client.post(app.url("/api/commerce/subscriptions")).bearer_auth(&token).json(&json!({ "planPublicId": plan, "paymentMode": "carrier_pigeon", "customer": { "email": "a@x.com" } })).send().await.unwrap();
+    assert_eq!(um.status(), 422);
+    assert_eq!(um.json::<Value>().await.unwrap()["message"], "Unsupported subscription payment mode");
 
     let nc = app.client.post(app.url("/api/commerce/subscriptions")).bearer_auth(&token).json(&json!({ "planPublicId": plan })).send().await.unwrap();
     assert_eq!(nc.status(), 422);
