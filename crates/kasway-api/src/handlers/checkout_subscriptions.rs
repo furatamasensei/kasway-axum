@@ -15,11 +15,11 @@ use crate::error::{AppError, AppResult};
 use crate::handlers::checkout::body_str;
 use crate::handlers::subscriptions::cancel_subscription;
 use crate::kaspa_wrpc::KaspaWrpcClient;
-use crate::kpr1::compute_split_plan;
+use crate::kpr1::{self, compute_split_plan};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
 use crate::subscription_keeper::{cell_params, load_cell, CellRow};
-use crate::util::{decode_hex, decode_hex32, encode_hex, now_iso};
+use crate::util::{decode_hex, decode_hex32, encode_hex, now_iso, sha256_hex};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -90,12 +90,187 @@ fn cell_json(cell: &CellRow) -> Value {
     })
 }
 
+/// The per-claim payout split + claim period derived from the plan snapshot and
+/// merchant config — shared by the covenant cell (`autopay_prepare`) and the
+/// signed subscription intent the QR points at.
+struct AutopayPlan {
+    network: String,
+    asset: String,
+    amount: i64,
+    store_id: i64,
+    outputs: Vec<Value>,
+    payouts: Vec<Payout>,
+    period_daa: u64,
+    claim_total: u64,
+    config_commitment: String,
+    interval_unit: String,
+    interval_count: i64,
+}
+
+async fn autopay_plan(state: &AppState, sub: &PublicSub) -> AppResult<AutopayPlan> {
+    let snap = snapshot(sub);
+    let amount: i64 = snap["amount"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .filter(|a| *a > 0)
+        .ok_or_else(|| rerr("Subscription plan snapshot has no valid amount"))?;
+    let network = snap["paymentNetwork"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| state.config.kpr1.default_network.clone());
+    let asset = snap["paymentAsset"].as_str().unwrap_or("KAS").to_string();
+
+    // The exact per-claim payout split the KPR-1 intent minter would pin for an
+    // invoice of this amount (merchant_net, [tax], splits…, kasway_fee).
+    let store_id = resolve_request_store(state, sub.user_id, None).await?;
+    let split = compute_split_plan(state, sub.user_id, Some(store_id), amount as i128).await?;
+    let cfg = &state.config.kpr1;
+    let config_commitment = split.config_commitment(cfg.platform_fee_bps, cfg.platform_fee_flat_sompi);
+    let outputs = split.outputs_json();
+    let mut payouts = Vec::with_capacity(outputs.len());
+    for out in &outputs {
+        let role = out["role"].as_str().unwrap_or_default();
+        let addr = out["address"].as_str().unwrap_or_default();
+        let destination = Destination::parse(addr)
+            .map_err(|e| rerr(format!("{role} payout address is not covenant-compatible: {e}")))?;
+        let value: u64 = out["amountSompi"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| rerr("bad payout amount"))?;
+        payouts.push(Payout { destination, value });
+    }
+    // The exact value one claim removes from the cell: the payout sum
+    // (`SubscriptionV1Params::claim_total` computes the same).
+    let claim_total = payouts
+        .iter()
+        .map(|p| p.value)
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| rerr("subscription claim total overflows"))?;
+
+    // ponytail: interval → days uses coarse 30/365-day months and years; the CSV
+    // claim lock is set to 90% of the interval precisely so this calendar drift
+    // can never delay a due claim. Tighten to real calendar math if periods ever
+    // need to be exact on-chain.
+    let interval_unit = snap["intervalUnit"].as_str().unwrap_or("month").to_string();
+    let interval_count = snap["intervalCount"].as_i64().unwrap_or(1).max(1);
+    let days = match interval_unit.as_str() {
+        "day" => interval_count,
+        "week" => interval_count * 7,
+        "year" => interval_count * 365,
+        _ => interval_count * 30,
+    } as u64;
+    let period_daa = (days * DAA_PER_DAY * 9 / 10).clamp(1, u32::MAX as u64);
+
+    Ok(AutopayPlan {
+        network,
+        asset,
+        amount,
+        store_id,
+        outputs,
+        payouts,
+        period_daa,
+        claim_total,
+        config_commitment,
+        interval_unit,
+        interval_count,
+    })
+}
+
+/// Deterministic signed subscription intent (KPR-1-style): no random ids or
+/// timestamps in the body, so the canonical hash — pinned in the QR — stays
+/// stable while the plan snapshot and merchant rate config are unchanged.
+/// Returns `(signed intent, canonical hash)`.
+async fn build_subscription_intent(state: &AppState, sub: &PublicSub) -> AppResult<(Value, String)> {
+    if sub.status == "cancelled" {
+        return Err(rerr("Subscription is cancelled"));
+    }
+    let plan = autopay_plan(state, sub).await?;
+    let cfg = &state.config.kpr1;
+    // The merchant is the STORE, not the platform (same rule as invoice intents).
+    let merchant_name: String = sqlx::query_scalar("SELECT name FROM stores WHERE id = $1")
+        .bind(plan.store_id)
+        .fetch_optional(&state.db.pool)
+        .await?
+        .unwrap_or_else(|| cfg.app_name.clone());
+    let snap = snapshot(sub);
+    let base = format!("{}/api/checkout/subscriptions/{}", cfg.app_url.trim_end_matches('/'), sub.public_id);
+    let suggested: Vec<Value> = [3u64, 6, 12]
+        .iter()
+        .map(|periods| json!({ "periods": periods, "amountSompi": (plan.claim_total * periods).to_string() }))
+        .collect();
+    let unsigned = json!({
+        "version": "kpr-1",
+        "network": plan.network,
+        "asset": plan.asset,
+        "subscriptionId": sub.public_id,
+        "template": { "id": "subscription_v1", "version": "v1", "kind": "subscription_autopay_covenant" },
+        "amountSompi": plan.amount.to_string(),
+        "claimTotalSompi": plan.claim_total.to_string(),
+        "interval": { "unit": plan.interval_unit, "count": plan.interval_count },
+        "periodDaa": plan.period_daa,
+        "outputs": plan.outputs,
+        "configCommitment": plan.config_commitment,
+        "settlement": { "mode": "covenant", "addressRequiredFromWallet": true },
+        "suggestedFunding": suggested,
+        // Explicit wallet contract: consent → POST prepare {refundAddress} →
+        // fund covenantAddress with a claimTotal multiple → POST record {txId}
+        // → poll status until active.
+        "endpoints": { "status": base, "prepare": format!("{base}/autopay/prepare"), "record": format!("{base}/autopay") },
+        "merchant": {
+            "name": merchant_name,
+            "domain": url::Url::parse(&cfg.app_url).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default(),
+        },
+        "display": {
+            "memo": format!("Subscription {}", snap["name"].as_str().unwrap_or(&sub.public_id)),
+            "planName": snap["name"],
+            "description": snap["description"],
+            "currencyCode": plan.asset,
+        },
+    });
+    let signature_value = kpr1::sign(&kpr1::canonicalize(&unsigned), &cfg.signing_seed);
+    let mut signed = unsigned;
+    signed["signature"] = json!({ "alg": "ed25519", "keyId": cfg.signing_key_id, "value": signature_value });
+    let hash = sha256_hex(kpr1::canonicalize(&signed).as_bytes());
+    Ok((signed, hash))
+}
+
+/// `GET /api/checkout/subscriptions/:publicId/kpr1-intent` — the signed
+/// subscription intent a wallet fetches (and hash-checks) after scanning the QR.
+pub async fn intent(State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
+    let sub = load_public_sub(&state, &public_id).await?;
+    Ok(Json(build_subscription_intent(&state, &sub).await?.0))
+}
+
 /// `GET /api/checkout/subscriptions/:publicId` — public status: plan snapshot,
 /// billing position, and the autopay cell (if prepared).
 pub async fn show(State(state): State<AppState>, Path(public_id): Path<String>) -> AppResult<Json<Value>> {
     let sub = load_public_sub(&state, &public_id).await?;
     let snap = snapshot(&sub);
     let cell = load_cell(&state, sub.id).await?;
+    // QR payload, mirroring the invoice KPR-1 URI. `expires` is QR freshness
+    // only (outside the signed body); `hash` pins the signed intent. Null when
+    // no intent can be minted yet (incomplete merchant setup, cancelled sub) —
+    // show must keep working regardless.
+    let payment_request_uri = match build_subscription_intent(&state, &sub).await {
+        Ok((signed, hash)) => {
+            let cfg = &state.config.kpr1;
+            let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+            let intent_url = format!(
+                "{}/api/checkout/subscriptions/{}/kpr1-intent",
+                cfg.app_url.trim_end_matches('/'),
+                sub.public_id
+            );
+            let network = signed["network"].as_str().unwrap_or_default().to_string();
+            Some(format!(
+                "kaspa-payment:v1?request={}&hash={}&network={}&expires={}",
+                enc(&intent_url),
+                enc(&hash),
+                enc(&network),
+                chrono::Utc::now().timestamp() + 900
+            ))
+        }
+        Err(e) => {
+            tracing::debug!("subscription {} has no mintable intent: {e:?}", sub.public_id);
+            None
+        }
+    };
     Ok(Json(json!({
         "publicId": sub.public_id,
         "status": sub.status,
@@ -114,6 +289,7 @@ pub async fn show(State(state): State<AppState>, Path(public_id): Path<String>) 
         },
         "cell": cell.as_ref().map(cell_json),
         "cancelChallengeHex": encode_hex(&cancel_challenge(&sub.public_id)),
+        "paymentRequestUri": payment_request_uri,
     })))
 }
 
@@ -147,52 +323,14 @@ pub async fn autopay_prepare(
         return Err(rerr("Subscription autopay is not available (keeper is not configured)"));
     };
 
-    let snap = snapshot(&sub);
-    let amount: i64 = snap["amount"]
-        .as_str()
-        .and_then(|s| s.parse().ok())
-        .filter(|a| *a > 0)
-        .ok_or_else(|| rerr("Subscription plan snapshot has no valid amount"))?;
-    let network = snap["paymentNetwork"]
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| state.config.kpr1.default_network.clone());
-    let prefix = network_prefix(&network).map_err(|e| rerr(e.to_string()))?;
-
-    // The exact per-claim payout split the KPR-1 intent minter would pin for an
-    // invoice of this amount (merchant_net, [tax], splits…, kasway_fee).
-    let store_id = resolve_request_store(&state, sub.user_id, None).await?;
-    let split = compute_split_plan(&state, sub.user_id, Some(store_id), amount as i128).await?;
-    let outputs = split.outputs_json();
-    let mut payouts = Vec::with_capacity(outputs.len());
-    for out in &outputs {
-        let role = out["role"].as_str().unwrap_or_default();
-        let addr = out["address"].as_str().unwrap_or_default();
-        let destination = Destination::parse(addr)
-            .map_err(|e| rerr(format!("{role} payout address is not covenant-compatible: {e}")))?;
-        let value: u64 = out["amountSompi"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| rerr("bad payout amount"))?;
-        payouts.push(Payout { destination, value });
-    }
-
-    // ponytail: interval → days uses coarse 30/365-day months and years; the CSV
-    // claim lock is set to 90% of the interval precisely so this calendar drift
-    // can never delay a due claim. Tighten to real calendar math if periods ever
-    // need to be exact on-chain.
-    let unit = snap["intervalUnit"].as_str().unwrap_or("month");
-    let count = snap["intervalCount"].as_i64().unwrap_or(1).max(1) as u64;
-    let days = match unit {
-        "day" => count,
-        "week" => count * 7,
-        "year" => count * 365,
-        _ => count * 30,
-    };
-    let period_daa = (days * DAA_PER_DAY * 9 / 10).clamp(1, u32::MAX as u64);
+    let plan = autopay_plan(&state, &sub).await?;
+    let prefix = network_prefix(&plan.network).map_err(|e| rerr(e.to_string()))?;
 
     let mut params = SubscriptionV1Params {
-        payouts,
+        payouts: plan.payouts,
         keeper_pubkey: keeper.x_only_pubkey(),
         customer,
-        period_daa,
+        period_daa: plan.period_daa,
         sweep_threshold: 0, // claim_total ignores it; set right below
     };
     let claim_total = params.claim_total().map_err(|e| rerr(e.to_string()))?;
@@ -204,9 +342,9 @@ pub async fn autopay_prepare(
     let redeem_hex = encode_hex(&compiled.script);
 
     let params_json = json!({
-        "network": network,
-        "payouts": outputs,
-        "periodDaa": period_daa,
+        "network": plan.network,
+        "payouts": plan.outputs,
+        "periodDaa": params.period_daa,
         "sweepThreshold": params.sweep_threshold,
         "keeperPubkey": encode_hex(&params.keeper_pubkey),
         "customer": refund_address,
@@ -224,7 +362,7 @@ pub async fn autopay_prepare(
     )
     .bind(sub.id)
     .bind(sub.user_id)
-    .bind(&network)
+    .bind(&plan.network)
     .bind(&address)
     .bind(params_json.to_string())
     .bind(claim_total as i64)

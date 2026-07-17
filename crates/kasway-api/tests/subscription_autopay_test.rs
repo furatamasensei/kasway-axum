@@ -462,6 +462,156 @@ async fn underfunded_due_cycle_goes_past_due_exactly_once() {
     assert_eq!(cell_state, "past_due");
 }
 
+// ---------------------------------------------------------------------------
+// QR intent + pending → funded activation.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn subscription_intent_is_deterministic_signed_and_pinned_by_show() {
+    let app = autopay_app().await;
+    let token = merchant_with_real_setup(&app, "qr1@example.com").await;
+    let plan = create_plan(&app, &token, "month").await;
+    let sub = create_sub(&app, &token, &plan, json!({ "paymentMode": "wallet_autopay" })).await;
+    let pid = sub["publicId"].as_str().unwrap();
+
+    // wallet_autopay starts as an unconsented offer: pending, unbilled.
+    assert_eq!(sub["status"], "pending");
+    assert!(sub["nextBillingAt"].is_null());
+    assert_eq!(sub["cycles"].as_array().unwrap().len(), 0);
+
+    let fetch = || async {
+        let res = app
+            .client
+            .get(app.url(&format!("/api/checkout/subscriptions/{pid}/kpr1-intent")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        res.json::<Value>().await.unwrap()
+    };
+    let intent = fetch().await;
+    assert_eq!(intent, fetch().await, "intent must be deterministic");
+
+    assert_eq!(intent["template"]["id"], "subscription_v1");
+    assert_eq!(intent["subscriptionId"].as_str().unwrap(), pid);
+    assert_eq!(intent["amountSompi"], "500000000");
+    assert_eq!(intent["claimTotalSompi"], "500000000");
+    assert_eq!(intent["interval"]["unit"], "month");
+    assert_eq!(intent["periodDaa"].as_u64().unwrap(), 30 * 864_000 * 9 / 10);
+    assert_eq!(intent["suggestedFunding"][0]["periods"], 3);
+    assert_eq!(intent["suggestedFunding"][0]["amountSompi"], "1500000000");
+    assert!(intent["endpoints"]["prepare"]
+        .as_str()
+        .unwrap()
+        .ends_with(&format!("/api/checkout/subscriptions/{pid}/autopay/prepare")));
+    let roles: Vec<&str> = intent["outputs"].as_array().unwrap().iter().map(|o| o["role"].as_str().unwrap()).collect();
+    assert_eq!(roles, ["merchant_net", "kasway_fee"]);
+    assert_eq!(intent["configCommitment"].as_str().unwrap().len(), 64);
+
+    // The ed25519 signature covers the canonical unsigned body.
+    let mut unsigned = intent.clone();
+    let sig = unsigned.as_object_mut().unwrap().remove("signature").unwrap();
+    let message = kasway_api::kpr1::canonicalize(&unsigned);
+    assert!(kasway_api::kpr1::verify_intent_signature(
+        &app.state.config.kpr1.signing_seed,
+        &message,
+        sig["value"].as_str().unwrap(),
+    ));
+
+    // show's QR URI pins the canonical hash of the SIGNED intent.
+    let show: Value = app
+        .client
+        .get(app.url(&format!("/api/checkout/subscriptions/{pid}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uri = show["paymentRequestUri"].as_str().unwrap();
+    let hash = kasway_api::util::sha256_hex(kasway_api::kpr1::canonicalize(&intent).as_bytes());
+    assert!(uri.starts_with("kaspa-payment:v1?request="), "got {uri}");
+    assert!(uri.contains("kpr1-intent"), "got {uri}");
+    assert!(uri.contains(&format!("hash={hash}")), "got {uri}");
+}
+
+#[tokio::test]
+async fn cancelled_subscription_has_no_intent_or_qr() {
+    let app = autopay_app().await;
+    let token = merchant_with_real_setup(&app, "qr2@example.com").await;
+    let plan = create_plan(&app, &token, "month").await;
+    let sub = create_sub(&app, &token, &plan, json!({ "paymentMode": "wallet_autopay" })).await;
+    let pid = sub["publicId"].as_str().unwrap();
+
+    // Pending + unfunded → cancellable on the publicId capability alone.
+    let res = app
+        .client
+        .post(app.url(&format!("/api/checkout/subscriptions/{pid}/cancel")))
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = app
+        .client
+        .get(app.url(&format!("/api/checkout/subscriptions/{pid}/kpr1-intent")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 422);
+    let show: Value = app
+        .client
+        .get(app.url(&format!("/api/checkout/subscriptions/{pid}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(show["paymentRequestUri"].is_null());
+}
+
+#[tokio::test]
+async fn first_recognized_funding_activates_a_pending_subscription() {
+    let app = autopay_app().await;
+    let token = merchant_with_real_setup(&app, "qr3@example.com").await;
+    let plan = create_plan(&app, &token, "month").await;
+    let sub = create_sub(&app, &token, &plan, json!({ "paymentMode": "wallet_autopay" })).await;
+    let pid = sub["publicId"].as_str().unwrap();
+    let sub_id = sub["id"].as_i64().unwrap();
+
+    // Pending: the biller must not bill it.
+    assert_eq!(kasway_api::subscription_biller::run_tick(&app.state).await.unwrap(), 0);
+
+    // What the keeper calls when it first recognizes cell funding.
+    assert!(kasway_api::subscription_keeper::activate_pending_subscription(&app.state, sub_id).await.unwrap());
+
+    let (status, next): (String, Option<String>) =
+        sqlx::query_as("SELECT status, next_billing_at FROM subscriptions WHERE id = $1")
+            .bind(sub_id)
+            .fetch_one(&app.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "active");
+    assert!(next.unwrap() > kasway_api::util::now_iso(), "billing anchored at activation, advanced one period");
+
+    // First period billed immediately (claimable by the keeper's same tick).
+    let (cy_status, invoice_id): (String, Option<i64>) =
+        sqlx::query_as("SELECT status, invoice_id FROM subscription_cycles WHERE subscription_id = $1")
+            .bind(sub_id)
+            .fetch_one(&app.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(cy_status, "invoiced");
+    assert!(invoice_id.is_some());
+    assert_eq!(event_count(&app, "subscription.activated", pid).await, 1);
+
+    // Idempotent: an already-active subscription is untouched.
+    assert!(!kasway_api::subscription_keeper::activate_pending_subscription(&app.state, sub_id).await.unwrap());
+    assert_eq!(event_count(&app, "subscription.activated", pid).await, 1);
+}
+
 #[tokio::test]
 async fn merchant_lifecycle_endpoints_emit_subscription_events() {
     let app = common::spawn_app().await;

@@ -130,7 +130,7 @@ pub fn canonicalize(value: &Value) -> String {
     serde_json::to_string(value).expect("canonicalize")
 }
 
-fn sign(message: &str, seed: &[u8; 32]) -> String {
+pub(crate) fn sign(message: &str, seed: &[u8; 32]) -> String {
     let key = SigningKey::from_bytes(seed);
     B64.encode(key.sign(message.as_bytes()).to_bytes())
 }
@@ -346,6 +346,20 @@ impl SplitPlan {
         self.split_outs.iter().map(|s| (s.identifier.clone(), s.address.clone(), s.bps)).collect()
     }
 
+    /// The rate-config commitment for this plan under the given platform fee.
+    pub(crate) fn config_commitment(&self, platform_fee_bps: i64, platform_fee_flat_sompi: i64) -> String {
+        compute_config_commitment(
+            &self.merchant_address,
+            self.tax.enabled,
+            self.tax.bps,
+            self.tax.address.as_deref(),
+            &self.commitment_splits(),
+            platform_fee_bps,
+            platform_fee_flat_sompi,
+            &self.platform_fee_address,
+        )
+    }
+
     /// The ordered outputs JSON (`[{ role, address, amountSompi, ... }]`) stored
     /// in `required_outputs` and parseable by `parse_required_outputs`.
     pub(crate) fn outputs_json(&self) -> Vec<Value> {
@@ -525,16 +539,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     // fee) so the customer can verify it was not swapped before this intent was
     // minted. Bound into the signed intent below (and thus into its canonical
     // hash and the covenant the customer funds).
-    let config_commitment = compute_config_commitment(
-        &plan.merchant_address,
-        plan.tax.enabled,
-        plan.tax.bps,
-        plan.tax.address.as_deref(),
-        &plan.commitment_splits(),
-        cfg.platform_fee_bps,
-        cfg.platform_fee_flat_sompi,
-        &plan.platform_fee_address,
-    );
+    let config_commitment = plan.config_commitment(cfg.platform_fee_bps, cfg.platform_fee_flat_sompi);
 
     // intentId: kpr1_<16 random bytes hex>
     let mut id_bytes = [0u8; 16];

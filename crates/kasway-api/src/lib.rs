@@ -194,6 +194,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         // --- Public checkout: Subscription Pocket autopay ---
         .route("/api/checkout/subscriptions/:publicId", get(handlers::checkout_subscriptions::show))
+        .route("/api/checkout/subscriptions/:publicId/kpr1-intent", get(handlers::checkout_subscriptions::intent))
         .route("/api/checkout/subscriptions/:publicId/autopay/prepare", post(handlers::checkout_subscriptions::autopay_prepare))
         .route("/api/checkout/subscriptions/:publicId/autopay", post(handlers::checkout_subscriptions::autopay_record))
         .route("/api/checkout/subscriptions/:publicId/cancel", post(handlers::checkout_subscriptions::cancel))

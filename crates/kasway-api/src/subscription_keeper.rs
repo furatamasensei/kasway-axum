@@ -44,6 +44,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
 #[derive(sqlx::FromRow)]
 pub(crate) struct CellRow {
     pub(crate) id: i64,
+    pub(crate) subscription_id: i64,
     pub(crate) covenant_address: String,
     pub(crate) params_json: String,
     pub(crate) claim_total: i64,
@@ -59,7 +60,7 @@ pub(crate) struct CellRow {
     pub(crate) withdraw_sighash: Option<String>,
 }
 
-pub(crate) const CELL_COLS: &str = "id, covenant_address, params_json, claim_total, \
+pub(crate) const CELL_COLS: &str = "id, subscription_id, covenant_address, params_json, claim_total, \
     refund_address, state, recorded_funding_txids, active_outpoint_txid, active_outpoint_index, \
     active_amount, last_claim_tx_id, last_claim_at, withdraw_destination, withdraw_sighash";
 
@@ -180,9 +181,50 @@ async fn recognize_cells(state: &AppState, client: &KaspaWrpcClient) -> Result<u
         .execute(&state.db.pool)
         .await?;
         tracing::info!("subscription keeper: cell {} recognized funding {hex}:{index} ({value} sompi)", cell.id);
+        // First funding of a pending (QR-flow) subscription activates it —
+        // billing anchors here, and `claim_due` later in this same tick can
+        // already claim the first period.
+        if let Err(err) = activate_pending_subscription(state, cell.subscription_id).await {
+            tracing::warn!("subscription keeper: activating subscription {} failed: {err:?}", cell.subscription_id);
+        }
         changed += 1;
     }
     Ok(changed)
+}
+
+/// Flip a `pending` (wallet_autopay, never funded) subscription to `active`,
+/// anchor billing at this moment, and bill the first period immediately.
+/// No-op (`Ok(false)`) unless the subscription is `pending`. DB-only —
+/// unit-testable without RPC.
+pub async fn activate_pending_subscription(state: &AppState, subscription_id: i64) -> AppResult<bool> {
+    let now = chrono::Utc::now();
+    let flipped = sqlx::query(
+        "UPDATE subscriptions SET status = 'active', next_billing_at = $1, updated_at = $1 WHERE id = $2 AND status = 'pending'",
+    )
+    .bind(crate::util::to_iso(now))
+    .bind(subscription_id)
+    .execute(&state.db.pool)
+    .await?;
+    if flipped.rows_affected() == 0 {
+        return Ok(false);
+    }
+    crate::handlers::subscriptions::generate_due_invoice(state, subscription_id, now).await?;
+    let row: Option<(i64, String)> = sqlx::query_as("SELECT user_id, public_id FROM subscriptions WHERE id = $1")
+        .bind(subscription_id)
+        .fetch_optional(&state.db.pool)
+        .await?;
+    if let Some((user_id, public_id)) = row {
+        let payload = json!({ "publicId": public_id, "status": "active" });
+        if let Err(e) = crate::handlers::webhooks::emit_event(
+            state, user_id, None, "subscription.activated", "subscription", &public_id, &payload,
+        )
+        .await
+        {
+            tracing::warn!("subscription.activated emit failed for {public_id}: {e}");
+        }
+        tracing::info!("subscription keeper: subscription {public_id} activated on first funding");
+    }
+    Ok(true)
 }
 
 /// A cell with a due, still-open cycle to claim (or to mark past due).

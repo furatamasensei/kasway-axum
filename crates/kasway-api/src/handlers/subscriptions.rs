@@ -577,12 +577,18 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
     });
     let now_s = now_iso();
     let public_id = format!("sub_{}", random_hex(16));
-    let sub_id: i64 = sqlx::query_scalar::<_, i64>("INSERT INTO subscriptions (user_id, subscription_plan_id, subscription_customer_id, public_id, external_id, status, payment_mode, plan_snapshot, next_billing_at, metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, $9, $10, $11) RETURNING id")
-        .bind(auth.user_id).bind(plan.id).bind(customer_id).bind(&public_id).bind(&external_id).bind(&payment_mode)
-        .bind(snapshot.to_string()).bind(to_iso(starts_at)).bind(body.get("metadata").filter(|v| !v.is_null()).map(|m| m.to_string()))
+    // wallet_autopay: the subscription is an offer until the customer funds the
+    // covenant cell — created 'pending' with no billing anchor; the keeper
+    // activates it (and anchors billing) when it first recognizes funding.
+    let autopay = payment_mode == "wallet_autopay";
+    let status = if autopay { "pending" } else { "active" };
+    let next_billing_at = if autopay { None } else { Some(to_iso(starts_at)) };
+    let sub_id: i64 = sqlx::query_scalar::<_, i64>("INSERT INTO subscriptions (user_id, subscription_plan_id, subscription_customer_id, public_id, external_id, status, payment_mode, plan_snapshot, next_billing_at, metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id")
+        .bind(auth.user_id).bind(plan.id).bind(customer_id).bind(&public_id).bind(&external_id).bind(status).bind(&payment_mode)
+        .bind(snapshot.to_string()).bind(next_billing_at).bind(body.get("metadata").filter(|v| !v.is_null()).map(|m| m.to_string()))
         .bind(&now_s).bind(&now_s).fetch_one(&state.db.pool).await?;
 
-    if starts_at <= now {
+    if !autopay && starts_at <= now {
         generate_due_invoice(&state, sub_id, now).await?;
     }
 
