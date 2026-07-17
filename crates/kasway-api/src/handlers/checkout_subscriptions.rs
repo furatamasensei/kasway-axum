@@ -136,13 +136,9 @@ async fn autopay_plan(state: &AppState, sub: &PublicSub) -> AppResult<AutopayPla
         let value: u64 = out["amountSompi"].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| rerr("bad payout amount"))?;
         payouts.push(Payout { destination, value });
     }
-    // The exact value one claim removes from the cell: the payout sum
-    // (`SubscriptionV1Params::claim_total` computes the same).
-    let claim_total = payouts
-        .iter()
-        .map(|p| p.value)
-        .try_fold(0u64, u64::checked_add)
-        .ok_or_else(|| rerr("subscription claim total overflows"))?;
+    // One claim removes exactly the payout sum, which is `amount` by
+    // construction (`compute_split_plan`: merchant_net = amount − fees − splits).
+    let claim_total = amount as u64;
 
     // ponytail: interval → days uses coarse 30/365-day months and years; the CSV
     // claim lock is set to 90% of the interval precisely so this calendar drift
@@ -173,6 +169,14 @@ async fn autopay_plan(state: &AppState, sub: &PublicSub) -> AppResult<AutopayPla
     })
 }
 
+/// The funding sizes a wallet offers the customer: N periods × one claim.
+fn suggested_funding(claim_total: u64) -> Vec<Value> {
+    [3u64, 6, 12]
+        .iter()
+        .map(|periods| json!({ "periods": periods, "amountSompi": (claim_total * periods).to_string() }))
+        .collect()
+}
+
 /// Deterministic signed subscription intent (KPR-1-style): no random ids or
 /// timestamps in the body, so the canonical hash — pinned in the QR — stays
 /// stable while the plan snapshot and merchant rate config are unchanged.
@@ -191,10 +195,6 @@ async fn build_subscription_intent(state: &AppState, sub: &PublicSub) -> AppResu
         .unwrap_or_else(|| cfg.app_name.clone());
     let snap = snapshot(sub);
     let base = format!("{}/api/checkout/subscriptions/{}", cfg.app_url.trim_end_matches('/'), sub.public_id);
-    let suggested: Vec<Value> = [3u64, 6, 12]
-        .iter()
-        .map(|periods| json!({ "periods": periods, "amountSompi": (plan.claim_total * periods).to_string() }))
-        .collect();
     let unsigned = json!({
         "version": "kpr-1",
         "network": plan.network,
@@ -208,7 +208,7 @@ async fn build_subscription_intent(state: &AppState, sub: &PublicSub) -> AppResu
         "outputs": plan.outputs,
         "configCommitment": plan.config_commitment,
         "settlement": { "mode": "covenant", "addressRequiredFromWallet": true },
-        "suggestedFunding": suggested,
+        "suggestedFunding": suggested_funding(plan.claim_total),
         // Explicit wallet contract: consent → POST prepare {refundAddress} →
         // fund covenantAddress with a claimTotal multiple → POST record {txId}
         // → poll status until active.
@@ -250,19 +250,13 @@ pub async fn show(State(state): State<AppState>, Path(public_id): Path<String>) 
     // show must keep working regardless.
     let payment_request_uri = match build_subscription_intent(&state, &sub).await {
         Ok((signed, hash)) => {
-            let cfg = &state.config.kpr1;
             let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-            let intent_url = format!(
-                "{}/api/checkout/subscriptions/{}/kpr1-intent",
-                cfg.app_url.trim_end_matches('/'),
-                sub.public_id
-            );
-            let network = signed["network"].as_str().unwrap_or_default().to_string();
+            let intent_url = format!("{}/kpr1-intent", signed["endpoints"]["status"].as_str().unwrap_or_default());
             Some(format!(
                 "kaspa-payment:v1?request={}&hash={}&network={}&expires={}",
                 enc(&intent_url),
                 enc(&hash),
-                enc(&network),
+                enc(signed["network"].as_str().unwrap_or_default()),
                 chrono::Utc::now().timestamp() + 900
             ))
         }
@@ -333,7 +327,7 @@ pub async fn autopay_prepare(
         period_daa: plan.period_daa,
         sweep_threshold: 0, // claim_total ignores it; set right below
     };
-    let claim_total = params.claim_total().map_err(|e| rerr(e.to_string()))?;
+    let claim_total = plan.claim_total;
     // Sweep leftovers below 10% of one claim: too small to ever fund a period.
     params.sweep_threshold = (claim_total / 10).max(1);
 
@@ -371,16 +365,12 @@ pub async fn autopay_prepare(
     .execute(&state.db.pool)
     .await?;
 
-    let suggested: Vec<Value> = [3u64, 6, 12]
-        .iter()
-        .map(|periods| json!({ "periods": periods, "amountSompi": (claim_total * periods).to_string() }))
-        .collect();
     Ok(Json(json!({
         "covenantAddress": address,
         "redeemScriptHex": redeem_hex,
         "claimTotal": claim_total.to_string(),
         "params": params_json,
-        "suggestedFunding": suggested,
+        "suggestedFunding": suggested_funding(claim_total),
         "note": "fund covenantAddress with a multiple of claimTotal, then POST the funding txId to /autopay; only declared txids are recognized as cell funds",
     })))
 }

@@ -198,32 +198,25 @@ async fn recognize_cells(state: &AppState, client: &KaspaWrpcClient) -> Result<u
 /// unit-testable without RPC.
 pub async fn activate_pending_subscription(state: &AppState, subscription_id: i64) -> AppResult<bool> {
     let now = chrono::Utc::now();
-    let flipped = sqlx::query(
-        "UPDATE subscriptions SET status = 'active', next_billing_at = $1, updated_at = $1 WHERE id = $2 AND status = 'pending'",
+    let flipped: Option<(i64, String)> = sqlx::query_as(
+        "UPDATE subscriptions SET status = 'active', next_billing_at = $1, updated_at = $1 \
+         WHERE id = $2 AND status = 'pending' RETURNING user_id, public_id",
     )
     .bind(crate::util::to_iso(now))
     .bind(subscription_id)
-    .execute(&state.db.pool)
+    .fetch_optional(&state.db.pool)
     .await?;
-    if flipped.rows_affected() == 0 {
-        return Ok(false);
-    }
+    let Some((user_id, public_id)) = flipped else { return Ok(false) };
     crate::handlers::subscriptions::generate_due_invoice(state, subscription_id, now).await?;
-    let row: Option<(i64, String)> = sqlx::query_as("SELECT user_id, public_id FROM subscriptions WHERE id = $1")
-        .bind(subscription_id)
-        .fetch_optional(&state.db.pool)
-        .await?;
-    if let Some((user_id, public_id)) = row {
-        let payload = json!({ "publicId": public_id, "status": "active" });
-        if let Err(e) = crate::handlers::webhooks::emit_event(
-            state, user_id, None, "subscription.activated", "subscription", &public_id, &payload,
-        )
-        .await
-        {
-            tracing::warn!("subscription.activated emit failed for {public_id}: {e}");
-        }
-        tracing::info!("subscription keeper: subscription {public_id} activated on first funding");
+    let payload = json!({ "publicId": public_id, "status": "active" });
+    if let Err(e) = crate::handlers::webhooks::emit_event(
+        state, user_id, None, "subscription.activated", "subscription", &public_id, &payload,
+    )
+    .await
+    {
+        tracing::warn!("subscription.activated emit failed for {public_id}: {e}");
     }
+    tracing::info!("subscription keeper: subscription {public_id} activated on first funding");
     Ok(true)
 }
 
