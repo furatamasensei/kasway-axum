@@ -1045,32 +1045,15 @@ fn load_dotenv() {
     }
 }
 
-/// Create `db_name` on the local PostgreSQL server and connect+migrate.
+/// Create `db_name` on the smoke PostgreSQL server and connect+migrate. Shares
+/// the test harness's `connect_fresh`, so smoke databases are reclaimed by the
+/// same sweeper (this run keeps its own database for inspection).
 async fn fresh_db(db_name: &str) -> Result<kasway_db::Db, String> {
-    use std::str::FromStr;
     let base = std::env::var("SMOKE_DATABASE_URL")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "postgres://postgres:postgres@localhost:5432/kasway".to_string());
-    let opts = sqlx::postgres::PgConnectOptions::from_str(&base).map_err(es)?;
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(opts.clone().database("postgres"))
-        .await
-        .map_err(es)?;
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
-        .execute(&admin)
-        .await
-        .map_err(es)?;
-    admin.close().await;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect_with(opts.database(db_name))
-        .await
-        .map_err(es)?;
-    let db = kasway_db::Db { pool };
-    db.migrate().await.map_err(es)?;
-    Ok(db)
+    kasway_db::Db::connect_fresh(&base, db_name).await.map_err(es)
 }
 
 async fn post(

@@ -8,5 +8,9 @@ target/
 .claude/
 .worktreeinclude
 
+# Shared build cache config. Must stay untracked — a committed copy would be
+# checked out into every worktree and defeat the sharing. See .cargo/config.toml.
+.cargo/
+
 # Code-intelligence tool cache (understand)
 .ua/
