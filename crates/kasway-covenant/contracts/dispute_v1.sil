@@ -1,0 +1,59 @@
+pragma silverscript ^0.1.0;
+
+// Terminal dispute covenant selected and committed before escrow funding.
+// The evaluator signs the spending transaction, so it can authorize only one
+// exact release/refund output set and always receives the pre-agreed fixed fee.
+contract DisputeV1(
+    byte[32][] payout_payloads,
+    int[] payout_kinds,
+    int[] payout_values,
+    int payout_count,
+    byte[32] customer_pubkey,
+    byte[32] merchant_pubkey,
+    byte[32] evaluator_pubkey,
+    byte[32] reward_payload,
+    int reward_kind,
+    int gross_amount,
+    int evaluator_fee
+) {
+    function assert_total() {
+        require(tx.inputs[this.activeInputIndex].value == gross_amount + evaluator_fee);
+    }
+
+    function assert_reward(int output_index) {
+        byte[] reward_spk = reward_kind == 0
+            ? byte[](new ScriptPubKeyP2PK(pubkey(reward_payload)))
+            : byte[](new ScriptPubKeyP2SH(reward_payload));
+        require(tx.outputs[output_index].scriptPubKey == reward_spk);
+        require(tx.outputs[output_index].value == evaluator_fee);
+    }
+
+    entrypoint function release_by_evaluator(sig evaluator_sig) {
+        require(checkSig(evaluator_sig, pubkey(evaluator_pubkey)));
+        assert_total();
+        for (i, 0, payout_count, 8) {
+            byte[] spk = payout_kinds[i] == 0
+                ? byte[](new ScriptPubKeyP2PK(pubkey(payout_payloads[i])))
+                : byte[](new ScriptPubKeyP2SH(payout_payloads[i]));
+            require(tx.outputs[i].scriptPubKey == spk);
+            require(tx.outputs[i].value == payout_values[i]);
+        }
+        assert_reward(payout_count);
+    }
+
+    entrypoint function refund_by_evaluator(sig evaluator_sig) {
+        require(checkSig(evaluator_sig, pubkey(evaluator_pubkey)));
+        assert_total();
+        require(tx.outputs[0].scriptPubKey == byte[](new ScriptPubKeyP2PK(pubkey(customer_pubkey))));
+        require(tx.outputs[0].value == gross_amount);
+        assert_reward(1);
+    }
+
+    // A dead or unavailable evaluator cannot decide by timeout. Customer and
+    // seller retain an always-available jointly signed settlement escape hatch.
+    entrypoint function release_settled(sig customer_sig, sig merchant_sig) {
+        assert_total();
+        require(checkSig(customer_sig, pubkey(customer_pubkey)));
+        require(checkSig(merchant_sig, pubkey(merchant_pubkey)));
+    }
+}

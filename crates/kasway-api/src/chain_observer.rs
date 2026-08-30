@@ -117,6 +117,7 @@ struct Candidate {
     script_hash: String,
     covenant_address: Option<String>,
     gross_amount: Option<i64>,
+    evaluator_fee_sompi: Option<i64>,
     public_id: String,
     currency: String,
     total_amount: i64,
@@ -130,7 +131,7 @@ pub async fn run_tick<S: ChainSource>(state: &AppState, source: &S) -> Result<us
     let candidates = sqlx::query_as::<_, Candidate>(
         "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, i.intent_id, \
                 i.tx_id, i.network, i.asset_id, i.script_hash, \
-                i.covenant_address, i.gross_amount, \
+                i.covenant_address, i.gross_amount, i.evaluator_fee_sompi, \
                 inv.public_id, inv.currency, inv.total_amount \
          FROM kpr1_payment_intents i \
          JOIN invoices inv ON inv.id = i.invoice_id \
@@ -220,17 +221,18 @@ async fn observe_candidate<S: ChainSource>(
     let metadata = covenant_observation_metadata(c, &covenant_address, funded, &tx);
     let now = now_iso();
 
-    if funded != gross {
+    let expected = gross.saturating_add(c.evaluator_fee_sompi.unwrap_or(0));
+    if funded != expected {
         // Wrong-valued funding: fail closed with a stable reason + anomaly signal.
-        let reason = if funded < gross { "covenant_underfunded" } else { "covenant_overfunded" };
+        let reason = if funded < expected { "covenant_underfunded" } else { "covenant_overfunded" };
         upsert_observation(state, c, "mismatched", funded, confirmations, &tx, &metadata, &now).await?;
         fail_intent(state, c, reason, &now).await?;
         tracing::warn!(
-            "chain observer: covenant intent {} tx {} funded {} != gross {} ({reason})",
+            "chain observer: covenant intent {} tx {} funded {} != required covenant value {} ({reason})",
             c.intent_id,
             c.tx_id,
             kas(funded),
-            kas(gross)
+            kas(expected)
         );
         return Ok(Progress::Advanced);
     }
@@ -367,6 +369,7 @@ async fn mark_verified(state: &AppState, c: &Candidate, now: &str) -> Result<(),
 /// OPEN — the covenant keeper releases the split (or auto-refunds after expiry)
 /// and only then closes the invoice.
 async fn mark_funded(state: &AppState, c: &Candidate, now: &str) -> Result<(), sqlx::Error> {
+    let mut tx = state.db.pool.begin().await?;
     sqlx::query(
         "UPDATE kpr1_payment_intents SET covenant_state = 'funded', status = 'verified', \
          verification_status = 'verified', observed_at = COALESCE(observed_at, $1), \
@@ -374,8 +377,13 @@ async fn mark_funded(state: &AppState, c: &Candidate, now: &str) -> Result<(), s
     )
     .bind(now)
     .bind(c.intent_pk)
-    .execute(&state.db.pool)
+    .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "UPDATE evaluator_engagements e SET status='funded',updated_at=$1 \
+         FROM kpr1_payment_intents i WHERE i.id=$2 AND i.engagement_id=e.engagement_id AND e.status='accepted'",
+    ).bind(now).bind(c.intent_pk).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 

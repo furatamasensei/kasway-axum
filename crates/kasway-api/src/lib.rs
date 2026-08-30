@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod auth_token;
+pub mod arbitration;
 pub mod chain_observer;
 pub mod chain_source;
 pub mod invoice_expirer;
@@ -99,6 +100,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/explorer/kpr1/payment-requests/:canonicalHash", get(handlers::explorer_kpr1::show_payment_request))
         .route("/api/explorer/kpr1/transactions/:txId", get(handlers::explorer_kpr1::show_transaction))
         .route("/api/explorer/kpr1/invoices/:publicId", get(handlers::explorer_kpr1::show_invoice))
+        // --- Permissionless evaluator marketplace + encrypted case protocol ---
+        // Every write is authenticated by a participant BIP-340 signature;
+        // these routes intentionally do not require a Kasway account.
+        .route("/api/arbitration/evaluators", get(arbitration::evaluator_index).post(arbitration::evaluator_store))
+        .route("/api/arbitration/evaluators/:profileId", get(arbitration::evaluator_show))
+        .route("/api/arbitration/evaluators/:profileId/reputation", get(arbitration::reputation_show))
+        .route("/api/arbitration/quotes", post(arbitration::quote_store))
+        .route("/api/arbitration/engagements", post(arbitration::engagement_store))
+        .route("/api/arbitration/engagements/:engagementId/dispute/prepare", post(arbitration::dispute_prepare))
+        .route("/api/arbitration/engagements/:engagementId/dispute/submit", post(arbitration::dispute_submit))
+        .route("/api/arbitration/cases", post(arbitration::case_open))
+        .route("/api/arbitration/cases/:caseId", get(arbitration::case_show))
+        .route("/api/arbitration/cases/:caseId/messages", get(arbitration::message_index).post(arbitration::message_store))
+        .route("/api/arbitration/cases/:caseId/decision/commit", post(arbitration::decision_commit))
+        .route("/api/arbitration/cases/:caseId/decision/reveal", post(arbitration::decision_reveal))
+        .route("/api/arbitration/cases/:caseId/settlement/prepare", post(arbitration::settlement_prepare))
+        .route("/api/arbitration/cases/:caseId/settlement/submit", post(arbitration::settlement_submit))
+        .route("/api/arbitration/cases/:caseId/feedback", post(arbitration::feedback_store))
         // --- Public auth (/api/auth) ---
         .route("/api/auth/login", post(handlers::auth::login))
         .route("/api/auth/register", post(handlers::auth::register))

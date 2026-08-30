@@ -2,7 +2,7 @@
 
 **Status:** Public technical whitepaper draft
 
-**Version:** 0.3
+**Version:** 0.4
 
 **Date:** 31 August 2026
 
@@ -18,7 +18,7 @@ Kasway is an open-source commerce-payment protocol for Kaspa. It combines signed
 
 Each payment uses a fresh, signed, single-use invoice. A customer wallet verifies the invoice, signs and broadcasts locally, and submits the transaction identifier for observation. A chain observer verifies the required payment outputs before treating the covenant as funded. The covenant then enforces release, refund, mutual settlement, and time-based paths.
 
-Kasway's target dispute protocol adds an open marketplace of pseudonymous evaluators. A customer selects an evaluator by fee, policy, service level, and reputation; the seller and evaluator must accept the same engagement before funding. If a dispute occurs, buyer, seller, and evaluator use a signed, end-to-end encrypted case room whose message commitments are sequenced on Kaspa. Kasway backends never receive private keys, plaintext messages, or decryption keys.
+Kasway's evaluator protocol adds an open marketplace of pseudonymous evaluators. A customer selects an evaluator by fee, policy, service level, and reputation; the seller and evaluator accept the same engagement before funding. If a dispute occurs, the payment UTXO moves into a precommitted dispute covenant and normal capture becomes impossible. Buyer, seller, and evaluator can use signed, end-to-end encrypted case messages with separately submitted Kaspa commitment references. Kasway backends never receive private keys, plaintext messages, or decryption keys.
 
 ## 1. The problem
 
@@ -71,17 +71,18 @@ The `kasway-covenant` component compiles settlement constraints and constructs c
 
 ### 3.1 Cryptographic primitives
 
-The implemented protocol uses the following primitives. Where the target dispute protocol (sections 6–9) introduces new commitments, this document specifies the same hash family unless a later specification says otherwise.
+The implemented protocol uses the following primitives. Sections 6–9 distinguish covenant-enforced behavior from application/indexer controls where the current release still has explicit trust boundaries.
 
 | Purpose | Primitive |
 | --- | --- |
 | KPR-1 intent signature | Ed25519 over the canonical JSON encoding of the unsigned intent (UTF-8; object keys sorted lexicographically at every depth). Signature and public key travel base64-encoded; the signature block carries `alg: "ed25519"` and a `keyId`. |
 | KPR-1 canonical intent hash | SHA-256 (hex) over the canonical JSON encoding of the signed intent. The payment-request URI carries this hash, binding the QR code to the exact document the wallet fetches. |
 | Merchant rate-config commitment | SHA-256 (hex) over a canonical JSON encoding of the merchant's payout address, tax, revenue splits, and platform fee. |
-| Participant keys and addresses | secp256k1 with BIP-340 Schnorr signatures; participant identities are 32-byte x-only public keys. Customer refund, merchant payout, and arbiter panel addresses must be Schnorr P2PK. |
+| Participant keys and addresses | secp256k1 with BIP-340 Schnorr signatures; participant identities are 32-byte x-only public keys. Customer refund, merchant identity, and evaluator decision keys are Schnorr P2PK keys. |
 | Covenant spends | 65-byte input signatures (64-byte BIP-340 Schnorr plus the `SIG_HASH_ALL` type byte) over Kaspa's consensus transaction sighash. Off-chain authorizations verified by the backend are 64-byte BIP-340 signatures over a 32-byte digest. |
 | Covenant address | Kaspa P2SH. The script public key is `[OP_BLAKE2B, OP_DATA_32, <32-byte hash>, OP_EQUAL]`, so the covenant address commits to the BLAKE2b-256 hash of the SilverScript-compiled redeem script. |
-| Dispute-protocol commitments (target) | SHA-256 over a canonical encoding, matching the KPR-1 intent hash. This includes the decision commitment of section 8. The Kasia-derived message-encryption suite is selected during the security review required by section 15. |
+| Dispute-protocol commitments | SHA-256 over canonical JSON, matching the KPR-1 intent hash. This includes signed profiles, quotes, engagements, messages, feedback, and the decision commitment of section 8. |
+| Case-message encryption | Pairwise authenticated public-key encryption through rusty-kaspa's `CryptoBox` binding (`crypto_box`); purpose-scoped messaging secret keys stay in participant wallets. The current API stores only ciphertext and public envelope data. |
 
 ### 3.2 Network prerequisites
 
@@ -96,16 +97,16 @@ The protocol assigns a precise meaning to each payment stage.
 | Stage | Meaning |
 | --- | --- |
 | Invoice created | The seller system creates a signed KPR-1 intent with payment terms and expiry. |
-| Engagement accepted | When arbitration protection is selected, customer, seller, and evaluator sign the same evaluator terms before funding. This target stage is not implemented in the current release. |
-| Covenant finalized | The wallet supplies a customer refund address. Kasway derives and persists the covenant address and its parameters. |
+| Engagement accepted | When evaluator protection is selected, customer, seller, and evaluator sign the same canonical terms before finalization and funding. |
+| Covenant finalized | The wallet supplies a customer refund address. Kasway compiles and persists the initial and dispute covenants. Its signed finalize receipt contains both redeem scripts; the wallet derives their P2SH addresses locally and fails closed on mismatch. |
 | Submitted / awaiting funding | The wallet has broadcast a transaction and submitted its transaction ID, but the required output has not been confirmed. |
 | Funded / verified | The observer verifies the exact required output and confirmation policy. Funds are held by the covenant. |
-| Disputed | A participant opens a dispute before the applicable deadline. The target protocol must prevent normal time-based capture while evaluation is active. This stage is not implemented in the current release. |
+| Disputed | Customer or seller signs a transaction moving the full escrow and evaluator reserve to the precommitted dispute covenant. Because the initial outpoint is consumed, its time-based capture path can no longer execute. |
 | Released / settled | An authorized covenant spend pays the seller or the committed payout split. |
 | Refunded | An authorized covenant spend returns the applicable amount to the customer. |
 | Expired | An unfunded invoice whose payment window elapsed is retired. A timely submitted payment can remain eligible for observation while confirmations finish. |
 
-The wallet verifies network, signature, intent hash, template, expiry, script hash, and required outputs before signing (the full KPR-1 intent format and verification checklist are in Appendix A). The chain observer independently checks the observed transaction against the intent's required addresses and amounts. A mismatch fails closed and does not mark the invoice as paid.
+The wallet verifies network, signature, intent hash, template, expiry, finalize-receipt signature, refund ownership, redeem-script-to-P2SH derivation, and required funding amount before signing (the full KPR-1 intent format and verification checklist are in Appendix A). The wallet does not yet contain a SilverScript compiler and therefore does not independently prove that every byte of a backend-supplied redeem script implements the signed economic terms. The chain observer independently checks the observed transaction against the finalized covenant address and amount. A mismatch fails closed and does not mark the invoice as paid.
 
 Each payment address and covenant is single-use. The reference implementation caps the funding window at 900 seconds (15 minutes); an invoice may request a shorter window but never a longer one, because a long-lived intent is a stale quote for a fixed payout set. The wallet must not reuse an expired invoice for a later payment.
 
@@ -121,11 +122,15 @@ The implemented `escrow_v2` covenant currently supports:
 4. **Seller refund.** The seller voluntarily returns the gross amount to the customer.
 5. **M-of-N arbitration.** A configured threshold panel signs a seller release or customer refund.
 
-The current M-of-N panel is selected through deployment configuration and snapshotted into each covenant. It is an implemented transitional mechanism, not the target evaluator-marketplace model described by this whitepaper. A production deployment can reject a missing external panel or a panel that includes Kasway's configured arbiter key, but code alone cannot prove that panel members are independent people or organizations.
+The current M-of-N panel is selected through deployment configuration and snapshotted into each legacy covenant. It is an implemented transitional mechanism, not the evaluator-marketplace path described by this whitepaper. A production deployment can reject a missing external panel or a panel that includes Kasway's configured arbiter key, but code alone cannot prove that panel members are independent people or organizations.
+
+The implemented `escrow_v3` path replaces that panel for evaluator-protected invoices. It reserves a positive, customer-funded evaluator fee and commits to a `DisputeV1` script at finalization. Normal release or capture pays the commercial split and returns the unused reserve to the customer. Opening a dispute moves `gross + fee` into `DisputeV1`. A valid evaluator release pays the committed commercial split and fixed reward; a valid evaluator refund returns the commercial gross to the customer and pays the same fixed reward. Customer and seller retain a jointly signed settlement escape hatch.
+
+Kaspa lock time provides a lower-bound primitive, not a covenant-enforceable wall-clock upper bound. Consequently, once capture becomes eligible, capture and dispute-open may both be valid attempts to spend the same initial outpoint; consensus accepts only the one that confirms first. Interfaces should open disputes before the agreed deadline and show this race explicitly.
 
 ## 6. Open evaluator marketplace
 
-The target protocol replaces a platform-configured global panel with evaluator choice and three-party consent. Kasway does not operate an evaluator authority and does not collect identity documents.
+The evaluator protocol replaces a platform-configured global panel with evaluator choice and three-party consent. Kasway does not operate an evaluator authority and does not collect identity documents.
 
 ### 6.1 Pseudonymous evaluator profiles
 
@@ -165,7 +170,7 @@ sequenceDiagram
   W->>K: Fund covenant with engagement commitment
 ```
 
-The engagement commitment should bind at least:
+The implemented canonical engagement binds:
 
 - network, order, invoice, and case identifiers;
 - evaluator profile and case-key commitment;
@@ -181,17 +186,17 @@ Every party signs a domain-separated payload that includes the network, protocol
 
 Evaluators set their own fee schedules and can issue custom signed quotes. The engagement fixes the fee before funding; an evaluator cannot raise it after a dispute begins. The fee must not depend on whether the evaluator chooses release or refund.
 
-The settlement covenant pays an earned evaluator fee only after a valid decision arrives within the agreed SLA. The evaluator uses a case-specific reward address rather than exposing or reusing a primary wallet address. The exact funding split between customer and seller remains an engagement term and must be visible to both before they sign.
+The dispute covenant pays the evaluator fee only in an evaluator-authorized terminal release or refund. The evaluator uses a case-specific reward address rather than reusing a primary payment address. The current covenant does not enforce the decision SLA as a time predicate; SLA compliance is public protocol evidence and reputation input. Fee funding is customer-paid in protocol version 1, is fixed before funding, and is identical for release and refund.
 
 ### 6.4 Availability and fallback
 
-The engagement must define what happens if the evaluator misses the SLA. A timeout must not silently award the case to either customer or seller. Compatible policies can name a pre-approved backup evaluator or require a mutually signed replacement, while objective missed-SLA behavior can affect reputation or an optional bond.
+The current implementation offers a mutually signed settlement escape hatch if an evaluator becomes unavailable. Pre-approved backup evaluator rotation and bond slashing remain future protocol variants; neither party receives an automatic win merely because an SLA elapsed.
 
 ## 7. Encrypted dispute communication
 
-Kasway can adapt the open-source [Kasia](https://github.com/K-Kluster/Kasia) encrypted messaging design for dispute communication. Kasia demonstrates encrypted messages embedded in Kaspa transactions and uses an optional indexer for historical retrieval. Kasway should reuse reviewed protocol and cryptographic components rather than depend on a single hosted Kasia service.
+Kasway adapts the separation demonstrated by the open-source [Kasia](https://github.com/K-Kluster/Kasia) design: encryption happens in the wallet, while a replaceable service indexes public envelope metadata and ciphertext. The mobile shell exposes rusty-kaspa `CryptoBox` encryption/decryption, and the shared arbitration client refuses secret-shaped fields at its network boundary.
 
-The target dispute protocol extends one-to-one messaging into a three-party case room. Buyer, seller, and evaluator use purpose-scoped messaging keys and a shared case key. Payment, messaging, evaluation, and feedback keys remain logically separated even when one wallet protects them.
+The case protocol extends one-to-one messaging into a three-party room. The signed engagement fixes purpose-scoped messaging public keys for buyer, seller, and evaluator. A client may encrypt the same logical message pairwise for the other participants; payment, messaging, evaluation, and feedback keys remain logically separated even when one wallet protects them.
 
 Each signed message envelope should contain:
 
@@ -209,13 +214,13 @@ expiresAt
 signature
 ```
 
-The case room records negotiation, evidence commitments, questions, responses, decision commitment, decision reveal, and feedback actions. The chain proves ciphertext inclusion, ordering, timing, and signatures. It does not prove that a statement or off-chain exhibit is truthful.
+The case room records negotiation, evidence commitments, questions, responses, decision commitment, decision reveal, and feedback actions. The signed envelope and its `previousMessageHash` prove authorship and application-level ordering. A submitted Kaspa transaction reference is stored separately and must commit to the envelope hash. The current backend marks such anchors `submitted`; it does not yet retrieve historical transaction payloads to upgrade them to independently `observed`. Accordingly, the present release must not claim that every stored message is already proven on chain. Neither a valid anchor nor a signature proves that a statement or off-chain exhibit is truthful.
 
 Kasway backends and public indexers must not receive plaintext or decryption keys. They can cache ciphertext and public metadata for synchronization. Large or sensitive exhibits should remain encrypted under participant control; the chain can record a content hash so a participant can later prove that a disclosed file matches the original commitment.
 
 Interfaces should discourage sharing persistent wallet addresses or contact details in a case room and can block obvious patterns before encryption. This filter is a safety aid, not a protocol guarantee: encoding, images, modified open-source clients, and communication outside Kasway cannot be prevented cryptographically.
 
-Evaluator profiles remain publicly selectable, so the protocol does not promise absolute evaluator anonymity. It limits linkability by using case-specific messaging keys, decision keys, and reward addresses. A signed decision commitment can prevent an evaluator from changing the outcome after later contact or payment attempts.
+Evaluator profiles and identity keys remain publicly selectable, so the protocol does not promise evaluator anonymity or make bribery impossible. Case-specific messaging keys and reward addresses reduce payment-address reuse. Obvious address/contact patterns can be blocked before encryption, but modified clients, encoded data, images, and off-platform contact cannot be prevented cryptographically. Reward script data also becomes public through the covenant and settlement transaction.
 
 ## 8. Decision commitment and settlement
 
@@ -227,7 +232,9 @@ decisionCommit = SHA-256(canonical(caseId, outcome, reasonHash, salt))
 
 `canonical(...)` is the same canonical JSON encoding used for KPR-1 intent hashing (section 3.1): UTF-8, object keys sorted at every depth.
 
-After the commitment becomes observable, the evaluator reveals the outcome, reason commitment, salt, and signature. The settlement path verifies the commitment and permits only outcomes accepted by the engagement and covenant, such as the committed seller payout or a refund to the customer.
+After submitting a commitment reference, the evaluator reveals the outcome, reason commitment, salt, and signature. The API recomputes the canonical preimage and rejects a reveal that differs from the stored commitment. The `DisputeV1` covenant independently restricts the resulting evaluator-signed transaction to the committed seller payout or customer refund and the fixed evaluator reward.
+
+The current covenant verifies the evaluator's Kaspa transaction signature and exact outputs; it cannot read a prior transaction's payload and therefore does not itself verify that the API's earlier commitment anchor was observed. Commit-reveal is presently an auditable application/indexer control around a covenant-enforced binary decision, not a complete trustless two-transaction state machine.
 
 Commit-reveal creates evidence if an evaluator attempts to change a decision. It does not prove that the evaluator interpreted off-chain evidence correctly, and it does not make bribery impossible. Transparent case records, fixed fees, key separation, reputation, and optional appeal policies reduce the opportunity and expected benefit of misconduct.
 
@@ -273,7 +280,7 @@ Kasway assigns different responsibilities to different parties.
 
 Production wallet signing uses native-secure storage. Browser signing exists only as an explicit fail-closed local TN10 testing exception; it is not a production custody model. Kasway does not treat a submitted transaction identifier as proof of funding or funding as proof that the seller has received settled funds.
 
-End-to-end encryption protects message content from an indexer, but it does not erase public transaction metadata. Ciphertext remains on chain and can become readable if participants later disclose or lose control of the relevant keys. Clients should therefore minimize personal data and keep large sensitive exhibits outside permanent chain payloads.
+End-to-end encryption protects message content from an indexer, but it does not erase public transaction metadata. Ciphertext published in transaction payloads remains on chain and can become readable if participants later disclose or lose control of the relevant keys. Clients should therefore minimize personal data and keep large sensitive exhibits outside permanent chain payloads.
 
 ## 12. Relation to agentic commerce
 
@@ -285,17 +292,27 @@ Software agents can act as customers, sellers, or evaluators when they hold appr
 
 ## 13. Implementation status
 
-The current code implements signed KPR-1 intent creation, covenant compilation and P2SH derivation, submitted-payment observation, confirmation tracking, customer release, merchant refund, bilateral settlement, M-of-N covenant branches, invoice expiry, subscription billing, wallet-local auto-renew orchestration, and integration coverage for implemented payment and subscription paths.
+The current code implements signed KPR-1 intent creation, covenant compilation and P2SH derivation, submitted-payment observation, confirmation tracking, customer release, merchant refund, bilateral settlement, transitional M-of-N branches, invoice expiry, subscription billing, and wallet-local auto-renew orchestration.
 
-The following whitepaper v0.2 components are target architecture and are not implemented in the current release:
+Evaluator protocol v1 now additionally implements:
 
-- permissionless evaluator registry;
-- customer selection and three-party evaluator engagement;
-- evaluator fee and case-specific reward path;
-- dispute-open state that prevents normal time-based capture;
-- Kasia-derived three-party encrypted case rooms;
-- decision commit-reveal;
-- case-derived public reputation and feedback.
+- a permissionless, signed pseudonymous profile registry with fee, policy, SLA, and reputation queries;
+- signed quotes and one three-party-signed engagement per invoice;
+- `escrow_v3` plus a precommitted `DisputeV1` transition that disables capture by consuming the original outpoint;
+- a positive customer-funded fee reserve, exact case reward output, and equal reward for either outcome;
+- signed ciphertext-only case envelopes, sequence/hash chaining, and separately recorded Kaspa anchor references;
+- evaluator decision commit/reveal validation;
+- evaluator-signed release/refund settlement transaction preparation and submission;
+- one buyer and one seller feedback receipt per settled case, with separate aggregate scores;
+- wallet-side P2SH derivation checks, arbitration API bindings, and `CryptoBox` case-message encryption/decryption.
+
+The following pieces remain incomplete and must not be represented as production guarantees:
+
+- independent node verification of message and decision anchor payloads (`anchorStatus` remains `submitted`);
+- wallet-side recompilation of SilverScript from signed terms, rather than verification of a KPR-signed redeem script;
+- UI screens for evaluator browsing, negotiation, case discussion, and feedback;
+- a reviewed group-key lifecycle, recovery/export UX, backup-evaluator rotation, bonds, appeals, and blind feedback; the mobile encryption boundary already rejects obvious pasted wallet addresses, email addresses, and common off-platform contact links, but this is bypassable client-side safety policy;
+- reproducible TN10 evidence for the complete evaluator-protected funding → dispute → decision → settlement flow and an external security audit.
 
 Historical TN10 evidence proves manual and automatic next-cycle payment broadcasts reaching the funded/verified state. That evidence proves broadcast and observer-confirmed covenant funding for those runs. It must not be represented as proof of seller settlement unless the corresponding release transaction is also observed.
 
@@ -309,9 +326,9 @@ The protocol does not ask customers to delegate broad spending authority to Kasw
 
 ## 15. Development direction
 
-Kasway's next public technical work should specify the evaluator profile, engagement payload, typed case-message envelope, dispute-open covenant transition, decision commitment, evaluator fee path, and case receipt. Each specification should ship with conformance tests and reproducible TN10 demonstrations before production claims change.
+Kasway's next public technical work should freeze the canonical evaluator payload schemas as a standalone specification, add cross-language conformance vectors, verify transaction payload anchors against independently queried nodes, and reproduce the full evaluator-protected flow on TN10. A wallet-distributed SilverScript compiler or independently maintained covenant vector set is required before claiming that wallets verify covenant semantics without trusting the KPR signing service.
 
-Kasia-derived components require independent protocol and security review before use in value-bearing disputes. The Kasway implementation should vendor or pin reviewed components and allow self-hosted indexers rather than depend on one public infrastructure provider.
+The case encryption/key lifecycle and Kasia-derived architecture require independent protocol and security review before use in value-bearing disputes. Compatible indexers should remain self-hostable and replaceable rather than depending on one public infrastructure provider.
 
 ## Appendix A: KPR-1 payment-intent format
 
@@ -364,6 +381,7 @@ Field semantics and constraints:
 - **`configCommitment`** commits to the merchant's rate configuration (payout address, tax, splits, platform fee) so a customer can check that the configuration was not swapped between publication and mint (section 3.1).
 - A subscription-cycle intent additionally carries `paymentType: "subscription"`, `subscriptionId`, `subscriptionCycleId`, and a `subscription` object with `publicId`, `cyclePublicId`, `intervalUnit`, `intervalCount`, `nextBillingAt`, and any `priceChange` notice — all inside the signature, so a wallet never infers recurring authority from a memo or an unsigned checkout response.
 - The covenant P2SH address and script hash are **not** in the minted intent: they are derived at finalize, once the wallet supplies the customer refund address, as a deterministic function of the signed economic terms plus that address.
+- For `escrow_v3`, the separately three-party-signed engagement fixes the evaluator fee. The signed finalize receipt identifies the engagement hash and states `commercialGrossSompi`, `evaluatorFeeSompi`, both redeem scripts, and the total `amountSompi` the wallet funds. The observer requires that exact total.
 - Minimum invoice amounts follow the KIP-9 storage-mass floor of section 3.2; an intent whose smallest payout slice cannot settle on-chain is refused at mint.
 
 ### A.2 Signing and verification
@@ -375,10 +393,10 @@ A wallet must, before signing a funding transaction:
 1. fetch the intent from the `request` URL and recompute the SHA-256 canonical hash; reject on mismatch with the URI's `hash`;
 2. verify the Ed25519 signature over the canonical unsigned intent against the published signing key;
 3. check that `network` matches the wallet's network, `expiresAt` has not passed, and the template is one the wallet understands;
-4. check that the outputs sum to `grossSompi` and re-derive the covenant address from the signed terms plus its own refund address, rejecting a covenant address the backend supplied but the wallet cannot reproduce;
+4. check that intent outputs sum to `grossSompi`; verify the KPR-signed finalize receipt and that its refund address is the wallet's address; derive each P2SH address from the receipt's redeem script and reject any address mismatch; for `escrow_v3`, also require `commercialGrossSompi + evaluatorFeeSompi = amountSompi` and verify the three-party engagement before funding;
 5. sign and broadcast locally, then submit the transaction identifier for observation.
 
-Every check fails closed: a wallet that cannot complete a step must not sign.
+Every check fails closed: a wallet that cannot complete a step must not sign. In v0.4 this proves receipt authenticity and script-to-address consistency, but not independent semantic equivalence between the compiled script bytes and all signed terms; that remaining trust boundary is explicit in sections 4 and 13.
 
 ## Glossary
 

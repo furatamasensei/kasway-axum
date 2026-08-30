@@ -17,6 +17,9 @@ pub use silverscript_lang::compiler::CompiledContract;
 /// Escrow — tiered dispute-resolution covenant (optimistic release/capture +
 /// mutual settlement + M-of-N arbiter panel); see `escrow_v2.sil`.
 pub mod escrow_v2;
+/// Escrow V3 and its terminal dispute covenant — a selected evaluator, reserved
+/// fee, and a real UTXO transition that disables optimistic capture.
+pub mod escrow_v3;
 /// Subscription — non-custodial recurring-claim autopay covenant (periodic
 /// keeper claim + self-replicating remainder + customer withdraw); see
 /// `subscription_v1.sil`.
@@ -116,6 +119,23 @@ impl Destination {
     pub fn script_public_key(&self) -> ScriptPublicKey {
         pay_to_address_script(&self.address)
     }
+}
+
+/// Extract a 32-byte x-only public key from a Schnorr P2PK Kaspa address.
+///
+/// Public arbitration APIs use this to bind a signed seller/customer identity
+/// to the exact address already committed by an invoice. P2SH and ECDSA
+/// addresses are rejected because they are not BIP-340 verification keys.
+pub fn schnorr_pubkey_from_address(addr: &str) -> Result<[u8; 32], CovenantError> {
+    let address = Address::try_from(addr).map_err(|e| CovenantError::Address(e.to_string()))?;
+    if address.version != Version::PubKey || address.payload.len() != 32 {
+        return Err(CovenantError::UnsupportedAddressKind(addr.to_string()));
+    }
+    address
+        .payload
+        .as_slice()
+        .try_into()
+        .map_err(|_| CovenantError::UnsupportedAddressKind(addr.to_string()))
 }
 
 /// One ordered release payout, in transaction-output order.

@@ -793,29 +793,29 @@ pub async fn finalize_covenant_for_invoice(
         return Err(err("KPR-1 payment intent not found"));
     };
 
-    let row = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>, String, Option<String>, Option<String>, Option<String>)>(
+    let row = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>, String, Option<String>, Option<String>, Option<String>, String, Option<String>, Option<i64>)>(
         "SELECT id, network, required_outputs, gross_amount, expiry_ts, covenant_state, covenant_address, \
-         customer_refund_address, expires_at FROM kpr1_payment_intents WHERE invoice_id = $1",
+         customer_refund_address, expires_at, covenant_version, engagement_id, evaluator_fee_sompi \
+         FROM kpr1_payment_intents WHERE invoice_id = $1",
     )
     .bind(inv_id)
     .fetch_optional(&state.db.pool)
     .await?;
-    let Some((intent_pk, network, required_outputs, gross_opt, expiry_opt, covenant_state, existing_address, existing_refund, payment_expires_at)) = row else {
+    let Some((intent_pk, network, required_outputs, gross_opt, expiry_opt, covenant_state, existing_address, existing_refund, payment_expires_at, covenant_version, engagement_id, evaluator_fee_opt)) = row else {
         return Err(err("KPR-1 payment intent not found"));
     };
 
     let gross = gross_opt.ok_or_else(|| err("KPR-1 covenant gross amount is missing"))? as u64;
     let expiry = expiry_opt.ok_or_else(|| err("KPR-1 covenant expiry is missing"))? as u64;
 
-    // Idempotent: already finalized -> return the existing covenant, receipted
-    // with the refund address BAKED INTO IT rather than the one just requested.
-    // A second payer must be able to see that this escrow refunds elsewhere.
-    if covenant_state != "pending" {
-        if let Some(addr) = existing_address {
-            let refund = existing_refund.unwrap_or_default();
-            return Ok(finalize_response(state, &addr, gross, expiry, &covenant_state, &refund));
-        }
-    }
+    // Finalize is first-writer-wins. Rebuild using the address that was already
+    // persisted, never the new caller's address, so the signed receipt exposes
+    // an attempted second-payer substitution.
+    let effective_refund = if covenant_state == "pending" {
+        refund_address.to_string()
+    } else {
+        existing_refund.clone().ok_or_else(|| err("finalized covenant is missing its refund address"))?
+    };
     if inv_status != "open" {
         return Err(err("KPR-1 covenant can only be finalized for open invoices"));
     }
@@ -829,12 +829,8 @@ pub async fn finalize_covenant_for_invoice(
     }
 
     let prefix = kasway_covenant::network_prefix(&network).map_err(|e| err(&e.to_string()))?;
-    let customer_refund = kasway_covenant::Destination::parse(refund_address)
+    let customer_refund = kasway_covenant::Destination::parse(&effective_refund)
         .map_err(|e| err(&format!("KPR-1 refund address is not a supported Kaspa address: {e}")))?;
-
-    // EscrowV2 M-of-N arbiter panel (consented at funding). Falls back to a
-    // 1-of-1 panel of the configured Kasway arbiter during migration.
-    let (arbiter_panel, arbiter_threshold) = escrow_arbiter_panel(state)?;
 
     let outs = parse_required_outputs(&required_outputs);
     // The merchant's signing identity is the merchant_net payout address (schnorr P2PK).
@@ -854,55 +850,106 @@ pub async fn finalize_covenant_for_invoice(
         payouts.push(kasway_covenant::Payout { destination, value });
     }
 
-    let params = kasway_covenant::escrow_v2::EscrowV2Params {
-        payouts,
-        customer_refund,
-        merchant,
-        arbiter_panel,
-        arbiter_threshold,
-        gross_amount: gross,
-        // `capture_time` is an on-chain lock_time. Kaspa treats lock_time values
-        // >= 500e9 as millisecond wall-clock timestamps and smaller values as DAA
-        // scores; `expiry` is Unix SECONDS, so scale to milliseconds to get a
-        // correct wall-clock auto-capture deadline (not a far-future DAA score).
-        capture_time: expiry.saturating_mul(1000),
-    };
-    let compiled = kasway_covenant::escrow_v2::compile_escrow_v2(&params)
-        .map_err(|e| err(&format!("KPR-1 covenant compilation failed: {e}")))?;
-    let address = kasway_covenant::covenant_address(&compiled, prefix)
-        .map_err(|e| err(&e.to_string()))?
-        .to_string();
-    let script_hash: String = encode_hex(&kasway_covenant::covenant_script_hash(&compiled));
+    let capture_time = expiry.saturating_mul(1000);
+    let (address, script_hash, funding_amount, receipt_protocol, panel_json, arbiter_threshold_i) =
+        if covenant_version == "escrow_v3" {
+            let engagement_id = engagement_id.as_deref().ok_or_else(|| err("escrow_v3 requires an accepted evaluator engagement"))?;
+            let engagement = sqlx::query_as::<_, (String, String, String, String, String, String)>(
+                "SELECT customer_key,evaluator_key,reward_address,dispute_deadline,status,engagement_hash \
+                 FROM evaluator_engagements WHERE engagement_id=$1 AND invoice_public_id=$2",
+            ).bind(engagement_id).bind(public_id).fetch_optional(&state.db.pool).await?
+                .ok_or_else(|| err("evaluator engagement not found"))?;
+            let (customer_key, evaluator_key, reward_address, dispute_deadline, engagement_status, engagement_hash) = engagement;
+            if !matches!(engagement_status.as_str(), "accepted" | "funded") {
+                return Err(err("evaluator engagement is not fundable"));
+            }
+            let refund_key = kasway_covenant::schnorr_pubkey_from_address(&effective_refund)
+                .map_err(|e| err(&format!("customer refund address must be Schnorr P2PK: {e}")))?;
+            if !encode_hex(&refund_key).eq_ignore_ascii_case(&customer_key) {
+                return Err(err("refund address does not match the customer key that signed the evaluator engagement"));
+            }
+            let evaluator_pubkey = decode_hex32(&evaluator_key)
+                .ok_or_else(|| err("engagement evaluator key must be 32-byte hex"))?;
+            let evaluator_reward = kasway_covenant::Destination::parse(&reward_address)
+                .map_err(|e| err(&format!("evaluator reward address is invalid: {e}")))?;
+            let evaluator_fee = u64::try_from(evaluator_fee_opt.ok_or_else(|| err("escrow_v3 evaluator fee is missing"))?)
+                .map_err(|_| err("escrow_v3 evaluator fee is invalid"))?;
+            if evaluator_fee == 0 { return Err(err("escrow_v3 evaluator fee must be positive")); }
+            let dispute_deadline_ms = chrono::DateTime::parse_from_rfc3339(&dispute_deadline)
+                .map_err(|_| err("engagement dispute deadline is invalid"))?
+                .timestamp_millis();
+            let dispute_deadline = u64::try_from(dispute_deadline_ms).map_err(|_| err("engagement dispute deadline is invalid"))?;
+            let params = kasway_covenant::escrow_v3::EscrowV3Params {
+                dispute: kasway_covenant::escrow_v3::DisputeV1Params {
+                    payouts,
+                    customer_refund,
+                    merchant,
+                    evaluator_pubkey,
+                    evaluator_reward,
+                    gross_amount: gross,
+                    evaluator_fee,
+                },
+                capture_time,
+                dispute_deadline,
+            };
+            let contracts = kasway_covenant::escrow_v3::compile_escrow_v3(&params)
+                .map_err(|e| err(&format!("KPR-1 escrow_v3 compilation failed: {e}")))?;
+            let address = kasway_covenant::covenant_address(&contracts.escrow, prefix).map_err(|e| err(&e.to_string()))?.to_string();
+            let dispute_address = kasway_covenant::covenant_address(&contracts.dispute, prefix).map_err(|e| err(&e.to_string()))?.to_string();
+            let script_hash = encode_hex(&kasway_covenant::covenant_script_hash(&contracts.escrow));
+            let dispute_script_hash = encode_hex(&kasway_covenant::covenant_script_hash(&contracts.dispute));
+            let escrow_redeem = encode_hex(&contracts.escrow.script);
+            let dispute_redeem = encode_hex(&contracts.dispute.script);
+            let funding_amount = gross.checked_add(evaluator_fee).ok_or_else(|| err("escrow_v3 funding amount overflow"))?;
+            let protocol = json!({
+                "version": "escrow_v3", "engagementId": engagement_id, "engagementHash": engagement_hash,
+                "commercialGrossSompi": gross.to_string(), "evaluatorFeeSompi": evaluator_fee.to_string(),
+                "disputeDeadline": dispute_deadline, "disputeCovenantAddress": dispute_address,
+                "disputeScriptHash": dispute_script_hash, "redeemScript": escrow_redeem,
+                "disputeRedeemScript": dispute_redeem,
+            });
+            if covenant_state == "pending" {
+                sqlx::query(
+                    "UPDATE kpr1_payment_intents SET dispute_covenant_address=$1,dispute_script_hash=$2, \
+                     covenant_redeem_script=$3,dispute_redeem_script=$4 WHERE id=$5",
+                ).bind(protocol["disputeCovenantAddress"].as_str()).bind(protocol["disputeScriptHash"].as_str())
+                 .bind(protocol["redeemScript"].as_str()).bind(protocol["disputeRedeemScript"].as_str()).bind(intent_pk)
+                 .execute(&state.db.pool).await?;
+            }
+            (address, script_hash, funding_amount, Some(protocol), None, None)
+        } else {
+            let (arbiter_panel, arbiter_threshold) = escrow_arbiter_panel(state)?;
+            let params = kasway_covenant::escrow_v2::EscrowV2Params {
+                payouts, customer_refund, merchant, arbiter_panel, arbiter_threshold,
+                gross_amount: gross, capture_time,
+            };
+            let compiled = kasway_covenant::escrow_v2::compile_escrow_v2(&params)
+                .map_err(|e| err(&format!("KPR-1 covenant compilation failed: {e}")))?;
+            let address = kasway_covenant::covenant_address(&compiled, prefix).map_err(|e| err(&e.to_string()))?.to_string();
+            let script_hash = encode_hex(&kasway_covenant::covenant_script_hash(&compiled));
+            let panel_hex: Vec<String> = params.arbiter_panel.iter().map(|k| encode_hex(k)).collect();
+            let panel_json = serde_json::to_string(&panel_hex).unwrap_or_else(|_| "[]".to_string());
+            let protocol = json!({ "version": "escrow_v2", "redeemScript": encode_hex(&compiled.script) });
+            (address, script_hash, gross, Some(protocol), Some(panel_json), Some(params.arbiter_threshold as i32))
+        };
 
-    // Snapshot the arbiter panel so settlement rebuilds this exact covenant even
-    // if the configured panel later changes.
-    let panel_hex: Vec<String> =
-        params.arbiter_panel.iter().map(|k| encode_hex(k)).collect();
-    let panel_json = serde_json::to_string(&panel_hex).unwrap_or_else(|_| "[]".to_string());
-    let arbiter_threshold_i = params.arbiter_threshold as i32;
+    if let Some(existing) = existing_address.as_deref() {
+        if existing != address { return Err(err("stored covenant address does not match deterministic recompilation")); }
+    }
 
     let now = now_iso();
-    sqlx::query(
-        "UPDATE kpr1_payment_intents SET covenant_address = $1, customer_refund_address = $2, script_hash = $3, \
-         arbiter_panel_json = $4, arbiter_threshold = $5, covenant_state = 'awaiting_funding', updated_at = $6 WHERE id = $7",
-    )
-    .bind(&address)
-    .bind(refund_address)
-    .bind(&script_hash)
-    .bind(&panel_json)
-    .bind(arbiter_threshold_i)
-    .bind(&now)
-    .bind(intent_pk)
-    .execute(&state.db.pool)
-    .await?;
-    sqlx::query("UPDATE invoices SET payment_address = $1, updated_at = $2 WHERE id = $3")
-        .bind(&address)
-        .bind(&now)
-        .bind(inv_id)
-        .execute(&state.db.pool)
-        .await?;
+    if covenant_state == "pending" {
+        sqlx::query(
+            "UPDATE kpr1_payment_intents SET covenant_address = $1, customer_refund_address = $2, script_hash = $3, \
+             arbiter_panel_json = $4, arbiter_threshold = $5, covenant_state = 'awaiting_funding', updated_at = $6 WHERE id = $7",
+        ).bind(&address).bind(&effective_refund).bind(&script_hash).bind(panel_json).bind(arbiter_threshold_i)
+         .bind(&now).bind(intent_pk).execute(&state.db.pool).await?;
+        sqlx::query("UPDATE invoices SET payment_address = $1, updated_at = $2 WHERE id = $3")
+            .bind(&address).bind(&now).bind(inv_id).execute(&state.db.pool).await?;
+    }
 
-    Ok(finalize_response(state, &address, gross, expiry, "awaiting_funding", refund_address))
+    let response_state = if covenant_state == "pending" { "awaiting_funding" } else { &covenant_state };
+    Ok(finalize_response(state, &address, funding_amount, expiry, response_state, &effective_refund, receipt_protocol))
 }
 
 /// The Kasway arbiter public key baked into every covenant, derived from the
@@ -951,6 +998,7 @@ fn finalize_response(
     expiry: u64,
     covenant_state: &str,
     refund_address: &str,
+    protocol: Option<Value>,
 ) -> Value {
     let cfg = &state.config.kpr1;
     let unsigned = json!({
@@ -959,6 +1007,7 @@ fn finalize_response(
         "expiryTs": expiry,
         "covenantState": covenant_state,
         "refundAddress": refund_address,
+        "protocol": protocol,
     });
     let signature_value = sign(&canonicalize(&unsigned), &cfg.signing_seed);
     let mut signed = unsigned;

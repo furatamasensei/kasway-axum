@@ -169,6 +169,9 @@ struct Funded {
     /// baked at finalize. NULL for legacy rows → settlement falls back to config.
     arbiter_panel_json: Option<String>,
     arbiter_threshold: Option<i32>,
+    covenant_version: String,
+    engagement_id: Option<String>,
+    evaluator_fee_sompi: Option<i64>,
 }
 
 /// One pass: settle up to `CLAIM_BATCH` funded covenants. Returns how many were
@@ -200,7 +203,7 @@ pub async fn run_tick(state: &AppState, client: &KaspaWrpcClient) -> Result<usiz
     let candidates = sqlx::query_as::<_, Funded>(
         "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, inv.store_id, inv.public_id, i.network, \
                 i.required_outputs, i.customer_refund_address, i.covenant_address, i.gross_amount, i.expiry_ts, \
-                i.arbiter_panel_json, i.arbiter_threshold \
+                i.arbiter_panel_json, i.arbiter_threshold, i.covenant_version, i.engagement_id, i.evaluator_fee_sompi \
          FROM kpr1_payment_intents i JOIN invoices inv ON inv.id = i.invoice_id \
          WHERE i.covenant_state = 'funded' AND inv.status = 'open' AND i.expiry_ts * 1000 < $2 \
          ORDER BY i.id LIMIT $1",
@@ -255,6 +258,9 @@ async fn settle_one(
     min_fee: u64,
     c: &Funded,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if c.covenant_version == "escrow_v3" {
+        return settle_one_v3(state, client, keeper, min_fee, c).await;
+    }
     let (params, prefix, covenant_addr) = rebuild_params(state, c).map_err(|e| kerr(format!("{e:?}")))?;
     let compiled = compile_escrow_v2(&params).map_err(|e| kerr(e.to_string()))?;
 
@@ -292,6 +298,78 @@ async fn settle_one(
     emit_invoice_event(state, c.invoice_id, &c.public_id, c.user_id, c.store_id, "invoice.paid", &tx_id).await?;
 
     tracing::info!("covenant keeper: intent {} auto-captured to merchant via tx {tx_id}", c.intent_pk);
+    Ok(())
+}
+
+async fn rebuild_v3(state: &AppState, c: &Funded) -> AppResult<(kasway_covenant::escrow_v3::EscrowV3Params, kasway_covenant::Prefix, String)> {
+    let covenant_addr = c.covenant_address.clone().ok_or_else(|| rerr("covenant not finalized"))?;
+    let refund_addr = c.customer_refund_address.clone().ok_or_else(|| rerr("missing customer refund address"))?;
+    let gross = u64::try_from(c.gross_amount.ok_or_else(|| rerr("missing gross"))?).map_err(|_| rerr("bad gross"))?;
+    let evaluator_fee = u64::try_from(c.evaluator_fee_sompi.ok_or_else(|| rerr("missing evaluator fee"))?)
+        .map_err(|_| rerr("bad evaluator fee"))?;
+    let capture_time = u64::try_from(c.expiry_ts.ok_or_else(|| rerr("missing capture time"))?)
+        .map_err(|_| rerr("bad capture time"))?.saturating_mul(1000);
+    let prefix = network_prefix(&c.network).map_err(|e| rerr(e.to_string()))?;
+    let customer_refund = Destination::parse(&refund_addr).map_err(|e| rerr(e.to_string()))?;
+    let engagement_id = c.engagement_id.as_deref().ok_or_else(|| rerr("missing evaluator engagement"))?;
+    let engagement = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT evaluator_key,reward_address,dispute_deadline FROM evaluator_engagements WHERE engagement_id=$1",
+    ).bind(engagement_id).fetch_optional(&state.db.pool).await.map_err(AppError::Database)?
+        .ok_or_else(|| rerr("evaluator engagement not found"))?;
+    let evaluator_pubkey = decode_hex32(&engagement.0).ok_or_else(|| rerr("bad evaluator key"))?;
+    let evaluator_reward = Destination::parse(&engagement.1).map_err(|e| rerr(e.to_string()))?;
+    let dispute_deadline = chrono::DateTime::parse_from_rfc3339(&engagement.2)
+        .map_err(|_| rerr("bad dispute deadline"))?.timestamp_millis();
+    let dispute_deadline = u64::try_from(dispute_deadline).map_err(|_| rerr("bad dispute deadline"))?;
+    let outs = parse_required_outputs(&c.required_outputs);
+    let merchant_addr = outs.iter().find(|o| o.role == "merchant_net").map(|o| o.address.clone())
+        .ok_or_else(|| rerr("intent has no merchant_net payout"))?;
+    let merchant = Destination::parse(&merchant_addr).map_err(|e| rerr(e.to_string()))?;
+    let payouts = outs.into_iter().map(|out| {
+        Ok(Payout {
+            destination: Destination::parse(&out.address).map_err(|e| rerr(e.to_string()))?,
+            value: u64::try_from(out.amount_sompi).map_err(|_| rerr("bad payout"))?,
+        })
+    }).collect::<AppResult<Vec<_>>>()?;
+    Ok((kasway_covenant::escrow_v3::EscrowV3Params {
+        dispute: kasway_covenant::escrow_v3::DisputeV1Params {
+            payouts, customer_refund, merchant, evaluator_pubkey, evaluator_reward, gross_amount: gross, evaluator_fee,
+        }, capture_time, dispute_deadline,
+    }, prefix, covenant_addr))
+}
+
+async fn settle_one_v3(
+    state: &AppState,
+    client: &KaspaWrpcClient,
+    keeper: &KeeperKey,
+    min_fee: u64,
+    c: &Funded,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (params, prefix, covenant_addr) = rebuild_v3(state, c).await.map_err(|e| kerr(format!("{e:?}")))?;
+    let contracts = kasway_covenant::escrow_v3::compile_escrow_v3(&params).map_err(|e| kerr(e.to_string()))?;
+    let derived = covenant_address(&contracts.escrow, prefix).map_err(|e| kerr(e.to_string()))?.to_string();
+    if derived != covenant_addr { return Err(kerr("escrow_v3 covenant address mismatch")); }
+    let total = params.dispute.gross_amount.checked_add(params.dispute.evaluator_fee).ok_or_else(|| kerr("escrow_v3 total overflow"))?;
+    let keeper_address = keeper.address(prefix).to_string();
+    let (cov_utxos, fee_utxos) = tokio::join!(client.fetch_utxos(&covenant_addr), client.fetch_utxos(&keeper_address));
+    let (cov_txid, cov_index, cov_value) = cov_utxos.map_err(|e| kerr(e.to_string()))?.into_iter()
+        .find(|(_, _, v)| *v == total).ok_or_else(|| kerr("escrow_v3 funding UTXO not found"))?;
+    let (fee_txid, fee_index, fee_value) = pick_fee_utxo(fee_utxos.map_err(|e| kerr(e.to_string()))?, min_fee)
+        .ok_or_else(|| kerr("no keeper fee UTXO available"))?;
+    let draft = kasway_covenant::escrow_v3::prepare_release(
+        &contracts, &params,
+        &Utxo { transaction_id: cov_txid, index: cov_index, value: cov_value },
+        &Utxo { transaction_id: fee_txid, index: fee_index, value: fee_value },
+        min_fee, keeper, prefix, params.capture_time,
+    ).map_err(|e| kerr(e.to_string()))?;
+    let spend = kasway_covenant::escrow_v3::complete_release(
+        &contracts, draft, kasway_covenant::escrow_v3::EP_RELEASE_CAPTURED, None,
+    ).map_err(|e| kerr(e.to_string()))?;
+    let tx_id = client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| kerr(e.to_string()))?;
+    mark_settled_paid(state, c.intent_pk, c.invoice_id, "captured", &tx_id).await?;
+    sqlx::query("UPDATE evaluator_engagements SET status='settled',updated_at=$1 WHERE engagement_id=$2")
+        .bind(now_iso()).bind(&c.engagement_id).execute(&state.db.pool).await?;
+    emit_invoice_event(state, c.invoice_id, &c.public_id, c.user_id, c.store_id, "invoice.paid", &tx_id).await?;
     Ok(())
 }
 
@@ -400,7 +478,7 @@ pub(crate) fn rerr(msg: impl AsRef<str>) -> AppError {
 
 /// Everything needed to (re)build a release spend for a funded covenant.
 struct ReleaseCtx {
-    params: EscrowV2Params,
+    params: ReleaseParams,
     prefix: kasway_covenant::Prefix,
     covenant_utxo: Utxo,
     fee_utxo: Utxo,
@@ -411,6 +489,11 @@ struct ReleaseCtx {
     store_id: Option<i64>,
     public_id: String,
     min_fee: u64,
+}
+
+enum ReleaseParams {
+    V2(EscrowV2Params),
+    V3(kasway_covenant::escrow_v3::EscrowV3Params),
 }
 
 /// Validate externally-collected M-of-N arbiter signatures against the covenant's
@@ -525,13 +608,22 @@ async fn gather_release_inputs(state: &AppState, client: &KaspaWrpcClient, publi
 
     let c = load_funded_open(state, public_id).await?;
 
-    let (params, prefix, covenant_addr) = rebuild_params(state, &c)?;
-    let compiled = compile_escrow_v2(&params).map_err(|e| rerr(e.to_string()))?;
-    let derived = covenant_address(&compiled, prefix).map_err(|e| rerr(e.to_string()))?.to_string();
+    let (params, prefix, covenant_addr, derived, total) = if c.covenant_version == "escrow_v3" {
+        let (params, prefix, covenant_addr) = rebuild_v3(state, &c).await?;
+        let contracts = kasway_covenant::escrow_v3::compile_escrow_v3(&params).map_err(|e| rerr(e.to_string()))?;
+        let derived = covenant_address(&contracts.escrow, prefix).map_err(|e| rerr(e.to_string()))?.to_string();
+        let total = params.dispute.gross_amount.checked_add(params.dispute.evaluator_fee).ok_or_else(|| rerr("escrow_v3 total overflow"))?;
+        (ReleaseParams::V3(params), prefix, covenant_addr, derived, total)
+    } else {
+        let (params, prefix, covenant_addr) = rebuild_params(state, &c)?;
+        let compiled = compile_escrow_v2(&params).map_err(|e| rerr(e.to_string()))?;
+        let derived = covenant_address(&compiled, prefix).map_err(|e| rerr(e.to_string()))?.to_string();
+        let total = params.gross_amount;
+        (ReleaseParams::V2(params), prefix, covenant_addr, derived, total)
+    };
     if derived != covenant_addr {
         return Err(rerr("covenant address mismatch"));
     }
-    let gross = params.gross_amount;
 
     // The covenant and keeper fee lookups are independent; fetch them concurrently.
     let keeper_address = keeper.address(prefix).to_string();
@@ -539,7 +631,7 @@ async fn gather_release_inputs(state: &AppState, client: &KaspaWrpcClient, publi
     let covenant_utxo = cov_utxos
         .map_err(|e| rerr(e.to_string()))?
         .into_iter()
-        .find(|(_, _, v)| *v == gross)
+        .find(|(_, _, v)| *v == total)
         .map(|(t, i, v)| Utxo { transaction_id: t, index: i, value: v })
         .ok_or_else(|| rerr("covenant funding UTXO not visible yet"))?;
 
@@ -567,11 +659,21 @@ async fn gather_release_inputs(state: &AppState, client: &KaspaWrpcClient, publi
 pub(crate) async fn customer_release_prepare(state: &AppState, public_id: &str) -> AppResult<serde_json::Value> {
     let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
     let ctx = gather_release_inputs(state, &client, public_id).await?;
-    let compiled = compile_escrow_v2(&ctx.params).map_err(|e| rerr(e.to_string()))?;
-    let draft = prepare_release(&compiled, &ctx.params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
-        .map_err(|e| rerr(e.to_string()))?;
+    let sighash = match &ctx.params {
+        ReleaseParams::V2(params) => {
+            let compiled = compile_escrow_v2(params).map_err(|e| rerr(e.to_string()))?;
+            prepare_release(&compiled, params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
+                .map_err(|e| rerr(e.to_string()))?.covenant_sighash
+        }
+        ReleaseParams::V3(params) => {
+            let contracts = kasway_covenant::escrow_v3::compile_escrow_v3(params).map_err(|e| rerr(e.to_string()))?;
+            kasway_covenant::escrow_v3::prepare_release(
+                &contracts, params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0,
+            ).map_err(|e| rerr(e.to_string()))?.covenant_sighash
+        }
+    };
     Ok(json!({
-        "covenantSighash": encode_hex(&draft.covenant_sighash),
+        "covenantSighash": encode_hex(&sighash),
         "sigHashType": "SIG_HASH_ALL",
         "algorithm": "schnorr",
         "note": "sign this 32-byte sighash with the customer refund key; submit the 65-byte signature (schnorr || sighash-type byte) as hex",
@@ -614,10 +716,23 @@ pub(crate) async fn customer_release_submit(state: &AppState, public_id: &str, s
 }
 
 async fn build_and_broadcast_release(client: &KaspaWrpcClient, ctx: &ReleaseCtx, customer_sig: &[u8]) -> AppResult<String> {
-    let compiled = compile_escrow_v2(&ctx.params).map_err(|e| rerr(e.to_string()))?;
-    let draft = prepare_release(&compiled, &ctx.params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
-        .map_err(|e| rerr(e.to_string()))?;
-    let spend = complete_release(&compiled, draft, EP_RELEASE_CONFIRMED, Some(customer_sig)).map_err(|e| rerr(e.to_string()))?;
+    let spend = match &ctx.params {
+        ReleaseParams::V2(params) => {
+            let compiled = compile_escrow_v2(params).map_err(|e| rerr(e.to_string()))?;
+            let draft = prepare_release(&compiled, params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
+                .map_err(|e| rerr(e.to_string()))?;
+            complete_release(&compiled, draft, EP_RELEASE_CONFIRMED, Some(customer_sig)).map_err(|e| rerr(e.to_string()))?
+        }
+        ReleaseParams::V3(params) => {
+            let contracts = kasway_covenant::escrow_v3::compile_escrow_v3(params).map_err(|e| rerr(e.to_string()))?;
+            let draft = kasway_covenant::escrow_v3::prepare_release(
+                &contracts, params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0,
+            ).map_err(|e| rerr(e.to_string()))?;
+            kasway_covenant::escrow_v3::complete_release(
+                &contracts, draft, kasway_covenant::escrow_v3::EP_RELEASE_CONFIRMED, Some(customer_sig),
+            ).map_err(|e| rerr(e.to_string()))?
+        }
+    };
     client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))
 }
 
@@ -627,7 +742,7 @@ async fn load_funded_open(state: &AppState, public_id: &str) -> AppResult<Funded
     sqlx::query_as::<_, Funded>(
         "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, inv.store_id, inv.public_id, i.network, \
                 i.required_outputs, i.customer_refund_address, i.covenant_address, i.gross_amount, i.expiry_ts, \
-                i.arbiter_panel_json, i.arbiter_threshold \
+                i.arbiter_panel_json, i.arbiter_threshold, i.covenant_version, i.engagement_id, i.evaluator_fee_sompi \
          FROM kpr1_payment_intents i JOIN invoices inv ON inv.id = i.invoice_id \
          WHERE inv.public_id = $1 AND i.covenant_state = 'funded' AND inv.status = 'open'",
     )
@@ -636,6 +751,220 @@ async fn load_funded_open(state: &AppState, public_id: &str) -> AppResult<Funded
     .await
     .map_err(AppError::Database)?
     .ok_or_else(|| rerr("covenant is not awaiting settlement (must be funded and open)"))
+}
+
+async fn load_v3_engagement(state: &AppState, engagement_id: &str, states: &[&str]) -> AppResult<Funded> {
+    let c = sqlx::query_as::<_, Funded>(
+        "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, inv.store_id, inv.public_id, i.network, \
+                i.required_outputs, i.customer_refund_address, i.covenant_address, i.gross_amount, i.expiry_ts, \
+                i.arbiter_panel_json, i.arbiter_threshold, i.covenant_version, i.engagement_id, i.evaluator_fee_sompi \
+         FROM kpr1_payment_intents i JOIN invoices inv ON inv.id=i.invoice_id \
+         WHERE i.engagement_id=$1 AND i.covenant_version='escrow_v3' AND inv.status='open'",
+    ).bind(engagement_id).fetch_optional(&state.db.pool).await.map_err(AppError::Database)?
+        .ok_or_else(|| rerr("funded escrow_v3 engagement not found"))?;
+    let current: String = sqlx::query_scalar("SELECT covenant_state FROM kpr1_payment_intents WHERE id=$1")
+        .bind(c.intent_pk).fetch_one(&state.db.pool).await.map_err(AppError::Database)?;
+    if !states.iter().any(|s| *s == current) {
+        return Err(rerr(format!("escrow_v3 covenant state {current} is not valid for this action")));
+    }
+    Ok(c)
+}
+
+struct V3ExternalDraftCtx {
+    c: Funded,
+    params: kasway_covenant::escrow_v3::EscrowV3Params,
+    contracts: kasway_covenant::escrow_v3::EscrowV3Contracts,
+    covenant_utxo: Utxo,
+    fee_utxo: Utxo,
+    fee_payer: Destination,
+    prefix: kasway_covenant::Prefix,
+    min_fee: u64,
+}
+
+async fn gather_v3_open_dispute(
+    state: &AppState,
+    client: &KaspaWrpcClient,
+    engagement_id: &str,
+    role: &str,
+) -> AppResult<V3ExternalDraftCtx> {
+    let c = load_v3_engagement(state, engagement_id, &["funded", "opening_dispute"]).await?;
+    let (params, prefix, covenant_addr) = rebuild_v3(state, &c).await?;
+    let contracts = kasway_covenant::escrow_v3::compile_escrow_v3(&params).map_err(|e| rerr(e.to_string()))?;
+    let derived = covenant_address(&contracts.escrow, prefix).map_err(|e| rerr(e.to_string()))?.to_string();
+    if derived != covenant_addr { return Err(rerr("escrow_v3 covenant address mismatch")); }
+    let fee_payer = match role {
+        "customer" => params.dispute.customer_refund.clone(),
+        "seller" => params.dispute.merchant.clone(),
+        _ => return Err(rerr("participantRole must be customer or seller")),
+    };
+    let total = params.dispute.gross_amount.checked_add(params.dispute.evaluator_fee).ok_or_else(|| rerr("escrow_v3 total overflow"))?;
+    let fee_payer_address = fee_payer.address().to_string();
+    let (cov_utxos, fee_utxos) = tokio::join!(client.fetch_utxos(&covenant_addr), client.fetch_utxos(&fee_payer_address));
+    let covenant_utxo = cov_utxos.map_err(|e| rerr(e.to_string()))?.into_iter().find(|(_,_,v)| *v == total)
+        .map(|(transaction_id,index,value)| Utxo { transaction_id,index,value }).ok_or_else(|| rerr("escrow_v3 funding UTXO not visible"))?;
+    let min_fee = state.config.covenant.keeper_min_fee_sompi;
+    let fee_utxo = pick_fee_utxo(fee_utxos.map_err(|e| rerr(e.to_string()))?, min_fee)
+        .map(|(transaction_id,index,value)| Utxo { transaction_id,index,value }).ok_or_else(|| rerr("participant has no suitable fee UTXO"))?;
+    Ok(V3ExternalDraftCtx { c, params, contracts, covenant_utxo, fee_utxo, fee_payer, prefix, min_fee })
+}
+
+pub async fn evaluator_dispute_prepare(state: &AppState, engagement_id: &str, role: &str) -> AppResult<serde_json::Value> {
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
+    let ctx = gather_v3_open_dispute(state, &client, engagement_id, role).await?;
+    let draft = kasway_covenant::escrow_v3::prepare_open_dispute(
+        &ctx.contracts, &ctx.params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, ctx.fee_payer.address(),
+    ).map_err(|e| rerr(e.to_string()))?;
+    Ok(json!({
+        "engagementId": engagement_id, "participantRole": role,
+        "covenantSighash": encode_hex(&draft.covenant_sighash),
+        "feeSighash": encode_hex(&draft.fee_sighash.ok_or_else(|| rerr("missing fee sighash"))?),
+        "sigHashType": "SIG_HASH_ALL", "algorithm": "schnorr",
+        "disputeCovenantAddress": covenant_address(&ctx.contracts.dispute, ctx.prefix).map_err(|e| rerr(e.to_string()))?.to_string(),
+    }))
+}
+
+pub async fn evaluator_dispute_submit(
+    state: &AppState, engagement_id: &str, role: &str, participant_sig_hex: &str, fee_sig_hex: &str,
+) -> AppResult<serde_json::Value> {
+    let participant_sig = decode_hex(participant_sig_hex).filter(|s| s.len()==65).ok_or_else(|| rerr("participantSignature must be 65-byte hex"))?;
+    let fee_sig = decode_hex(fee_sig_hex).filter(|s| s.len()==65).ok_or_else(|| rerr("feeSignature must be 65-byte hex"))?;
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
+    let ctx = gather_v3_open_dispute(state, &client, engagement_id, role).await?;
+    let claimed = sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='opening_dispute',updated_at=$1 WHERE id=$2 AND covenant_state='funded'")
+        .bind(now_iso()).bind(ctx.c.intent_pk).execute(&state.db.pool).await.map_err(AppError::Database)?;
+    if claimed.rows_affected()==0 { return Err(rerr("escrow is no longer available to open a dispute")); }
+    let result = async {
+        let draft = kasway_covenant::escrow_v3::prepare_open_dispute(
+            &ctx.contracts, &ctx.params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, ctx.fee_payer.address(),
+        ).map_err(|e| rerr(e.to_string()))?;
+        let role_index = if role == "customer" { 0 } else { 1 };
+        let spend = kasway_covenant::escrow_v3::complete_open_dispute(&ctx.contracts, draft, &participant_sig, role_index, &fee_sig)
+            .map_err(|e| rerr(e.to_string()))?;
+        client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))
+    }.await;
+    match result {
+        Ok(tx_id) => {
+            let dispute_address = covenant_address(&ctx.contracts.dispute, ctx.prefix).map_err(|e| rerr(e.to_string()))?.to_string();
+            sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='dispute_submitted',updated_at=$1 WHERE id=$2 AND covenant_state='opening_dispute'")
+                .bind(now_iso()).bind(ctx.c.intent_pk).execute(&state.db.pool).await.map_err(AppError::Database)?;
+            Ok(json!({ "disputeTxId": tx_id, "disputeCovenantAddress": dispute_address }))
+        }
+        Err(e) => { restore_funded(state, ctx.c.intent_pk, "opening_dispute").await; Err(e) }
+    }
+}
+
+struct V3DecisionCtx {
+    c: Funded,
+    case_id: String,
+    outcome: String,
+    params: kasway_covenant::escrow_v3::EscrowV3Params,
+    contracts: kasway_covenant::escrow_v3::EscrowV3Contracts,
+    dispute_utxo: Utxo,
+    fee_utxo: Utxo,
+    fee_payer: Destination,
+    min_fee: u64,
+}
+
+async fn gather_v3_decision(
+    state: &AppState, client: &KaspaWrpcClient, case_id: &str, fee_payer_address: &str,
+) -> AppResult<V3DecisionCtx> {
+    let case: (String, String, String) = sqlx::query_as(
+        "SELECT engagement_id,state,decision_outcome FROM dispute_cases WHERE case_id=$1",
+    ).bind(case_id).fetch_optional(&state.db.pool).await.map_err(AppError::Database)?
+        .ok_or_else(AppError::row_not_found)?;
+    if !matches!(case.1.as_str(), "revealed" | "settling") { return Err(rerr("case decision must be revealed before settlement")); }
+    let c = load_v3_engagement(state, &case.0, &["dispute_open", "dispute_settling"]).await?;
+    let (params, prefix, _) = rebuild_v3(state, &c).await?;
+    let contracts = kasway_covenant::escrow_v3::compile_escrow_v3(&params).map_err(|e| rerr(e.to_string()))?;
+    let dispute_address = covenant_address(&contracts.dispute, prefix).map_err(|e| rerr(e.to_string()))?.to_string();
+    let stored: Option<String> = sqlx::query_scalar("SELECT dispute_covenant_address FROM kpr1_payment_intents WHERE id=$1")
+        .bind(c.intent_pk).fetch_one(&state.db.pool).await.map_err(AppError::Database)?;
+    if stored.as_deref()!=Some(dispute_address.as_str()) { return Err(rerr("dispute covenant address mismatch")); }
+    kasway_covenant::schnorr_pubkey_from_address(fee_payer_address)
+        .map_err(|_| rerr("feePayerAddress must be a Schnorr P2PK address"))?;
+    let fee_payer = Destination::parse(fee_payer_address).map_err(|e| rerr(format!("invalid fee payer address: {e}")))?;
+    let total = params.dispute.gross_amount.checked_add(params.dispute.evaluator_fee).ok_or_else(|| rerr("escrow_v3 total overflow"))?;
+    let (dispute_utxos, fee_utxos) = tokio::join!(client.fetch_utxos(&dispute_address), client.fetch_utxos(fee_payer_address));
+    let dispute_utxo = dispute_utxos.map_err(|e| rerr(e.to_string()))?.into_iter().find(|(_,_,v)| *v==total)
+        .map(|(transaction_id,index,value)| Utxo { transaction_id,index,value }).ok_or_else(|| rerr("dispute covenant UTXO not visible"))?;
+    let min_fee = state.config.covenant.keeper_min_fee_sompi;
+    let fee_utxo = pick_fee_utxo(fee_utxos.map_err(|e| rerr(e.to_string()))?, min_fee)
+        .map(|(transaction_id,index,value)| Utxo { transaction_id,index,value }).ok_or_else(|| rerr("fee payer has no suitable fee UTXO"))?;
+    Ok(V3DecisionCtx { c, case_id: case_id.into(), outcome: case.2, params, contracts, dispute_utxo, fee_utxo, fee_payer, min_fee })
+}
+
+pub async fn evaluator_settlement_prepare(
+    state: &AppState, case_id: &str, fee_payer_address: &str,
+) -> AppResult<serde_json::Value> {
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
+    let ctx = gather_v3_decision(state, &client, case_id, fee_payer_address).await?;
+    let release = ctx.outcome == "release";
+    let draft = kasway_covenant::escrow_v3::prepare_evaluator_decision(
+        &ctx.contracts, &ctx.params.dispute, release, &ctx.dispute_utxo, &ctx.fee_utxo,
+        ctx.min_fee, ctx.fee_payer.address(),
+    ).map_err(|e| rerr(e.to_string()))?;
+    Ok(json!({
+        "caseId": case_id, "outcome": ctx.outcome,
+        "covenantSighash": encode_hex(&draft.covenant_sighash),
+        "feeSighash": encode_hex(&draft.fee_sighash.ok_or_else(|| rerr("missing fee sighash"))?),
+        "sigHashType":"SIG_HASH_ALL", "algorithm":"schnorr",
+        "evaluatorFeeSompi": ctx.params.dispute.evaluator_fee.to_string(),
+    }))
+}
+
+pub async fn evaluator_settlement_submit(
+    state: &AppState, case_id: &str, fee_payer_address: &str, evaluator_sig_hex: &str, fee_sig_hex: &str,
+) -> AppResult<serde_json::Value> {
+    let evaluator_sig = decode_hex(evaluator_sig_hex).filter(|s| s.len()==65).ok_or_else(|| rerr("evaluatorSignature must be 65-byte hex"))?;
+    let fee_sig = decode_hex(fee_sig_hex).filter(|s| s.len()==65).ok_or_else(|| rerr("feeSignature must be 65-byte hex"))?;
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
+    let ctx = gather_v3_decision(state, &client, case_id, fee_payer_address).await?;
+    let mut tx = state.db.pool.begin().await.map_err(AppError::Database)?;
+    let case_claim = sqlx::query("UPDATE dispute_cases SET state='settling',updated_at=$1 WHERE case_id=$2 AND state='revealed'")
+        .bind(now_iso()).bind(case_id).execute(&mut *tx).await.map_err(AppError::Database)?;
+    let intent_claim = sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='dispute_settling',updated_at=$1 WHERE id=$2 AND covenant_state='dispute_open'")
+        .bind(now_iso()).bind(ctx.c.intent_pk).execute(&mut *tx).await.map_err(AppError::Database)?;
+    if case_claim.rows_affected()!=1 || intent_claim.rows_affected()!=1 { return Err(rerr("case is already settling or settled")); }
+    tx.commit().await.map_err(AppError::Database)?;
+    let release = ctx.outcome == "release";
+    let result = async {
+        let draft = kasway_covenant::escrow_v3::prepare_evaluator_decision(
+            &ctx.contracts, &ctx.params.dispute, release, &ctx.dispute_utxo, &ctx.fee_utxo,
+            ctx.min_fee, ctx.fee_payer.address(),
+        ).map_err(|e| rerr(e.to_string()))?;
+        let spend = kasway_covenant::escrow_v3::complete_evaluator_decision(
+            &ctx.contracts, draft, release, &evaluator_sig, &fee_sig,
+        ).map_err(|e| rerr(e.to_string()))?;
+        client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))
+    }.await;
+    match result {
+        Ok(tx_id) => {
+            let now = now_iso();
+            let mut dbtx = state.db.pool.begin().await.map_err(AppError::Database)?;
+            sqlx::query("UPDATE dispute_cases SET state='settled',settlement_tx_id=$1,settled_at=$2,updated_at=$2 WHERE case_id=$3 AND state='settling'")
+                .bind(&tx_id).bind(&now).bind(&ctx.case_id).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+            sqlx::query("UPDATE evaluator_engagements SET status='settled',updated_at=$1 WHERE engagement_id=$2")
+                .bind(&now).bind(&ctx.c.engagement_id).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+            if release {
+                sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='released',status='settled',release_tx_id=$1,settled_at=$2,updated_at=$2 WHERE id=$3")
+                    .bind(&tx_id).bind(&now).bind(ctx.c.intent_pk).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+                sqlx::query("UPDATE invoices SET status='paid',paid_at=COALESCE(paid_at,$1),updated_at=$1 WHERE id=$2 AND status='open'")
+                    .bind(&now).bind(ctx.c.invoice_id).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+            } else {
+                sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='refunded',status='settled',refund_tx_id=$1,settled_at=$2,updated_at=$2 WHERE id=$3")
+                    .bind(&tx_id).bind(&now).bind(ctx.c.intent_pk).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+                sqlx::query("UPDATE invoices SET status='refunded',updated_at=$1 WHERE id=$2 AND status='open'")
+                    .bind(&now).bind(ctx.c.invoice_id).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+            }
+            dbtx.commit().await.map_err(AppError::Database)?;
+            Ok(json!({ "caseId":case_id, "state":"settled", "outcome":ctx.outcome, "settlementTxId":tx_id }))
+        }
+        Err(e) => {
+            sqlx::query("UPDATE dispute_cases SET state='revealed',updated_at=$1 WHERE case_id=$2 AND state='settling'").bind(now_iso()).bind(case_id).execute(&state.db.pool).await.ok();
+            sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='dispute_open',updated_at=$1 WHERE id=$2 AND covenant_state='dispute_settling'").bind(now_iso()).bind(ctx.c.intent_pk).execute(&state.db.pool).await.ok();
+            Err(e)
+        }
+    }
 }
 
 /// Flip a funded intent to `to_state` (claiming it against a racing keeper tick
@@ -863,13 +1192,16 @@ async fn submit_refund_arbitrated(
 pub(crate) async fn arbiter_release_prepare(state: &AppState, public_id: &str) -> AppResult<serde_json::Value> {
     let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
     let ctx = gather_release_inputs(state, &client, public_id).await?;
-    let compiled = compile_escrow_v2(&ctx.params).map_err(|e| rerr(e.to_string()))?;
-    let draft = prepare_release(&compiled, &ctx.params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
+    let ReleaseParams::V2(params) = &ctx.params else {
+        return Err(rerr("escrow_v3 decisions use the selected evaluator case flow"));
+    };
+    let compiled = compile_escrow_v2(params).map_err(|e| rerr(e.to_string()))?;
+    let draft = prepare_release(&compiled, params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
         .map_err(|e| rerr(e.to_string()))?;
     Ok(json!({
         "covenantSighash": encode_hex(&draft.covenant_sighash),
-        "arbiterThreshold": ctx.params.arbiter_threshold,
-        "arbiterPanelSize": ctx.params.arbiter_panel.len(),
+        "arbiterThreshold": params.arbiter_threshold,
+        "arbiterPanelSize": params.arbiter_panel.len(),
         "sigHashType": "SIG_HASH_ALL",
         "algorithm": "schnorr",
         "note": "each independent arbiter signs this covenant sighash with their panel key; submit at least `arbiterThreshold` signatures as { index, signature } (signature = 65-byte hex: schnorr || sighash-type byte)",
@@ -894,8 +1226,11 @@ pub(crate) async fn arbiter_release(
     }
 
     let outcome = async {
-        let compiled = compile_escrow_v2(&ctx.params).map_err(|e| rerr(e.to_string()))?;
-        let draft = prepare_release(&compiled, &ctx.params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
+        let ReleaseParams::V2(params) = &ctx.params else {
+            return Err(rerr("escrow_v3 decisions use the selected evaluator case flow"));
+        };
+        let compiled = compile_escrow_v2(params).map_err(|e| rerr(e.to_string()))?;
+        let draft = prepare_release(&compiled, params, &ctx.covenant_utxo, &ctx.fee_utxo, ctx.min_fee, &ctx.keeper, ctx.prefix, 0)
             .map_err(|e| rerr(e.to_string()))?;
         let (sigs, idx) = if arbiter_sigs.is_empty() {
             // Dev fallback only: server signs with the single Kasway arbiter key.
@@ -903,7 +1238,7 @@ pub(crate) async fn arbiter_release(
             let arbiter_sig = arbiter.sign_sighash(&draft.covenant_sighash).map_err(|e| rerr(e.to_string()))?;
             (vec![arbiter_sig], vec![0u32])
         } else {
-            prepare_arbiter_signatures(&ctx.params, arbiter_sigs)?
+            prepare_arbiter_signatures(params, arbiter_sigs)?
         };
         let spend = complete_release_arbitrated(&compiled, draft, &sigs, &idx).map_err(|e| rerr(e.to_string()))?;
         client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))

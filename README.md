@@ -9,7 +9,11 @@ balance, and Kasway never touches a private key.
 
 📄 **Read the whitepaper:** [docs/WHITEPAPER.md](docs/WHITEPAPER.md)
 ([PDF](docs/WHITEPAPER.pdf)) — protocol design, trust model, KPR-1
-specification, and the target dispute-resolution architecture.
+specification, evaluator protocol, and explicit implementation limits.
+
+Protocol implementers should also read
+[docs/ARBITRATION_PROTOCOL_V1.md](docs/ARBITRATION_PROTOCOL_V1.md) for domains,
+lifecycle, routes, anchor semantics, and known incomplete work.
 
 ## How a payment works
 
@@ -26,8 +30,8 @@ specification, and the target dispute-resolution architecture.
    confirmation policy before the covenant counts as funded — a wallet's word is
    never proof of payment.
 5. Settlement happens on-chain through an authorized covenant path: customer
-   release, time-based capture, bilateral settlement, seller refund, or M-of-N
-   arbitration.
+   release, time-based capture, bilateral settlement, legacy M-of-N arbitration,
+   or a customer-selected evaluator protected by a dispute-UTXO transition.
 
 ## Quick start
 
@@ -147,7 +151,7 @@ the address-watching phase.
 
 ## Disputes
 
-Two paths, both enforced on-chain by the tiered `escrow_v2` covenant:
+Legacy invoices use two paths enforced on-chain by the tiered `escrow_v2` covenant:
 
 1. **Bilateral settlement** — customer and merchant co-sign a split of the escrowed
    amount. No third party is involved, and it resolves the large majority of real
@@ -161,24 +165,36 @@ Two paths, both enforced on-chain by the tiered `escrow_v2` covenant:
 If neither path resolves within `COVENANT_CAPTURE_WINDOW_SECS`, the keeper
 auto-captures to the merchant.
 
-The whitepaper's target architecture replaces the configured panel with an open
-evaluator marketplace — customer-selected, pseudonymous evaluators bound by a
-three-party signed engagement and end-to-end encrypted case rooms. See
-whitepaper sections 6–9; that layer is not implemented yet.
+Evaluator-protected invoices use `escrow_v3`. A pseudonymous evaluator publishes
+signed terms, the customer requests a quote, and customer, seller, and evaluator
+sign one engagement before funding. The funding output includes a fixed evaluator
+reserve and commits to `DisputeV1`. Opening a dispute consumes the original
+outpoint, disabling normal capture; the selected evaluator can then authorize
+only the committed seller payout or customer refund, with the same fixed reward
+for either result. The API stores signed ciphertext-only case envelopes,
+commit/reveal receipts, and case-derived feedback.
+
+Current limits are documented in whitepaper section 13: chain-anchor references
+are recorded but not yet independently observed, wallets verify signed
+redeem-script-to-P2SH consistency but do not compile SilverScript themselves,
+and evaluator/case UI plus external security review are still pending.
 
 ## Status
 
-Implemented and covered by integration tests: KPR-1 intent minting/signing,
+Implemented and covered by tests: KPR-1 intent minting/signing,
 covenant compilation + P2SH derivation, chain observation and confirmation
 tracking, customer release, merchant refund, bilateral settlement, M-of-N
 arbitration, invoice expiry, and recurring-invoice subscription billing with
-wallet-local auto-renew.
+wallet-local auto-renew. Evaluator protocol v1 adds the signed marketplace,
+three-party engagements, `escrow_v3`/`DisputeV1`, fee rewards, encrypted message
+APIs, decision commit/reveal, terminal evaluator settlement, and feedback-derived
+reputation. Covenant behavior is covered by local Kaspa VM execution tests.
 
 Reproducible payment evidence to date is from Kaspa **testnet-10**. Mainnet
 covenant support activated with the Toccata upgrade (June 2026); reproducing the
-TN10 demonstrations against mainnet consensus is the next milestone. The
-evaluator marketplace, encrypted case rooms, and decision commit-reveal remain
-target architecture (whitepaper section 13).
+TN10 demonstrations against mainnet consensus is the next milestone. The full
+evaluator flow still needs reproducible TN10 evidence and an external audit
+before production claims change (whitepaper section 13).
 
 ## History
 

@@ -1,0 +1,73 @@
+pragma silverscript ^0.1.0;
+
+// Kasway escrow V3 — one consented evaluator plus an actual dispute-lock
+// transition. The evaluator fee is reserved by the customer at funding time.
+contract EscrowV3(
+    byte[32][] payout_payloads,
+    int[] payout_kinds,
+    int[] payout_values,
+    int payout_count,
+    byte[32] customer_pubkey,
+    byte[32] merchant_pubkey,
+    byte[32] dispute_script_hash,
+    int gross_amount,
+    int evaluator_fee,
+    int capture_time
+) {
+    function assert_total() {
+        require(tx.inputs[this.activeInputIndex].value == gross_amount + evaluator_fee);
+    }
+
+    // Normal completion pays the commercial split and returns the unused
+    // evaluator reserve to the customer.
+    function assert_merchant_split() {
+        assert_total();
+        for (i, 0, payout_count, 8) {
+            byte[] spk = payout_kinds[i] == 0
+                ? byte[](new ScriptPubKeyP2PK(pubkey(payout_payloads[i])))
+                : byte[](new ScriptPubKeyP2SH(payout_payloads[i]));
+            require(tx.outputs[i].scriptPubKey == spk);
+            require(tx.outputs[i].value == payout_values[i]);
+        }
+        require(tx.outputs[payout_count].scriptPubKey == byte[](new ScriptPubKeyP2PK(pubkey(customer_pubkey))));
+        require(tx.outputs[payout_count].value == evaluator_fee);
+    }
+
+    entrypoint function release_confirmed(sig customer_sig) {
+        require(checkSig(customer_sig, pubkey(customer_pubkey)));
+        assert_merchant_split();
+    }
+
+    entrypoint function release_captured() {
+        require(tx.time >= capture_time);
+        assert_merchant_split();
+    }
+
+    // Either commerce party can stop normal capture by moving the complete
+    // value into the precommitted DisputeV1 P2SH covenant while this UTXO still
+    // exists. After capture becomes eligible, capture and dispute-open compete
+    // for the same outpoint and only one can confirm.
+    entrypoint function open_dispute(sig participant_sig, int participant_role) {
+        require(participant_role == 0 || participant_role == 1);
+        require(participant_role == 0
+            ? checkSig(participant_sig, pubkey(customer_pubkey))
+            : checkSig(participant_sig, pubkey(merchant_pubkey)));
+        assert_total();
+        require(tx.outputs[0].scriptPubKey == byte[](new ScriptPubKeyP2SH(dispute_script_hash)));
+        require(tx.outputs[0].value == gross_amount + evaluator_fee);
+    }
+
+    // Both parties may agree to any exact transaction output set.
+    entrypoint function release_settled(sig customer_sig, sig merchant_sig) {
+        assert_total();
+        require(checkSig(customer_sig, pubkey(customer_pubkey)));
+        require(checkSig(merchant_sig, pubkey(merchant_pubkey)));
+    }
+
+    entrypoint function refund_by_merchant(sig merchant_sig) {
+        require(checkSig(merchant_sig, pubkey(merchant_pubkey)));
+        assert_total();
+        require(tx.outputs[0].scriptPubKey == byte[](new ScriptPubKeyP2PK(pubkey(customer_pubkey))));
+        require(tx.outputs[0].value == gross_amount + evaluator_fee);
+    }
+}
