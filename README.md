@@ -203,6 +203,19 @@ Read the whitepaper first — it defines the trust boundaries the code must keep
 payment or settlement logic need a contract/integration test; `cargo test` must
 stay green (tests need a local PostgreSQL).
 
+## Support Kasway
+
+Kasway is built by one person — currently unemployed after a layoff, and
+honest about it. If community donations can cover part of the infrastructure,
+living costs, and Kasway's needs, I will develop Kasway full time.
+
+```
+kaspa:qypr7ayn2g55fccyv9n6gf9zgrcnpepkfgjf9d8mtfp68ezv3mgqnggxqs902q4
+```
+
+Every donation goes toward node infrastructure, the mainnet milestone, and
+full-time development of the roadmap in the whitepaper.
+
 ## License
 
 - `crates/kasway-covenant` (covenant scripts and compiler integration) and the
