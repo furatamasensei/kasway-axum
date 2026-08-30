@@ -1,28 +1,44 @@
 [workspace]
 resolver = "2"
-members = ["crates/kasway-db", "crates/kasway-api"]
+members = ["crates/kasway-db", "crates/kasway-api", "crates/kasway-covenant"]
+
+# Full DWARF is the bulk of a debug `target/` — for this dependency graph, most
+# of several GB. Line tables still give backtraces with file:line, which is what
+# a failing test is read with; a debugger session that needs variable inspection
+# can raise this back to 2 locally.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies are compiled optimized even in dev/test. scrypt's default params
+# are deliberately expensive (~128 MiB, log_n=17); unoptimized it runs for
+# seconds per hash, and every integration test registers a merchant — which
+# pushed requests past the router's 30s timeout and made tests fail at random.
+# Workspace crates stay unoptimized, so rebuilds and debugging are unaffected.
+[profile.dev.package."*"]
+opt-level = 3
 
 [workspace.package]
 edition = "2021"
-license = "UNLICENSED"
+license = "AGPL-3.0-only"
 publish = false
 
 [workspace.dependencies]
 axum = { version = "0.7", features = ["macros", "multipart"] }
 tokio = { version = "1", features = ["full"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "timeout"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono", "migrate"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "macros", "chrono", "migrate"] }
 chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+tokio-tungstenite = "0.24"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
+hmac = "0.12"
 futures = "0.3"
 base64 = "0.22"
 rand = "0.8"

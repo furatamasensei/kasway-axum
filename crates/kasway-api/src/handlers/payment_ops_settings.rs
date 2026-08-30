@@ -1,11 +1,8 @@
-//! `/api/payments/ops/{settings,capabilities,confirmation-policy,network-capabilities}`
-//! — PaymentTenantSettingsController + PaymentConfirmationPolicyController +
-//! PaymentNetworkCapabilitiesController.networkCapabilities. Merchant owner
-//! always holds the payments.ops.* permissions.
+//! `/api/payments/ops/confirmation-policy` — PaymentConfirmationPolicyController.
+//! Merchant owner always holds the payments.ops.* permissions.
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult};
-use crate::handlers::payments_networks::capabilities as network_capabilities;
 use crate::state::AppState;
 use crate::util::now_iso;
 use axum::extract::{Query, State};
@@ -14,250 +11,18 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-const MODULES: &[&str] = &["adjustments", "exports", "webhooks", "notifications", "exceptions", "anomalies", "evidence_packs", "analytics"];
-const RETRY_PROFILES: &[&str] = &["conservative", "balanced", "aggressive"];
-const NOTIF_CATEGORIES: &[&str] = &["payment_exception_created", "payment_exception_resolved", "payment_anomaly_detected", "webhook_delivery_failed", "webhook_endpoint_paused", "export_succeeded", "export_failed"];
-const ADJUSTMENT_KINDS: &[&str] = &["manual_credit", "write_off", "refund_record", "correction"];
-const SETTING_KEYS: &[&str] = &["enabledPaymentModules", "allowedNetworks", "allowedAssets", "defaultExportRetentionDays", "webhookRetryProfile", "exceptionNotificationCategories", "allowedManualAdjustmentKinds"];
 const POLICY_KEYS: &[&str] = &["version", "defaultConfirmations", "overrides", "riskBoostConfirmations"];
 const PLATFORM_MIN_CONFIRMATIONS: i64 = 10;
 
-#[derive(sqlx::FromRow)]
-struct SettingsRow {
-    enabled_payment_modules: String,
-    allowed_networks: String,
-    allowed_assets: String,
-    default_export_retention_days: i64,
-    webhook_retry_profile: String,
-    exception_notification_categories: String,
-    allowed_manual_adjustment_kinds: String,
-    confirmation_policy: Option<String>,
-}
-
-fn default_exception_categories() -> Value {
-    let mut m = serde_json::Map::new();
-    for c in NOTIF_CATEGORIES { m.insert((*c).into(), json!(true)); }
-    Value::Object(m)
-}
-
-fn settings_view(row: Option<&SettingsRow>) -> Value {
-    match row {
-        None => json!({
-            "enabledPaymentModules": MODULES,
-            "allowedNetworks": ["tn10"],
-            "allowedAssets": ["KAS"],
-            "defaultExportRetentionDays": 7,
-            "webhookRetryProfile": "balanced",
-            "exceptionNotificationCategories": default_exception_categories(),
-            "allowedManualAdjustmentKinds": ADJUSTMENT_KINDS,
-        }),
-        Some(r) => json!({
-            "enabledPaymentModules": parse_arr(&r.enabled_payment_modules),
-            "allowedNetworks": parse_arr(&r.allowed_networks),
-            "allowedAssets": parse_arr(&r.allowed_assets),
-            "defaultExportRetentionDays": r.default_export_retention_days,
-            "webhookRetryProfile": r.webhook_retry_profile,
-            "exceptionNotificationCategories": normalize_categories(&r.exception_notification_categories),
-            "allowedManualAdjustmentKinds": parse_arr(&r.allowed_manual_adjustment_kinds),
-        }),
-    }
-}
-
-fn parse_arr(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| json!([]))
-}
-
-fn normalize_categories(raw: &str) -> Value {
-    let parsed: Value = serde_json::from_str(raw).unwrap_or_else(|_| json!({}));
-    let mut out = serde_json::Map::new();
-    for c in NOTIF_CATEGORIES {
-        let v = parsed.get(*c).and_then(|x| x.as_bool()).unwrap_or(true);
-        out.insert((*c).into(), json!(v));
-    }
-    Value::Object(out)
-}
-
-async fn load_settings(state: &AppState, user_id: i64) -> AppResult<Option<SettingsRow>> {
-    Ok(sqlx::query_as::<_, SettingsRow>(
-        "SELECT enabled_payment_modules, allowed_networks, allowed_assets, default_export_retention_days, \
-         webhook_retry_profile, exception_notification_categories, allowed_manual_adjustment_kinds, confirmation_policy \
-         FROM payment_tenant_settings WHERE user_id = ?",
+/// Stored confirmation policy JSON for a tenant, if any.
+async fn load_policy(state: &AppState, user_id: i64) -> Result<Option<String>, sqlx::Error> {
+    let raw: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT confirmation_policy FROM payment_tenant_settings WHERE user_id = $1",
     )
     .bind(user_id)
     .fetch_optional(&state.db.pool)
-    .await?)
-}
-
-/// `GET /api/payments/ops/settings`
-pub async fn settings(auth: AuthMerchant, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let row = load_settings(&state, auth.user_id).await?;
-    Ok(Json(settings_view(row.as_ref())))
-}
-
-/// `PUT /api/payments/ops/settings`
-pub async fn update_settings(
-    auth: AuthMerchant,
-    State(state): State<AppState>,
-    Json(body): Json<Value>,
-) -> AppResult<(StatusCode, Json<Value>)> {
-    let obj = body.as_object().cloned().unwrap_or_default();
-    let unknown: Vec<&str> = obj.keys().filter(|k| !SETTING_KEYS.contains(&k.as_str())).map(|s| s.as_str()).collect();
-    if !unknown.is_empty() {
-        return Err(AppError::commerce(422, &format!("Unknown setting keys: {}", unknown.join(", "))));
-    }
-    if let Some(cats) = obj.get("exceptionNotificationCategories").and_then(|v| v.as_object()) {
-        let unk: Vec<&str> = cats.keys().filter(|k| !NOTIF_CATEGORIES.contains(&k.as_str())).map(|s| s.as_str()).collect();
-        if !unk.is_empty() {
-            return Err(AppError::commerce(422, &format!("Unknown exception notification categories: {}", unk.join(", "))));
-        }
-    }
-    validate_settings(&obj)?;
-
-    let current = settings_view(load_settings(&state, auth.user_id).await?.as_ref());
-    let merged = merge_settings(&current, &obj);
-    let now = now_iso();
-    sqlx::query(
-        "INSERT INTO payment_tenant_settings (user_id, enabled_payment_modules, allowed_networks, allowed_assets, \
-         default_export_retention_days, webhook_retry_profile, exception_notification_categories, allowed_manual_adjustment_kinds, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(user_id) DO UPDATE SET enabled_payment_modules = excluded.enabled_payment_modules, \
-         allowed_networks = excluded.allowed_networks, allowed_assets = excluded.allowed_assets, \
-         default_export_retention_days = excluded.default_export_retention_days, webhook_retry_profile = excluded.webhook_retry_profile, \
-         exception_notification_categories = excluded.exception_notification_categories, \
-         allowed_manual_adjustment_kinds = excluded.allowed_manual_adjustment_kinds, updated_at = excluded.updated_at",
-    )
-    .bind(auth.user_id)
-    .bind(merged["enabledPaymentModules"].to_string())
-    .bind(merged["allowedNetworks"].to_string())
-    .bind(merged["allowedAssets"].to_string())
-    .bind(merged["defaultExportRetentionDays"].as_i64().unwrap_or(7))
-    .bind(merged["webhookRetryProfile"].as_str().unwrap_or("balanced"))
-    .bind(merged["exceptionNotificationCategories"].to_string())
-    .bind(merged["allowedManualAdjustmentKinds"].to_string())
-    .bind(&now)
-    .bind(&now)
-    .execute(&state.db.pool)
     .await?;
-
-    Ok((StatusCode::CREATED, Json(merged)))
-}
-
-fn merge_settings(current: &Value, input: &serde_json::Map<String, Value>) -> Value {
-    let mut out = current.clone();
-    let m = out.as_object_mut().unwrap();
-    for key in ["enabledPaymentModules", "allowedNetworks", "allowedAssets", "defaultExportRetentionDays", "webhookRetryProfile", "allowedManualAdjustmentKinds"] {
-        if let Some(v) = input.get(key) {
-            // dedup arrays
-            if let Some(arr) = v.as_array() {
-                let mut seen = std::collections::HashSet::new();
-                let deduped: Vec<Value> = arr.iter().filter(|x| seen.insert(x.to_string())).cloned().collect();
-                m.insert(key.into(), Value::Array(deduped));
-            } else {
-                m.insert(key.into(), v.clone());
-            }
-        }
-    }
-    if let Some(cats) = input.get("exceptionNotificationCategories").and_then(|v| v.as_object()) {
-        let mut merged = m["exceptionNotificationCategories"].as_object().cloned().unwrap_or_default();
-        for (k, v) in cats {
-            if NOTIF_CATEGORIES.contains(&k.as_str()) {
-                merged.insert(k.clone(), json!(v.as_bool().unwrap_or(false)));
-            }
-        }
-        m.insert("exceptionNotificationCategories".into(), Value::Object(merged));
-    }
-    out
-}
-
-fn validate_settings(obj: &serde_json::Map<String, Value>) -> AppResult<()> {
-    let check_enum_arr = |key: &str, allowed: &[&str]| -> AppResult<()> {
-        if let Some(v) = obj.get(key) {
-            let arr = v.as_array().ok_or_else(|| AppError::validation_field(key, "array", &format!("The {key} field must be an array")))?;
-            if arr.is_empty() {
-                return Err(AppError::validation_field(key, "minLength", &format!("The {key} field must have at least 1 items")));
-            }
-            for item in arr {
-                if !item.as_str().map(|s| allowed.contains(&s)).unwrap_or(false) {
-                    return Err(AppError::validation_field(key, "enum", &format!("The selected {key} is invalid")));
-                }
-            }
-        }
-        Ok(())
-    };
-    check_enum_arr("enabledPaymentModules", MODULES)?;
-    check_enum_arr("allowedManualAdjustmentKinds", ADJUSTMENT_KINDS)?;
-    if let Some(v) = obj.get("webhookRetryProfile") {
-        if !v.as_str().map(|s| RETRY_PROFILES.contains(&s)).unwrap_or(false) {
-            return Err(AppError::validation_field("webhookRetryProfile", "enum", "The selected webhookRetryProfile is invalid"));
-        }
-    }
-    if let Some(v) = obj.get("defaultExportRetentionDays") {
-        let n = v.as_i64().unwrap_or(0);
-        if n < 1 || n > 365 {
-            return Err(AppError::validation_field("defaultExportRetentionDays", "range", "The defaultExportRetentionDays field is invalid"));
-        }
-    }
-    Ok(())
-}
-
-/// `GET /api/payments/ops/capabilities`
-pub async fn capabilities(auth: AuthMerchant, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let row = load_settings(&state, auth.user_id).await?;
-    let settings = settings_view(row.as_ref());
-    let modules: Vec<String> = settings["enabledPaymentModules"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-    let module_enabled = |m: &str| modules.iter().any(|x| x == m);
-
-    let setup_exists: Option<i64> = sqlx::query_scalar("SELECT id FROM setups WHERE user_id = ? LIMIT 1").bind(auth.user_id).fetch_optional(&state.db.pool).await?;
-    let setup_ready = setup_exists.is_some();
-    let webhook_url: Option<String> = sqlx::query_scalar("SELECT webhook_url FROM setups WHERE user_id = ? AND webhook_url IS NOT NULL LIMIT 1").bind(auth.user_id).fetch_optional(&state.db.pool).await?.flatten();
-    let active_endpoints: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = ? AND is_active = 1 AND paused_at IS NULL").bind(auth.user_id).fetch_one(&state.db.pool).await?;
-    let has_active_endpoint = active_endpoints > 0;
-
-    let exc_cats: Vec<String> = settings["exceptionNotificationCategories"].as_object().unwrap().iter().filter(|(_, v)| v.as_bool() == Some(true)).map(|(k, _)| k.clone()).collect();
-    let adj_kinds = &settings["allowedManualAdjustmentKinds"];
-
-    Ok(Json(json!({
-        "setup": { "exists": setup_ready, "hasWebhookUrl": webhook_url.is_some(), "hasActiveWebhookEndpoint": has_active_endpoint },
-        "constraints": { "allowedNetworks": settings["allowedNetworks"], "allowedAssets": settings["allowedAssets"] },
-        "modules": {
-            "adjustments": { "enabled": setup_ready && module_enabled("adjustments") && !adj_kinds.as_array().unwrap().is_empty(), "allowedKinds": adj_kinds, "setupRequired": true },
-            "exports": { "enabled": setup_ready && module_enabled("exports"), "defaultRetentionDays": settings["defaultExportRetentionDays"], "setupRequired": true },
-            "webhooks": { "enabled": setup_ready && module_enabled("webhooks") && has_active_endpoint, "retryProfile": settings["webhookRetryProfile"], "activeEndpointCount": active_endpoints, "setupRequired": true },
-            "notifications": { "enabled": setup_ready && module_enabled("notifications") && !exc_cats.is_empty(), "exceptionCategories": exc_cats, "setupRequired": true },
-            "exceptions": { "enabled": setup_ready && module_enabled("exceptions"), "setupRequired": true },
-            "anomalies": { "enabled": setup_ready && module_enabled("anomalies"), "setupRequired": true },
-            "evidencePacks": { "enabled": setup_ready && module_enabled("evidence_packs"), "setupRequired": true },
-            "analytics": { "enabled": setup_ready && module_enabled("analytics"), "setupRequired": true },
-        },
-        "configured": settings,
-    })))
-}
-
-/// `GET /api/payments/ops/network-capabilities` (merchant)
-pub async fn network_capabilities_merchant(auth: AuthMerchant, State(state): State<AppState>) -> AppResult<Json<Value>> {
-    let settings = settings_view(load_settings(&state, auth.user_id).await?.as_ref());
-    let allowed_nets: Vec<String> = settings["allowedNetworks"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-    let allowed_assets: Vec<String> = settings["allowedAssets"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
-
-    let capabilities: Vec<Value> = network_capabilities()
-        .into_iter()
-        .filter(|c| allowed_nets.iter().any(|n| n == c["network"].as_str().unwrap()))
-        .filter_map(|mut c| {
-            let assets: Vec<Value> = c["assets"].as_array().unwrap().iter()
-                .filter(|a| allowed_assets.iter().any(|x| x == a["assetId"].as_str().unwrap()))
-                .cloned().collect();
-            if assets.is_empty() { return None; }
-            c["assets"] = Value::Array(assets);
-            Some(c)
-        })
-        .collect();
-
-    Ok(Json(json!({
-        "allowedNetworks": allowed_nets,
-        "allowedAssets": allowed_assets,
-        "constraints": { "allowedNetworks": settings["allowedNetworks"], "allowedAssets": settings["allowedAssets"] },
-        "capabilities": capabilities,
-    })))
+    Ok(raw.flatten())
 }
 
 // ---------------- confirmation policy ----------------
@@ -331,14 +96,34 @@ fn resolve_policy(policy: &Value, network: &str, asset_id: &str, currency: &str,
     })
 }
 
+/// Required confirmations for one payment per the tenant's stored confirmation
+/// policy (platform default when unset). Used by the chain observer to decide
+/// when a matched observation may settle the invoice.
+pub(crate) async fn required_confirmations_for(
+    state: &AppState,
+    user_id: i64,
+    network: &str,
+    asset_id: &str,
+    currency: &str,
+    invoice_amount: i128,
+) -> Result<i64, sqlx::Error> {
+    let raw = load_policy(state, user_id).await?;
+    let policy = normalize_policy(raw.as_deref());
+    let resolved = resolve_policy(&policy, network, asset_id, currency, invoice_amount);
+    Ok(resolved
+        .get("requiredConfirmations")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(PLATFORM_MIN_CONFIRMATIONS))
+}
+
 /// `GET /api/payments/ops/confirmation-policy`
 pub async fn confirmation_policy(
     auth: AuthMerchant,
     State(state): State<AppState>,
     Query(q): Query<PolicyQuery>,
 ) -> AppResult<Json<Value>> {
-    let row = load_settings(&state, auth.user_id).await?;
-    let policy = normalize_policy(row.as_ref().and_then(|r| r.confirmation_policy.as_deref()));
+    let raw = load_policy(&state, auth.user_id).await?;
+    let policy = normalize_policy(raw.as_deref());
     let network = q.network.clone().unwrap_or_else(|| "tn10".into());
     let asset_id = q.asset_id.clone().unwrap_or_else(|| "KAS".into());
     let currency = q.currency.clone().unwrap_or_else(|| "KAS".into());
@@ -373,8 +158,8 @@ pub async fn update_confirmation_policy(
         return Err(AppError::commerce(422, &format!("Confirmation policy minimum confirmations must be at least {PLATFORM_MIN_CONFIRMATIONS}")));
     }
 
-    let current_row = load_settings(&state, auth.user_id).await?;
-    let current = normalize_policy(current_row.as_ref().and_then(|r| r.confirmation_policy.as_deref()));
+    let raw = load_policy(&state, auth.user_id).await?;
+    let current = normalize_policy(raw.as_deref());
     let next = normalize_policy(Some(&body.to_string()));
     // merge: next fields override current
     let mut merged = current.as_object().cloned().unwrap_or_default();
@@ -385,23 +170,14 @@ pub async fn update_confirmation_policy(
     let merged = Value::Object(merged);
 
     let now = now_iso();
-    let current_view = settings_view(current_row.as_ref());
+    // Every other column has a SQL DEFAULT; only the policy is written here.
     sqlx::query(
-        "INSERT INTO payment_tenant_settings (user_id, enabled_payment_modules, allowed_networks, allowed_assets, \
-         default_export_retention_days, webhook_retry_profile, exception_notification_categories, allowed_manual_adjustment_kinds, confirmation_policy, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO payment_tenant_settings (user_id, confirmation_policy, created_at, updated_at) \
+         VALUES ($1, $2, $3, $3) \
          ON CONFLICT(user_id) DO UPDATE SET confirmation_policy = excluded.confirmation_policy, updated_at = excluded.updated_at",
     )
     .bind(auth.user_id)
-    .bind(current_view["enabledPaymentModules"].to_string())
-    .bind(current_view["allowedNetworks"].to_string())
-    .bind(current_view["allowedAssets"].to_string())
-    .bind(current_view["defaultExportRetentionDays"].as_i64().unwrap_or(7))
-    .bind(current_view["webhookRetryProfile"].as_str().unwrap_or("balanced"))
-    .bind(current_view["exceptionNotificationCategories"].to_string())
-    .bind(current_view["allowedManualAdjustmentKinds"].to_string())
     .bind(merged.to_string())
-    .bind(&now)
     .bind(&now)
     .execute(&state.db.pool)
     .await?;

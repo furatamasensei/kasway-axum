@@ -2,14 +2,6 @@ mod common;
 
 use serde_json::{json, Value};
 
-async fn merchant_with_setup(app: &common::TestApp, email: &str) -> String {
-    let token = common::register_merchant(app, email, "secret123").await;
-    let uid = common::merchant_user_id(&app.db, email).await;
-    let store = common::seed_default_store(&app.db, uid).await;
-    common::seed_setup(&app.db, uid, store, "kaspatest:merchantpayout00001").await;
-    token
-}
-
 async fn create_link(app: &common::TestApp, token: &str, title: &str, amount: &str) -> Value {
     app.client
         .post(app.url("/api/payment-links"))
@@ -35,7 +27,7 @@ async fn payment_links_index_requires_auth() {
 #[tokio::test]
 async fn payment_links_store_creates_active_link() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl1@example.com").await;
+    let token = common::merchant_with_setup(&app, "pl1@example.com").await;
 
     let res = app
         .client
@@ -58,7 +50,7 @@ async fn payment_links_store_creates_active_link() {
 #[tokio::test]
 async fn payment_links_store_zero_amount_422() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl2@example.com").await;
+    let token = common::merchant_with_setup(&app, "pl2@example.com").await;
 
     let res = app
         .client
@@ -78,7 +70,7 @@ async fn payment_links_store_zero_amount_422() {
 #[tokio::test]
 async fn payment_links_store_validation_missing_title() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl3@example.com").await;
+    let token = common::merchant_with_setup(&app, "pl3@example.com").await;
 
     let res = app
         .client
@@ -96,7 +88,7 @@ async fn payment_links_store_validation_missing_title() {
 #[tokio::test]
 async fn payment_links_show_and_missing() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl4@example.com").await;
+    let token = common::merchant_with_setup(&app, "pl4@example.com").await;
     let link = create_link(&app, &token, "Item", "1000").await;
     let id = link["id"].as_i64().unwrap();
 
@@ -124,7 +116,7 @@ async fn payment_links_show_and_missing() {
 #[tokio::test]
 async fn payment_links_disable_enable() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl5@example.com").await;
+    let token = common::merchant_with_setup(&app, "pl5@example.com").await;
     let link = create_link(&app, &token, "Item", "1000").await;
     let id = link["id"].as_i64().unwrap();
 
@@ -156,7 +148,7 @@ async fn payment_links_disable_enable() {
 #[tokio::test]
 async fn payment_links_index_lists() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl6@example.com").await;
+    let token = common::merchant_with_setup(&app, "pl6@example.com").await;
     create_link(&app, &token, "A", "100").await;
     create_link(&app, &token, "B", "200").await;
 
@@ -180,7 +172,7 @@ async fn payment_links_index_lists() {
 #[tokio::test]
 async fn checkout_link_show_public_summary() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl7@example.com").await;
+    let token = common::merchant_with_setup(&app, "pl7@example.com").await;
     let link = create_link(&app, &token, "Donate", "12345").await;
     let public_id = link["publicId"].as_str().unwrap();
 
@@ -204,7 +196,7 @@ async fn checkout_link_show_public_summary() {
 #[tokio::test]
 async fn checkout_link_show_inactive_410_and_missing_404() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl8@example.com").await;
+    let token = common::merchant_with_setup(&app, "pl8@example.com").await;
     let link = create_link(&app, &token, "X", "100").await;
     let id = link["id"].as_i64().unwrap();
     let public_id = link["publicId"].as_str().unwrap().to_string();
@@ -240,8 +232,10 @@ async fn checkout_link_show_inactive_410_and_missing_404() {
 #[tokio::test]
 async fn checkout_link_create_invoice_spawns_and_increments_count() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "pl9@example.com").await;
-    let link = create_link(&app, &token, "Subscription", "7000").await;
+    let token = common::merchant_with_setup(&app, "pl9@example.com").await;
+    // Settleable amount: a covenant release of this must clear the KIP-9
+    // storage-mass cap (a tiny amount would be rejected by the minter guard).
+    let link = create_link(&app, &token, "Subscription", "500000000").await;
     let id = link["id"].as_i64().unwrap();
     let public_id = link["publicId"].as_str().unwrap();
 
@@ -257,7 +251,7 @@ async fn checkout_link_create_invoice_spawns_and_increments_count() {
     assert_eq!(inv["status"], "open");
     assert_eq!(inv["paymentRail"], "kpr1_covenant");
     assert_eq!(inv["paymentLinkId"], id);
-    assert_eq!(inv["subtotalAmount"], "7000");
+    assert_eq!(inv["subtotalAmount"], "500000000");
     assert!(inv["kpr1PaymentIntent"]["intentId"].as_str().unwrap().starts_with("kpr1_"));
     // metadata carries the payment-link channel markers
     assert_eq!(inv["metadata"]["source"], "payment_link");

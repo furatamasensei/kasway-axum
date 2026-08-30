@@ -4,14 +4,15 @@ use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::state::AppState;
 use crate::store_context::{assert_can_create_new_payments, ensure_default_store};
-use crate::util::now_iso;
+use crate::util::{now_iso, random_hex, ser_bool, ser_json};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use rand::RngCore;
+use serde::Serialize;
 use serde_json::{json, Value};
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct StoreRow {
     id: i64,
     user_id: i64,
@@ -19,8 +20,11 @@ pub(crate) struct StoreRow {
     name: String,
     slug: Option<String>,
     status: String,
-    is_included: bool,
-    is_default: bool,
+    #[serde(serialize_with = "ser_bool")]
+    is_included: i64,
+    #[serde(serialize_with = "ser_bool")]
+    is_default: i64,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     disabled_at: Option<String>,
     archived_at: Option<String>,
@@ -32,30 +36,12 @@ const STORE_COLS: &str = "id, user_id, public_id, name, slug, status, is_include
     metadata, disabled_at, archived_at, created_at, updated_at";
 
 fn serialize_store(s: &StoreRow) -> Value {
-    let metadata = match &s.metadata {
-        None => Value::Null,
-        Some(m) => serde_json::from_str(m).unwrap_or(Value::Null),
-    };
-    json!({
-        "id": s.id,
-        "userId": s.user_id,
-        "publicId": s.public_id,
-        "name": s.name,
-        "slug": s.slug,
-        "status": s.status,
-        "isIncluded": s.is_included,
-        "isDefault": s.is_default,
-        "metadata": metadata,
-        "disabledAt": s.disabled_at,
-        "archivedAt": s.archived_at,
-        "createdAt": s.created_at,
-        "updatedAt": s.updated_at,
-    })
+    serde_json::to_value(s).unwrap_or(Value::Null)
 }
 
 async fn load_owned_store(state: &AppState, user_id: i64, id: i64) -> AppResult<StoreRow> {
     sqlx::query_as::<_, StoreRow>(&format!(
-        "SELECT {STORE_COLS} FROM stores WHERE user_id = ? AND id = ?"
+        "SELECT {STORE_COLS} FROM stores WHERE user_id = $1 AND id = $2"
     ))
     .bind(user_id)
     .bind(id)
@@ -72,7 +58,7 @@ async fn ensure_slug_available(
 ) -> AppResult<()> {
     let Some(slug) = slug else { return Ok(()) };
     let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM stores WHERE user_id = ? AND slug = ? AND id != ?",
+        "SELECT id FROM stores WHERE user_id = $1 AND slug = $2 AND id != $3",
     )
     .bind(user_id)
     .bind(slug)
@@ -89,7 +75,7 @@ async fn ensure_slug_available(
 pub async fn index(auth: AuthMerchant, State(state): State<AppState>) -> AppResult<Json<Value>> {
     ensure_default_store(&state, auth.user_id).await?;
     let stores = sqlx::query_as::<_, StoreRow>(&format!(
-        "SELECT {STORE_COLS} FROM stores WHERE user_id = ? ORDER BY is_default DESC, id ASC"
+        "SELECT {STORE_COLS} FROM stores WHERE user_id = $1 ORDER BY is_default DESC, id ASC"
     ))
     .bind(auth.user_id)
     .fetch_all(&state.db.pool)
@@ -115,10 +101,10 @@ pub async fn store(
     let now = now_iso();
     let public_id = format!("store_{}", random_hex(12));
 
-    let result = sqlx::query(
+    let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO stores \
          (user_id, public_id, name, slug, status, is_included, is_default, metadata, disabled_at, archived_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'disabled', 0, 0, ?, ?, NULL, ?, ?)",
+         VALUES ($1, $2, $3, $4, 'disabled', 0, 0, $5, $6, NULL, $7, $8) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(&public_id)
@@ -128,9 +114,8 @@ pub async fn store(
     .bind(&now)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-    let id = result.last_insert_rowid();
     // NOTE: markPaidStorePendingEntitlement (pending entitlement) is a side
     // effect not surfaced in the response; deferred to the entitlements slice.
 
@@ -167,16 +152,16 @@ pub async fn update(
 
     let now = now_iso();
     if let Some(name) = name {
-        sqlx::query("UPDATE stores SET name = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE stores SET name = $1, updated_at = $2 WHERE id = $3")
             .bind(name).bind(&now).bind(s.id).execute(&state.db.pool).await?;
     }
     if body.get("slug").is_some() {
-        sqlx::query("UPDATE stores SET slug = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE stores SET slug = $1, updated_at = $2 WHERE id = $3")
             .bind(&slug).bind(&now).bind(s.id).execute(&state.db.pool).await?;
     }
     if body.get("metadata").is_some() {
         let meta_str = metadata.map(|m| m.to_string());
-        sqlx::query("UPDATE stores SET metadata = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE stores SET metadata = $1, updated_at = $2 WHERE id = $3")
             .bind(&meta_str).bind(&now).bind(s.id).execute(&state.db.pool).await?;
     }
 
@@ -195,11 +180,11 @@ pub async fn set_default(
     assert_can_create_new_payments(&state, s.id).await?;
 
     // clear other defaults first to respect the partial-unique index
-    sqlx::query("UPDATE stores SET is_default = 0 WHERE user_id = ?")
+    sqlx::query("UPDATE stores SET is_default = 0 WHERE user_id = $1")
         .bind(auth.user_id)
         .execute(&state.db.pool)
         .await?;
-    sqlx::query("UPDATE stores SET is_default = 1, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE stores SET is_default = 1, updated_at = $1 WHERE id = $2")
         .bind(now_iso())
         .bind(s.id)
         .execute(&state.db.pool)
@@ -263,8 +248,3 @@ fn validate_store(
     Ok((name, slug, metadata))
 }
 
-fn random_hex(bytes: usize) -> String {
-    let mut b = vec![0u8; bytes];
-    rand::thread_rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{:02x}", x)).collect()
-}

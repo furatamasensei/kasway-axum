@@ -34,7 +34,7 @@ pub async fn countries(
 
 async fn get_or_create_settings(state: &AppState, user_id: i64, store_id: i64) -> AppResult<String> {
     let existing: Option<String> =
-        sqlx::query_scalar("SELECT fallback_policy FROM store_regional_pricing_settings WHERE store_id = ?")
+        sqlx::query_scalar("SELECT fallback_policy FROM store_regional_pricing_settings WHERE store_id = $1")
             .bind(store_id)
             .fetch_optional(&state.db.pool)
             .await?;
@@ -44,7 +44,7 @@ async fn get_or_create_settings(state: &AppState, user_id: i64, store_id: i64) -
     let now = now_iso();
     sqlx::query(
         "INSERT INTO store_regional_pricing_settings (user_id, store_id, fallback_policy, created_at, updated_at) \
-         VALUES (?, ?, 'fail_closed', ?, ?)",
+         VALUES ($1, $2, 'fail_closed', $3, $4)",
     )
     .bind(user_id)
     .bind(store_id)
@@ -60,7 +60,7 @@ async fn settings_payload(state: &AppState, user_id: i64, store_id: i64) -> AppR
     let rows = sqlx::query_as::<_, (String, Option<String>)>(
         "SELECT ssc.country_code, sc.name FROM store_sellable_countries ssc \
          LEFT JOIN supported_countries sc ON sc.code = ssc.country_code \
-         WHERE ssc.user_id = ? AND ssc.store_id = ? ORDER BY ssc.country_code ASC",
+         WHERE ssc.user_id = $1 AND ssc.store_id = $2 ORDER BY ssc.country_code ASC",
     )
     .bind(user_id)
     .bind(store_id)
@@ -132,7 +132,7 @@ pub async fn update_settings(
         }
         for code in codes {
             let supported: Option<String> =
-                sqlx::query_scalar("SELECT code FROM supported_countries WHERE code = ?")
+                sqlx::query_scalar("SELECT code FROM supported_countries WHERE code = $1")
                     .bind(code)
                     .fetch_optional(&state.db.pool)
                     .await?;
@@ -147,23 +147,23 @@ pub async fn update_settings(
 
     // upsert setting
     let existing: Option<i64> =
-        sqlx::query_scalar("SELECT id FROM store_regional_pricing_settings WHERE store_id = ?")
+        sqlx::query_scalar("SELECT id FROM store_regional_pricing_settings WHERE store_id = $1")
             .bind(store_id)
             .fetch_optional(&state.db.pool)
             .await?;
     if let Some(id) = existing {
-        sqlx::query("UPDATE store_regional_pricing_settings SET fallback_policy = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE store_regional_pricing_settings SET fallback_policy = $1, updated_at = $2 WHERE id = $3")
             .bind(&fallback).bind(&now).bind(id).execute(&state.db.pool).await?;
     } else {
-        sqlx::query("INSERT INTO store_regional_pricing_settings (user_id, store_id, fallback_policy, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO store_regional_pricing_settings (user_id, store_id, fallback_policy, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)")
             .bind(auth.user_id).bind(store_id).bind(&fallback).bind(&now).bind(&now).execute(&state.db.pool).await?;
     }
 
     if let Some(codes) = &country_codes {
-        sqlx::query("DELETE FROM store_sellable_countries WHERE user_id = ? AND store_id = ?")
+        sqlx::query("DELETE FROM store_sellable_countries WHERE user_id = $1 AND store_id = $2")
             .bind(auth.user_id).bind(store_id).execute(&state.db.pool).await?;
         for code in codes {
-            sqlx::query("INSERT INTO store_sellable_countries (user_id, store_id, country_code, created_at, updated_at) VALUES (?, ?, ?, ?, ?)")
+            sqlx::query("INSERT INTO store_sellable_countries (user_id, store_id, country_code, created_at, updated_at) VALUES ($1, $2, $3, $4, $5)")
                 .bind(auth.user_id).bind(store_id).bind(code).bind(&now).bind(&now).execute(&state.db.pool).await?;
         }
     }

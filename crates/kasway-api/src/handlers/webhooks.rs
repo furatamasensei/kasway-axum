@@ -2,21 +2,21 @@
 //! WebhookEndpointsController / WebhookEventsController /
 //! WebhookDeliveryControlsController + their services.
 //!
-//! Merchant-guarded (owner always has `payments.ops.manage_webhooks`). Actual
-//! HTTP delivery (DeliverWebhookJob) + notifications are deferred — delivery
-//! rows are created `pending`. URL registration enforces the SSRF policy
-//! (synchronous checks; DNS resolution is deferred).
+//! Merchant-guarded (owner always has `payments.ops.manage_webhooks`).
+//! Delivery rows are created `pending` and picked up by the background
+//! delivery worker (`crate::webhook_worker`); notifications are deferred.
+//! URL registration enforces the SSRF policy (synchronous checks; DNS
+//! resolution is deferred).
 
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
-use crate::util::{now_iso, paginator_meta};
+use crate::util::{now_iso, paginator_meta, random_hex, ser_bool, ser_json_arr, ser_json_obj};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const WEBHOOK_EVENT_TYPES: &[&str] = &[
@@ -25,6 +25,7 @@ const WEBHOOK_EVENT_TYPES: &[&str] = &[
     "invoice.expired",
     "payment.confirmed",
     "invoice.paid",
+    "invoice.refunded",
     "subscription.created",
     "subscription.updated",
     "subscription.paused",
@@ -32,19 +33,23 @@ const WEBHOOK_EVENT_TYPES: &[&str] = &[
     "subscription.cancelled",
     "subscription.invoice.created",
     "subscription.invoice.paid",
+    "subscription.price.changed",
     "subscription.past_due",
 ];
 
 // ---------- rows + serialization ----------
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
 struct EndpointRow {
     id: i64,
     user_id: i64,
     store_id: Option<i64>,
     url: String,
+    #[serde(serialize_with = "ser_json_arr")]
     events: String,
-    is_active: bool,
+    #[serde(serialize_with = "ser_bool")]
+    is_active: i64,
     paused_at: Option<String>,
     secret_rotated_at: Option<String>,
     created_at: Option<String>,
@@ -55,25 +60,15 @@ const ENDPOINT_COLS: &str = "id, user_id, store_id, url, events, is_active, paus
     secret_rotated_at, created_at, updated_at";
 
 fn serialize_endpoint(e: &EndpointRow, deliveries: Option<&[DeliveryRow]>) -> Value {
-    let mut obj = json!({
-        "id": e.id,
-        "userId": e.user_id,
-        "storeId": e.store_id,
-        "url": e.url,
-        "events": serde_json::from_str::<Value>(&e.events).unwrap_or(json!([])),
-        "isActive": e.is_active,
-        "pausedAt": e.paused_at,
-        "secretRotatedAt": e.secret_rotated_at,
-        "createdAt": e.created_at,
-        "updatedAt": e.updated_at,
-    });
+    let mut obj = serde_json::to_value(e).unwrap_or(Value::Null);
     if let (Value::Object(map), Some(ds)) = (&mut obj, deliveries) {
         map.insert("deliveries".into(), Value::Array(ds.iter().map(|d| serialize_delivery(d, None, None)).collect()));
     }
     obj
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct EventRow {
     id: i64,
     user_id: i64,
@@ -81,6 +76,7 @@ struct EventRow {
     event_type: String,
     resource_type: String,
     resource_id: String,
+    #[serde(serialize_with = "ser_json_obj")]
     payload: String,
     created_at: Option<String>,
     updated_at: Option<String>,
@@ -89,17 +85,7 @@ struct EventRow {
 const EVENT_COLS: &str = "id, user_id, store_id, event_type, resource_type, resource_id, payload, created_at, updated_at";
 
 fn serialize_event(e: &EventRow, deliveries: Option<&[(DeliveryRow, Option<EndpointRow>)]>) -> Value {
-    let mut obj = json!({
-        "id": e.id,
-        "userId": e.user_id,
-        "storeId": e.store_id,
-        "eventType": e.event_type,
-        "resourceType": e.resource_type,
-        "resourceId": e.resource_id,
-        "payload": serde_json::from_str::<Value>(&e.payload).unwrap_or(json!({})),
-        "createdAt": e.created_at,
-        "updatedAt": e.updated_at,
-    });
+    let mut obj = serde_json::to_value(e).unwrap_or(Value::Null);
     if let (Value::Object(map), Some(ds)) = (&mut obj, deliveries) {
         map.insert(
             "deliveries".into(),
@@ -109,7 +95,8 @@ fn serialize_event(e: &EventRow, deliveries: Option<&[(DeliveryRow, Option<Endpo
     obj
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct DeliveryRow {
     id: i64,
     webhook_event_id: i64,
@@ -119,7 +106,8 @@ struct DeliveryRow {
     response_status: Option<i64>,
     response_body: Option<String>,
     error: Option<String>,
-    is_replay: bool,
+    #[serde(serialize_with = "ser_bool")]
+    is_replay: i64,
     last_attempted_at: Option<String>,
     next_attempt_at: Option<String>,
     delivered_at: Option<String>,
@@ -132,22 +120,7 @@ const DELIVERY_COLS: &str = "id, webhook_event_id, webhook_endpoint_id, status, 
     delivered_at, created_at, updated_at";
 
 fn serialize_delivery(d: &DeliveryRow, endpoint: Option<&EndpointRow>, event: Option<&EventRow>) -> Value {
-    let mut obj = json!({
-        "id": d.id,
-        "webhookEventId": d.webhook_event_id,
-        "webhookEndpointId": d.webhook_endpoint_id,
-        "status": d.status,
-        "attemptCount": d.attempt_count,
-        "responseStatus": d.response_status,
-        "responseBody": d.response_body,
-        "error": d.error,
-        "isReplay": d.is_replay,
-        "lastAttemptedAt": d.last_attempted_at,
-        "nextAttemptAt": d.next_attempt_at,
-        "deliveredAt": d.delivered_at,
-        "createdAt": d.created_at,
-        "updatedAt": d.updated_at,
-    });
+    let mut obj = serde_json::to_value(d).unwrap_or(Value::Null);
     if let Value::Object(map) = &mut obj {
         if let Some(ep) = endpoint {
             map.insert("endpoint".into(), serialize_endpoint(ep, None));
@@ -161,14 +134,10 @@ fn serialize_delivery(d: &DeliveryRow, endpoint: Option<&EndpointRow>, event: Op
 
 // ---------- helpers ----------
 
-fn random_hex(n: usize) -> String {
-    let mut b = vec![0u8; n];
-    rand::thread_rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{:02x}", x)).collect()
-}
-
-fn q_store_id(q: &WebhookQuery) -> Option<i64> {
-    q.store_id
+/// Dedup event types preserving first-seen order.
+fn dedup_events(events: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    events.into_iter().filter(|e| seen.insert(e.clone())).collect()
 }
 
 #[derive(Deserialize, Default)]
@@ -191,9 +160,9 @@ pub struct WebhookQuery {
 
 /// findEndpoint: user-scoped (+ optional storeId). 404 when absent/cross-user.
 async fn find_endpoint(state: &AppState, user_id: i64, id: i64, store_id: Option<i64>) -> AppResult<EndpointRow> {
-    let mut sql = format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = ? AND id = ?");
+    let mut sql = format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = $1 AND id = $2");
     if store_id.is_some() {
-        sql.push_str(" AND store_id = ?");
+        sql.push_str(" AND store_id = $3");
     }
     let mut q = sqlx::query_as::<_, EndpointRow>(&sql).bind(user_id).bind(id);
     if let Some(sid) = store_id {
@@ -202,18 +171,28 @@ async fn find_endpoint(state: &AppState, user_id: i64, id: i64, store_id: Option
     q.fetch_optional(&state.db.pool).await?.ok_or_else(AppError::row_not_found)
 }
 
-/// findOrFail by id (global) — pause/resume/rotate use this then ownership 403.
+/// findOrFail by id (global, no ownership check).
 async fn find_endpoint_global(state: &AppState, id: i64) -> AppResult<EndpointRow> {
-    sqlx::query_as::<_, EndpointRow>(&format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = ?"))
+    sqlx::query_as::<_, EndpointRow>(&format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = $1"))
         .bind(id)
         .fetch_optional(&state.db.pool)
         .await?
         .ok_or_else(AppError::row_not_found)
 }
 
+/// findOrFail by id (404 when absent) then ownership check (403 when the
+/// endpoint belongs to another user) — pause/resume/rotate semantics.
+async fn find_endpoint_authorized(state: &AppState, user_id: i64, id: i64) -> AppResult<EndpointRow> {
+    let e = find_endpoint_global(state, id).await?;
+    if e.user_id != user_id {
+        return Err(AppError::Forbidden);
+    }
+    Ok(e)
+}
+
 // ---------- URL policy (SSRF) ----------
 
-fn validate_webhook_url(raw: &str, allow_loopback: bool) -> Result<(), (&'static str, &'static str)> {
+pub(crate) async fn validate_webhook_url(raw: &str, allow_loopback: bool) -> Result<(), (&'static str, &'static str)> {
     let parsed = url::Url::parse(raw).map_err(|_| ("invalid_url", "Webhook URL is not a valid URL"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(("embedded_credentials", "Webhook URL must not contain embedded credentials"));
@@ -230,25 +209,58 @@ fn validate_webhook_url(raw: &str, allow_loopback: bool) -> Result<(), (&'static
     if allow_loopback && is_loopback {
         return Ok(());
     }
+    // IP-literal host: validate directly against the forbidden-IP rules.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if is_forbidden_ip(&ip) {
             return Err(("forbidden_address", "Webhook URL must not target a private, loopback, link-local, or reserved address"));
+        }
+        return Ok(());
+    }
+    // DNS name host: reject bare "localhost" outright. Then best-effort resolve:
+    // if the name resolves now, reject any forbidden IP; if it does NOT resolve
+    // (NXDOMAIN / offline / DNS not yet propagated) allow it through — delivery
+    // time is the hard SSRF gate, where `webhook_worker` re-resolves, re-checks
+    // every IP against `is_forbidden_ip`, and PINS the connection to those
+    // validated addresses (defeating DNS-rebinding). The loopback dev exception
+    // was already handled above.
+    if host == "localhost" {
+        return Err(("forbidden_address", "Webhook URL must not target localhost"));
+    }
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    if let Ok(addrs) = tokio::net::lookup_host(format!("{host}:{port}")).await {
+        for addr in addrs {
+            if is_forbidden_ip(&addr.ip()) {
+                return Err(("forbidden_address", "Webhook URL must not resolve to a private, loopback, link-local, or reserved address"));
+            }
         }
     }
     Ok(())
 }
 
-fn is_forbidden_ip(ip: &std::net::IpAddr) -> bool {
+pub(crate) fn is_forbidden_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
                 || v4.is_broadcast() || v4.is_documentation()
         }
-        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        std::net::IpAddr::V6(v6) => {
+            // IPv4-mapped (::ffff:a.b.c.d): fall back to the v4 rules.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_forbidden_ip(&std::net::IpAddr::V4(v4));
+            }
+            let seg = v6.octets();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // unique-local fc00::/7
+                || (seg[0] & 0xfe) == 0xfc
+                // link-local fe80::/10
+                || (seg[0] == 0xfe && (seg[1] & 0xc0) == 0x80)
+        }
     }
 }
 
-fn allow_loopback(state: &AppState) -> bool {
+pub(crate) fn allow_loopback(state: &AppState) -> bool {
     state.config.node_env != "production"
 }
 
@@ -260,22 +272,25 @@ pub async fn endpoints_index(
     State(state): State<AppState>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<Json<Value>> {
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    // Clamp pagination params before multiplying so `offset` can't overflow i64.
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
     let (filter, bind_store) = match q.store_id {
-        Some(_) => (" AND store_id = ?", true),
+        Some(_) => (" AND store_id = $2", true),
         None => ("", false),
     };
 
-    let count_sql = format!("SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = ?{filter}");
+    let count_sql = format!("SELECT COUNT(*) FROM webhook_endpoints WHERE user_id = $1{filter}");
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(auth.user_id);
     if bind_store { cq = cq.bind(q.store_id.unwrap()); }
     let total = cq.fetch_one(&state.db.pool).await?;
 
+    // list: user_id=$1, optional store=$2, then LIMIT/OFFSET follow in bind order
+    let (limit_ph, offset_ph) = if bind_store { ("$3", "$4") } else { ("$2", "$3") };
     let list_sql = format!(
-        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = ?{filter} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = $1{filter} ORDER BY created_at DESC, id DESC LIMIT {limit_ph} OFFSET {offset_ph}"
     );
     let mut lq = sqlx::query_as::<_, EndpointRow>(&list_sql).bind(auth.user_id);
     if bind_store { lq = lq.bind(q.store_id.unwrap()); }
@@ -293,7 +308,7 @@ pub async fn endpoints_store(
 ) -> AppResult<(StatusCode, Json<Value>)> {
     let (url_, events, is_active, store_id_in) = validate_store_endpoint(&body)?;
 
-    if let Err((code, reason)) = validate_webhook_url(&url_, allow_loopback(&state)) {
+    if let Err((code, reason)) = validate_webhook_url(&url_, allow_loopback(&state)).await {
         return Err(AppError::Validation(vec![ValidationFailure {
             message: reason.into(),
             rule: code.into(),
@@ -304,14 +319,11 @@ pub async fn endpoints_store(
     let store_id = resolve_request_store(&state, auth.user_id, store_id_in).await?;
     let signing_secret = format!("whsec_{}", random_hex(32));
     let now = now_iso();
-    // dedup events preserving order
-    let mut seen = std::collections::HashSet::new();
-    let events: Vec<String> = events.into_iter().filter(|e| seen.insert(e.clone())).collect();
-    let events_json = serde_json::to_string(&events).unwrap();
+    let events_json = serde_json::to_string(&dedup_events(events)).unwrap();
 
-    let result = sqlx::query(
+    let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO webhook_endpoints (user_id, store_id, url, events, signing_secret, is_active, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(store_id)
@@ -321,9 +333,8 @@ pub async fn endpoints_store(
     .bind(is_active as i64)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-    let id = result.last_insert_rowid();
 
     let e = find_endpoint(&state, auth.user_id, id, None).await?;
     let mut v = serialize_endpoint(&e, None);
@@ -338,9 +349,9 @@ pub async fn endpoints_show(
     Path(id): Path<i64>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<Json<Value>> {
-    let e = find_endpoint(&state, auth.user_id, id, q_store_id(&q)).await?;
+    let e = find_endpoint(&state, auth.user_id, id, q.store_id).await?;
     let deliveries = sqlx::query_as::<_, DeliveryRow>(&format!(
-        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_endpoint_id = ? ORDER BY created_at DESC LIMIT 20"
+        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_endpoint_id = $1 ORDER BY created_at DESC, id DESC LIMIT 20"
     ))
     .bind(e.id)
     .fetch_all(&state.db.pool)
@@ -356,30 +367,28 @@ pub async fn endpoints_update(
     Query(q): Query<WebhookQuery>,
     Json(body): Json<Value>,
 ) -> AppResult<Json<Value>> {
-    let e = find_endpoint(&state, auth.user_id, id, q_store_id(&q)).await?;
+    let e = find_endpoint(&state, auth.user_id, id, q.store_id).await?;
     let now = now_iso();
 
     if let Some(url_v) = body.get("url") {
         let url_ = url_v.as_str().unwrap_or("");
-        if let Err((code, reason)) = validate_webhook_url(url_, allow_loopback(&state)) {
+        if let Err((code, reason)) = validate_webhook_url(url_, allow_loopback(&state)).await {
             return Err(AppError::Validation(vec![ValidationFailure {
                 message: reason.into(),
                 rule: code.into(),
                 field: "url".into(),
             }]));
         }
-        sqlx::query("UPDATE webhook_endpoints SET url = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE webhook_endpoints SET url = $1, updated_at = $2 WHERE id = $3")
             .bind(url_).bind(&now).bind(e.id).execute(&state.db.pool).await?;
     }
     if let Some(events_v) = body.get("events") {
-        let events = parse_events(events_v)?;
-        let mut seen = std::collections::HashSet::new();
-        let events: Vec<String> = events.into_iter().filter(|x| seen.insert(x.clone())).collect();
-        sqlx::query("UPDATE webhook_endpoints SET events = ?, updated_at = ? WHERE id = ?")
+        let events = dedup_events(parse_events(events_v)?);
+        sqlx::query("UPDATE webhook_endpoints SET events = $1, updated_at = $2 WHERE id = $3")
             .bind(serde_json::to_string(&events).unwrap()).bind(&now).bind(e.id).execute(&state.db.pool).await?;
     }
     if let Some(active) = body.get("isActive").and_then(|v| v.as_bool()) {
-        sqlx::query("UPDATE webhook_endpoints SET is_active = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE webhook_endpoints SET is_active = $1, updated_at = $2 WHERE id = $3")
             .bind(active as i64).bind(&now).bind(e.id).execute(&state.db.pool).await?;
     }
 
@@ -394,8 +403,8 @@ pub async fn endpoints_destroy(
     Path(id): Path<i64>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<StatusCode> {
-    let e = find_endpoint(&state, auth.user_id, id, q_store_id(&q)).await?;
-    sqlx::query("DELETE FROM webhook_endpoints WHERE id = ?").bind(e.id).execute(&state.db.pool).await?;
+    let e = find_endpoint(&state, auth.user_id, id, q.store_id).await?;
+    sqlx::query("DELETE FROM webhook_endpoints WHERE id = $1").bind(e.id).execute(&state.db.pool).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -407,7 +416,7 @@ pub async fn endpoints_test_send(
     Query(q): Query<WebhookQuery>,
     Json(body): Json<Value>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
-    let e = find_endpoint(&state, auth.user_id, id, q_store_id(&q)).await?;
+    let e = find_endpoint(&state, auth.user_id, id, q.store_id).await?;
     let event_type = match body.get("eventType").and_then(|v| v.as_str()) {
         Some(t) if WEBHOOK_EVENT_TYPES.contains(&t) => t.to_string(),
         _ => {
@@ -420,7 +429,7 @@ pub async fn endpoints_test_send(
     };
 
     let events: Vec<String> = serde_json::from_str(&e.events).unwrap_or_default();
-    let subscribed = e.is_active && e.paused_at.is_none() && events.contains(&event_type);
+    let subscribed = e.is_active != 0 && e.paused_at.is_none() && events.contains(&event_type);
     if !subscribed {
         return Err(AppError::Validation(vec![ValidationFailure {
             message: format!("Endpoint is not subscribed to {event_type}"),
@@ -438,14 +447,13 @@ pub async fn endpoints_test_send(
     let payload = body.get("payload").cloned().unwrap_or_else(|| json!({ "test": true, "webhookEndpointId": e.id }));
     let now = now_iso();
 
-    let ev = sqlx::query(
+    let event_id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO webhook_events (user_id, store_id, event_type, resource_type, resource_id, payload, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
     )
     .bind(e.user_id).bind(e.store_id).bind(&event_type).bind(&resource_type).bind(&resource_id)
     .bind(payload.to_string()).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?;
-    let event_id = ev.last_insert_rowid();
+    .fetch_one(&state.db.pool).await?;
 
     let delivery_id = create_delivery(&state, event_id, e.id, false, &now).await?;
 
@@ -456,15 +464,76 @@ pub async fn endpoints_test_send(
     }))))
 }
 
-async fn create_delivery(state: &AppState, event_id: i64, endpoint_id: i64, is_replay: bool, now: &str) -> AppResult<i64> {
-    let r = sqlx::query(
+async fn create_delivery(state: &AppState, event_id: i64, endpoint_id: i64, is_replay: bool, now: &str) -> Result<i64, sqlx::Error> {
+    let r: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO webhook_deliveries (webhook_event_id, webhook_endpoint_id, status, attempt_count, is_replay, created_at, updated_at) \
-         VALUES (?, ?, 'pending', 0, ?, ?, ?)",
+         VALUES ($1, $2, 'pending', 0, $3, $4, $5) RETURNING id",
     )
     .bind(event_id).bind(endpoint_id).bind(is_replay as i64).bind(now).bind(now)
-    .execute(&state.db.pool).await?;
-    // DeliverWebhookJob.dispatch -> deferred no-op
-    Ok(r.last_insert_rowid())
+    .fetch_one(&state.db.pool).await?;
+    // Picked up by the background delivery worker (crate::webhook_worker).
+    Ok(r)
+}
+
+/// Emit a webhook event: insert the `webhook_events` row and fan out pending
+/// deliveries to every active, non-paused endpoint subscribed to `event_type`
+/// (same store scoping as `events_replay`: the event's store, or every
+/// endpoint when the event is account-level and has none). Deliveries are
+/// picked up by the background worker. Returns the event id.
+pub(crate) async fn emit_event(
+    state: &AppState,
+    user_id: i64,
+    store_id: Option<i64>,
+    event_type: &str,
+    resource_type: &str,
+    resource_id: &str,
+    payload: &Value,
+) -> Result<i64, sqlx::Error> {
+    let now = now_iso();
+    let event_id: i64 = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO webhook_events (user_id, store_id, event_type, resource_type, resource_id, payload, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
+    )
+    .bind(user_id).bind(store_id).bind(event_type).bind(resource_type).bind(resource_id)
+    .bind(payload.to_string()).bind(&now).bind(&now)
+    .fetch_one(&state.db.pool).await?;
+
+    fan_out(state, user_id, store_id, event_id, event_type, false, &now).await?;
+    Ok(event_id)
+}
+
+/// Fan out pending deliveries for an event to every active, non-paused
+/// endpoint subscribed to `event_type` — scoped to the event's store, or to
+/// ALL of the user's endpoints when the event has none (account-level events
+/// like the subscription lifecycle: subscriptions are not store-scoped).
+/// Endpoints registered via the API always get a store assigned
+/// (`resolve_request_store`), so matching store-less events only against
+/// store-less endpoints would make those events silently undeliverable.
+/// Shared by `emit_event` and `events_replay` (createDeliveries).
+async fn fan_out(
+    state: &AppState,
+    user_id: i64,
+    store_id: Option<i64>,
+    event_id: i64,
+    event_type: &str,
+    is_replay: bool,
+    now: &str,
+) -> Result<(), sqlx::Error> {
+    let mut sql = format!(
+        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = $1 AND is_active = 1 AND paused_at IS NULL"
+    );
+    if store_id.is_some() { sql.push_str(" AND store_id = $2"); }
+    let mut q = sqlx::query_as::<_, EndpointRow>(&sql).bind(user_id);
+    if let Some(s) = store_id { q = q.bind(s); }
+    let endpoints = q.fetch_all(&state.db.pool).await?;
+
+    for ep in &endpoints {
+        let events: Vec<String> = serde_json::from_str(&ep.events).unwrap_or_default();
+        if events.iter().any(|e| e == event_type) {
+            create_delivery(state, event_id, ep.id, is_replay, now).await?;
+        }
+    }
+    Ok(())
 }
 
 // ---------- delivery controls (pause/resume/rotate) ----------
@@ -475,12 +544,9 @@ pub async fn endpoints_pause(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
-    let e = find_endpoint_global(&state, id).await?;
-    if e.user_id != auth.user_id {
-        return Err(AppError::Forbidden);
-    }
+    let e = find_endpoint_authorized(&state, auth.user_id, id).await?;
     if e.paused_at.is_none() {
-        sqlx::query("UPDATE webhook_endpoints SET paused_at = ?, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE webhook_endpoints SET paused_at = $1, updated_at = $2 WHERE id = $3")
             .bind(now_iso()).bind(now_iso()).bind(e.id).execute(&state.db.pool).await?;
         // notification emit -> deferred no-op
     }
@@ -494,12 +560,9 @@ pub async fn endpoints_resume(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
-    let e = find_endpoint_global(&state, id).await?;
-    if e.user_id != auth.user_id {
-        return Err(AppError::Forbidden);
-    }
+    let e = find_endpoint_authorized(&state, auth.user_id, id).await?;
     if e.paused_at.is_some() {
-        sqlx::query("UPDATE webhook_endpoints SET paused_at = NULL, updated_at = ? WHERE id = ?")
+        sqlx::query("UPDATE webhook_endpoints SET paused_at = NULL, updated_at = $1 WHERE id = $2")
             .bind(now_iso()).bind(e.id).execute(&state.db.pool).await?;
     }
     let e = find_endpoint_global(&state, id).await?;
@@ -512,13 +575,10 @@ pub async fn endpoints_rotate_secret(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<Value>> {
-    let e = find_endpoint_global(&state, id).await?;
-    if e.user_id != auth.user_id {
-        return Err(AppError::Forbidden);
-    }
+    let e = find_endpoint_authorized(&state, auth.user_id, id).await?;
     let secret = format!("whsec_{}", random_hex(32));
     let now = now_iso();
-    sqlx::query("UPDATE webhook_endpoints SET signing_secret = ?, secret_rotated_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE webhook_endpoints SET signing_secret = $1, secret_rotated_at = $2, updated_at = $3 WHERE id = $4")
         .bind(&secret).bind(&now).bind(&now).bind(e.id).execute(&state.db.pool).await?;
     let e = find_endpoint_global(&state, id).await?;
     let mut v = serialize_endpoint(&e, None);
@@ -534,21 +594,26 @@ pub async fn deliveries_index(
     State(state): State<AppState>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<Json<Value>> {
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    // Clamp pagination params before multiplying so `offset` can't overflow i64.
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
     // base: deliveries whose endpoint belongs to merchant (+ filters)
+    // running placeholder counter, threaded through both count and id queries
+    let mut n = 1;
     let mut where_sql = String::from(
-        "FROM webhook_deliveries d JOIN webhook_endpoints e ON e.id = d.webhook_endpoint_id WHERE e.user_id = ?",
+        "FROM webhook_deliveries d JOIN webhook_endpoints e ON e.id = d.webhook_endpoint_id WHERE e.user_id = $1",
     );
-    if q.store_id.is_some() { where_sql.push_str(" AND e.store_id = ?"); }
-    if q.webhook_event_id.is_some() { where_sql.push_str(" AND d.webhook_event_id = ?"); }
-    if q.webhook_endpoint_id.is_some() { where_sql.push_str(" AND d.webhook_endpoint_id = ?"); }
-    if q.status.is_some() { where_sql.push_str(" AND d.status = ?"); }
-    if q.is_replay.is_some() { where_sql.push_str(" AND d.is_replay = ?"); }
+    n += 1; // $1 = user_id consumed
+    if q.store_id.is_some() { where_sql.push_str(&format!(" AND e.store_id = ${n}")); n += 1; }
+    if q.webhook_event_id.is_some() { where_sql.push_str(&format!(" AND d.webhook_event_id = ${n}")); n += 1; }
+    if q.webhook_endpoint_id.is_some() { where_sql.push_str(&format!(" AND d.webhook_endpoint_id = ${n}")); n += 1; }
+    if q.status.is_some() { where_sql.push_str(&format!(" AND d.status = ${n}")); n += 1; }
+    if q.is_replay.is_some() { where_sql.push_str(&format!(" AND d.is_replay = ${n}")); n += 1; }
     if q.event_type.is_some() {
-        where_sql.push_str(" AND EXISTS (SELECT 1 FROM webhook_events ev WHERE ev.id = d.webhook_event_id AND ev.event_type = ?)");
+        where_sql.push_str(&format!(" AND EXISTS (SELECT 1 FROM webhook_events ev WHERE ev.id = d.webhook_event_id AND ev.event_type = ${n})"));
+        n += 1;
     }
 
     let count_sql = format!("SELECT COUNT(*) {where_sql}");
@@ -561,8 +626,10 @@ pub async fn deliveries_index(
     if let Some(v) = &q.event_type { cq = cq.bind(v.clone()); }
     let total: i64 = cq.fetch_one(&state.db.pool).await?;
 
-    // fetch delivery ids (then load rows + relations)
-    let id_sql = format!("SELECT d.id {where_sql} ORDER BY d.created_at DESC LIMIT ? OFFSET ?");
+    // fetch delivery ids (then load rows + relations); LIMIT/OFFSET continue the counter
+    let limit_ph = n;
+    let offset_ph = n + 1;
+    let id_sql = format!("SELECT d.id {where_sql} ORDER BY d.created_at DESC, d.id DESC LIMIT ${limit_ph} OFFSET ${offset_ph}");
     let mut id_query = sqlx::query_scalar::<_, i64>(&id_sql);
     id_query = id_query.bind(auth.user_id);
     if let Some(s) = q.store_id { id_query = id_query.bind(s); }
@@ -573,23 +640,58 @@ pub async fn deliveries_index(
     if let Some(v) = &q.event_type { id_query = id_query.bind(v.clone()); }
     let ids: Vec<i64> = id_query.bind(per_page).bind(offset).fetch_all(&state.db.pool).await?;
 
-    let mut data = Vec::with_capacity(ids.len());
-    for did in ids {
-        data.push(load_delivery_full(&state, did).await?);
-    }
+    // Load the page's deliveries + their endpoints/events in three queries
+    // instead of 3N. Re-running the same ORDER BY on the id subset preserves
+    // the page order.
+    let deliveries = sqlx::query_as::<_, DeliveryRow>(&format!(
+        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE id = ANY($1) ORDER BY created_at DESC, id DESC"
+    ))
+    .bind(&ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let endpoint_ids: Vec<i64> = deliveries.iter().map(|d| d.webhook_endpoint_id).collect();
+    let event_ids: Vec<i64> = deliveries.iter().map(|d| d.webhook_event_id).collect();
+    let endpoints = endpoints_by_ids(&state, &endpoint_ids).await?;
+    let events: std::collections::HashMap<i64, EventRow> = sqlx::query_as::<_, EventRow>(&format!(
+        "SELECT {EVENT_COLS} FROM webhook_events WHERE id = ANY($1)"
+    ))
+    .bind(&event_ids)
+    .fetch_all(&state.db.pool)
+    .await?
+    .into_iter()
+    .map(|e| (e.id, e))
+    .collect();
+
+    let data: Vec<Value> = deliveries
+        .iter()
+        .map(|d| serialize_delivery(d, endpoints.get(&d.webhook_endpoint_id), events.get(&d.webhook_event_id)))
+        .collect();
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": data })))
 }
 
+/// Endpoints by id, one query for a whole page.
+async fn endpoints_by_ids(state: &AppState, ids: &[i64]) -> AppResult<std::collections::HashMap<i64, EndpointRow>> {
+    Ok(sqlx::query_as::<_, EndpointRow>(&format!(
+        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = ANY($1)"
+    ))
+    .bind(ids)
+    .fetch_all(&state.db.pool)
+    .await?
+    .into_iter()
+    .map(|e| (e.id, e))
+    .collect())
+}
+
 async fn load_delivery_full(state: &AppState, id: i64) -> AppResult<Value> {
-    let d = sqlx::query_as::<_, DeliveryRow>(&format!("SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE id = ?"))
+    let d = sqlx::query_as::<_, DeliveryRow>(&format!("SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE id = $1"))
         .bind(id)
         .fetch_one(&state.db.pool)
         .await?;
-    let endpoint = sqlx::query_as::<_, EndpointRow>(&format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = ?"))
+    let endpoint = sqlx::query_as::<_, EndpointRow>(&format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = $1"))
         .bind(d.webhook_endpoint_id)
         .fetch_optional(&state.db.pool)
         .await?;
-    let event = sqlx::query_as::<_, EventRow>(&format!("SELECT {EVENT_COLS} FROM webhook_events WHERE id = ?"))
+    let event = sqlx::query_as::<_, EventRow>(&format!("SELECT {EVENT_COLS} FROM webhook_events WHERE id = $1"))
         .bind(d.webhook_event_id)
         .fetch_optional(&state.db.pool)
         .await?;
@@ -599,10 +701,10 @@ async fn load_delivery_full(state: &AppState, id: i64) -> AppResult<Value> {
 /// getDeliveryForMerchant: delivery whose endpoint belongs to merchant.
 async fn delivery_for_merchant(state: &AppState, user_id: i64, id: i64, store_id: Option<i64>) -> AppResult<DeliveryRow> {
     let mut sql = format!(
-        "SELECT {DELIVERY_COLS} FROM webhook_deliveries d WHERE d.id = ? AND EXISTS \
-         (SELECT 1 FROM webhook_endpoints e WHERE e.id = d.webhook_endpoint_id AND e.user_id = ?"
+        "SELECT {DELIVERY_COLS} FROM webhook_deliveries d WHERE d.id = $1 AND EXISTS \
+         (SELECT 1 FROM webhook_endpoints e WHERE e.id = d.webhook_endpoint_id AND e.user_id = $2"
     );
-    if store_id.is_some() { sql.push_str(" AND e.store_id = ?"); }
+    if store_id.is_some() { sql.push_str(" AND e.store_id = $3"); }
     sql.push(')');
     let mut q = sqlx::query_as::<_, DeliveryRow>(&sql).bind(id).bind(user_id);
     if let Some(s) = store_id { q = q.bind(s); }
@@ -616,7 +718,7 @@ pub async fn deliveries_show(
     Path(id): Path<i64>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<Json<Value>> {
-    let d = delivery_for_merchant(&state, auth.user_id, id, q_store_id(&q)).await?;
+    let d = delivery_for_merchant(&state, auth.user_id, id, q.store_id).await?;
     Ok(Json(load_delivery_full(&state, d.id).await?))
 }
 
@@ -627,7 +729,7 @@ pub async fn deliveries_replay(
     Path(id): Path<i64>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
-    let d = delivery_for_merchant(&state, auth.user_id, id, q_store_id(&q)).await?;
+    let d = delivery_for_merchant(&state, auth.user_id, id, q.store_id).await?;
     let now = now_iso();
     let replay_id = create_delivery(&state, d.webhook_event_id, d.webhook_endpoint_id, true, &now).await?;
     Ok((StatusCode::ACCEPTED, Json(load_delivery_full(&state, replay_id).await?)))
@@ -641,56 +743,68 @@ pub async fn events_index(
     State(state): State<AppState>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<Json<Value>> {
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    // Clamp pagination params before multiplying so `offset` can't overflow i64.
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
     let (filter, bind_store) = match q.store_id {
-        Some(_) => (" AND store_id = ?", true),
+        Some(_) => (" AND store_id = $2", true),
         None => ("", false),
     };
-    let count_sql = format!("SELECT COUNT(*) FROM webhook_events WHERE user_id = ?{filter}");
+    let count_sql = format!("SELECT COUNT(*) FROM webhook_events WHERE user_id = $1{filter}");
     let mut cq = sqlx::query_scalar::<_, i64>(&count_sql).bind(auth.user_id);
     if bind_store { cq = cq.bind(q.store_id.unwrap()); }
     let total = cq.fetch_one(&state.db.pool).await?;
 
+    let (limit_ph, offset_ph) = if bind_store { ("$3", "$4") } else { ("$2", "$3") };
     let list_sql = format!(
-        "SELECT {EVENT_COLS} FROM webhook_events WHERE user_id = ?{filter} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT {EVENT_COLS} FROM webhook_events WHERE user_id = $1{filter} ORDER BY created_at DESC, id DESC LIMIT {limit_ph} OFFSET {offset_ph}"
     );
     let mut lq = sqlx::query_as::<_, EventRow>(&list_sql).bind(auth.user_id);
     if bind_store { lq = lq.bind(q.store_id.unwrap()); }
     let rows = lq.bind(per_page).bind(offset).fetch_all(&state.db.pool).await?;
 
-    let mut data = Vec::with_capacity(rows.len());
-    for ev in &rows {
-        let ds = load_event_deliveries(&state, ev.id).await?;
-        data.push(serialize_event(ev, Some(&ds)));
-    }
+    let event_ids: Vec<i64> = rows.iter().map(|e| e.id).collect();
+    let mut ds_by_event = load_events_deliveries(&state, &event_ids).await?;
+    let data: Vec<Value> = rows
+        .iter()
+        .map(|ev| serialize_event(ev, Some(&ds_by_event.remove(&ev.id).unwrap_or_default())))
+        .collect();
     Ok(Json(json!({ "meta": paginator_meta(total, per_page, page), "data": data })))
 }
 
-async fn load_event_deliveries(state: &AppState, event_id: i64) -> AppResult<Vec<(DeliveryRow, Option<EndpointRow>)>> {
+/// Deliveries (+ their endpoints) for a set of events, grouped by event id —
+/// two queries for a whole page instead of one per delivery.
+async fn load_events_deliveries(
+    state: &AppState,
+    event_ids: &[i64],
+) -> AppResult<std::collections::HashMap<i64, Vec<(DeliveryRow, Option<EndpointRow>)>>> {
     let ds = sqlx::query_as::<_, DeliveryRow>(&format!(
-        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_event_id = ? ORDER BY created_at DESC"
+        "SELECT {DELIVERY_COLS} FROM webhook_deliveries WHERE webhook_event_id = ANY($1) ORDER BY created_at DESC, id DESC"
     ))
-    .bind(event_id)
+    .bind(event_ids)
     .fetch_all(&state.db.pool)
     .await?;
-    let mut out = Vec::with_capacity(ds.len());
+    let endpoint_ids: Vec<i64> = ds.iter().map(|d| d.webhook_endpoint_id).collect();
+    let endpoints = endpoints_by_ids(state, &endpoint_ids).await?;
+    let mut out: std::collections::HashMap<i64, Vec<(DeliveryRow, Option<EndpointRow>)>> =
+        std::collections::HashMap::new();
     for d in ds {
-        let ep = sqlx::query_as::<_, EndpointRow>(&format!("SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE id = ?"))
-            .bind(d.webhook_endpoint_id)
-            .fetch_optional(&state.db.pool)
-            .await?;
-        out.push((d, ep));
+        let ep = endpoints.get(&d.webhook_endpoint_id).cloned();
+        out.entry(d.webhook_event_id).or_default().push((d, ep));
     }
     Ok(out)
 }
 
+async fn load_event_deliveries(state: &AppState, event_id: i64) -> AppResult<Vec<(DeliveryRow, Option<EndpointRow>)>> {
+    Ok(load_events_deliveries(state, &[event_id]).await?.remove(&event_id).unwrap_or_default())
+}
+
 async fn load_event_owned(state: &AppState, user_id: i64, id: i64, store_id: Option<i64>) -> AppResult<EventRow> {
     // query by id (+ optional store), then ownership 403
-    let mut sql = format!("SELECT {EVENT_COLS} FROM webhook_events WHERE id = ?");
-    if store_id.is_some() { sql.push_str(" AND store_id = ?"); }
+    let mut sql = format!("SELECT {EVENT_COLS} FROM webhook_events WHERE id = $1");
+    if store_id.is_some() { sql.push_str(" AND store_id = $2"); }
     let mut q = sqlx::query_as::<_, EventRow>(&sql).bind(id);
     if let Some(s) = store_id { q = q.bind(s); }
     let ev = q.fetch_optional(&state.db.pool).await?.ok_or_else(AppError::row_not_found)?;
@@ -707,7 +821,7 @@ pub async fn events_show(
     Path(id): Path<i64>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<Json<Value>> {
-    let ev = load_event_owned(&state, auth.user_id, id, q_store_id(&q)).await?;
+    let ev = load_event_owned(&state, auth.user_id, id, q.store_id).await?;
     let ds = load_event_deliveries(&state, ev.id).await?;
     Ok(Json(serialize_event(&ev, Some(&ds))))
 }
@@ -719,24 +833,10 @@ pub async fn events_replay(
     Path(id): Path<i64>,
     Query(q): Query<WebhookQuery>,
 ) -> AppResult<(StatusCode, Json<Value>)> {
-    let ev = load_event_owned(&state, auth.user_id, id, q_store_id(&q)).await?;
+    let ev = load_event_owned(&state, auth.user_id, id, q.store_id).await?;
 
     // createDeliveries(event, isReplay=true): active, non-paused, subscribed endpoints matching store
-    let mut sql = format!(
-        "SELECT {ENDPOINT_COLS} FROM webhook_endpoints WHERE user_id = ? AND is_active = 1 AND paused_at IS NULL"
-    );
-    if ev.store_id.is_some() { sql.push_str(" AND store_id = ?"); } else { sql.push_str(" AND store_id IS NULL"); }
-    let mut q2 = sqlx::query_as::<_, EndpointRow>(&sql).bind(ev.user_id);
-    if let Some(s) = ev.store_id { q2 = q2.bind(s); }
-    let endpoints = q2.fetch_all(&state.db.pool).await?;
-
-    let now = now_iso();
-    for ep in &endpoints {
-        let events: Vec<String> = serde_json::from_str(&ep.events).unwrap_or_default();
-        if events.contains(&ev.event_type) {
-            create_delivery(&state, ev.id, ep.id, true, &now).await?;
-        }
-    }
+    fan_out(&state, ev.user_id, ev.store_id, ev.id, &ev.event_type, true, &now_iso()).await?;
 
     let ds = load_event_deliveries(&state, ev.id).await?;
     Ok((StatusCode::ACCEPTED, Json(serialize_event(&ev, Some(&ds)))))

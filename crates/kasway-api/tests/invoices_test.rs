@@ -248,7 +248,7 @@ async fn invoices_cancel_expired_422() {
     assert_eq!(res.json::<Value>().await.unwrap()["message"], "Only open invoices can be cancelled");
 
     // and it is now expired
-    let status: String = sqlx::query_scalar("SELECT status FROM invoices WHERE id = ?")
+    let status: String = sqlx::query_scalar("SELECT status FROM invoices WHERE id = $1")
         .bind(id)
         .fetch_one(&app.db.pool)
         .await

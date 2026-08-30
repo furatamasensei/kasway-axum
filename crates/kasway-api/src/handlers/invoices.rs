@@ -5,19 +5,19 @@
 //! see that module). Response is the serialized invoice incl. the intent.
 
 use crate::auth::AuthMerchant;
-use crate::error::{AppError, AppResult, ValidationFailure};
+use crate::error::{AppError, AppResult};
+use crate::handlers::payment_ops_settings::required_confirmations_for;
 use crate::kpr1::{self, IntentInvoiceCtx};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
-use crate::util::{now_iso, paginator_meta};
+use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_amount_opt, ser_json, ser_json_arr, ser_json_obj, to_iso};
+use crate::validate::{opt_string, vpush};
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-const FEE_DELEGATIONS: &[&str] = &["merchant_subsidized", "customer_pays"];
-const PAYMENT_MODES: &[&str] = &["address", "covenant"];
+pub(crate) const FEE_DELEGATIONS: &[&str] = &["merchant_subsidized", "customer_pays"];
 
 #[derive(Deserialize, Default)]
 pub struct InvoiceQuery {
@@ -29,7 +29,8 @@ pub struct InvoiceQuery {
     source: Option<String>,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct InvoiceRow {
     id: i64,
     user_id: i64,
@@ -44,13 +45,16 @@ pub(crate) struct InvoiceRow {
     payment_network: Option<String>,
     payment_asset: Option<String>,
     payment_reference: Option<String>,
+    #[serde(serialize_with = "ser_amount")]
     subtotal_amount: i64,
+    #[serde(serialize_with = "ser_amount")]
     total_amount: i64,
     fee_delegation: Option<String>,
-    payment_mode: Option<String>,
+    #[serde(serialize_with = "ser_amount")]
     service_fee_amount: i64,
     currency: String,
     pricing_country_code: Option<String>,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     expires_at: Option<String>,
     paid_at: Option<String>,
@@ -68,26 +72,31 @@ impl InvoiceRow {
 const INVOICE_COLS: &str = "id, user_id, store_id, public_id, external_id, subscription_id, \
     subscription_cycle_id, payment_link_id, status, payment_address, payment_network, \
     payment_asset, payment_reference, subtotal_amount, total_amount, fee_delegation, \
-    payment_mode, service_fee_amount, currency, pricing_country_code, metadata, expires_at, \
+    service_fee_amount, currency, pricing_country_code, metadata, expires_at, \
     paid_at, cancelled_at, created_at, updated_at";
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ItemRow {
     id: i64,
     invoice_id: i64,
     name: String,
     quantity: i64,
+    #[serde(serialize_with = "ser_amount")]
     unit_amount: i64,
+    #[serde(serialize_with = "ser_amount")]
     total_amount: i64,
     pricing_country_code: Option<String>,
     pricing_currency: Option<String>,
     pricing_source: Option<String>,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
 }
 
-#[derive(sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct IntentRow {
     id: i64,
     invoice_id: i64,
@@ -96,17 +105,23 @@ pub(crate) struct IntentRow {
     status: String,
     network: String,
     asset_id: String,
+    #[serde(serialize_with = "ser_amount")]
     amount_sompi: i64,
     platform_fee_bps: i64,
+    #[serde(serialize_with = "ser_amount")]
     platform_fee_amount: i64,
     tax_bps: Option<i64>,
+    #[serde(serialize_with = "ser_amount_opt")]
     tax_amount: Option<i64>,
     tax_address: Option<String>,
     merchant_address: String,
     platform_fee_address: String,
     template_id: String,
     template_version: String,
-    script_hash: String,
+    // NULL until the covenant is finalized (the P2SH script hash is only known
+    // once the payer supplies a refund address). Was `String`, which made every
+    // freshly-minted intent 500 on decode.
+    script_hash: Option<String>,
     canonical_hash: String,
     payment_request_uri: String,
     payment_intent_url: String,
@@ -116,8 +131,18 @@ pub(crate) struct IntentRow {
     tx_id: Option<String>,
     verification_status: Option<String>,
     failure_reason: Option<String>,
+    // Covenant lifecycle. The payer's wallet needs these to know whether it may
+    // release funds to the merchant yet: release is only possible while the
+    // covenant is `funded` and the invoice is still open.
+    covenant_state: Option<String>,
+    covenant_address: Option<String>,
+    release_tx_id: Option<String>,
+    expiry_ts: Option<i64>,
+    #[serde(serialize_with = "ser_json_arr")]
     required_outputs: String,
+    #[serde(serialize_with = "ser_json_obj")]
     canonical_intent: String,
+    #[serde(serialize_with = "ser_json")]
     metadata: Option<String>,
     expires_at: Option<String>,
     fetched_at: Option<String>,
@@ -134,128 +159,46 @@ const INTENT_COLS: &str = "id, invoice_id, user_id, intent_id, status, network, 
     merchant_address, platform_fee_address, template_id, template_version, script_hash, \
     canonical_hash, payment_request_uri, payment_intent_url, signature_algorithm, \
     signature_key_id, signature_value, tx_id, verification_status, failure_reason, \
+    covenant_state, covenant_address, release_tx_id, expiry_ts, \
     required_outputs, canonical_intent, metadata, expires_at, fetched_at, submitted_at, \
     observed_at, verified_at, settled_at, created_at, updated_at";
-
-fn parse_json_or_null(raw: &Option<String>) -> Value {
-    match raw {
-        None => Value::Null,
-        Some(s) => serde_json::from_str(s).unwrap_or(Value::Null),
-    }
-}
 
 fn amount_str(v: i64) -> Value {
     Value::String(v.to_string())
 }
 
 fn serialize_item(item: &ItemRow) -> Value {
-    json!({
-        "id": item.id,
-        "invoiceId": item.invoice_id,
-        "name": item.name,
-        "quantity": item.quantity,
-        "unitAmount": amount_str(item.unit_amount),
-        "totalAmount": amount_str(item.total_amount),
-        "pricingCountryCode": item.pricing_country_code,
-        "pricingCurrency": item.pricing_currency,
-        "pricingSource": item.pricing_source,
-        "metadata": parse_json_or_null(&item.metadata),
-        "createdAt": item.created_at,
-        "updatedAt": item.updated_at,
-    })
+    serde_json::to_value(item).unwrap_or(Value::Null)
 }
 
 pub(crate) fn serialize_intent(intent: &IntentRow) -> Value {
-    json!({
-        "id": intent.id,
-        "invoiceId": intent.invoice_id,
-        "userId": intent.user_id,
-        "intentId": intent.intent_id,
-        "status": intent.status,
-        "network": intent.network,
-        "assetId": intent.asset_id,
-        "amountSompi": amount_str(intent.amount_sompi),
-        "platformFeeBps": intent.platform_fee_bps,
-        "platformFeeAmount": amount_str(intent.platform_fee_amount),
-        "taxBps": intent.tax_bps,
-        "taxAmount": intent.tax_amount.map(amount_str).unwrap_or(Value::Null),
-        "taxAddress": intent.tax_address,
-        "merchantAddress": intent.merchant_address,
-        "platformFeeAddress": intent.platform_fee_address,
-        "templateId": intent.template_id,
-        "templateVersion": intent.template_version,
-        "scriptHash": intent.script_hash,
-        "canonicalHash": intent.canonical_hash,
-        "paymentRequestUri": intent.payment_request_uri,
-        "paymentIntentUrl": intent.payment_intent_url,
-        "signatureAlgorithm": intent.signature_algorithm,
-        "signatureKeyId": intent.signature_key_id,
-        "signatureValue": intent.signature_value,
-        "txId": intent.tx_id,
-        "verificationStatus": intent.verification_status,
-        "failureReason": intent.failure_reason,
-        "requiredOutputs": serde_json::from_str::<Value>(&intent.required_outputs).unwrap_or(json!([])),
-        "canonicalIntent": serde_json::from_str::<Value>(&intent.canonical_intent).unwrap_or(json!({})),
-        "metadata": parse_json_or_null(&intent.metadata),
-        "expiresAt": intent.expires_at,
-        "fetchedAt": intent.fetched_at,
-        "submittedAt": intent.submitted_at,
-        "observedAt": intent.observed_at,
-        "verifiedAt": intent.verified_at,
-        "settledAt": intent.settled_at,
-        "createdAt": intent.created_at,
-        "updatedAt": intent.updated_at,
-    })
+    serde_json::to_value(intent).unwrap_or(Value::Null)
 }
 
 /// Replicates `Invoice.serialize()` including the KPR-1 hoisting logic.
 pub(crate) fn serialize_invoice(inv: &InvoiceRow, items: &[ItemRow], intent: Option<&IntentRow>) -> Value {
-    let mut obj = Map::new();
-    obj.insert("id".into(), json!(inv.id));
-    obj.insert("userId".into(), json!(inv.user_id));
-    obj.insert("storeId".into(), json!(inv.store_id));
-    obj.insert("publicId".into(), json!(inv.public_id));
-    obj.insert("externalId".into(), json!(inv.external_id));
-    obj.insert("subscriptionId".into(), json!(inv.subscription_id));
-    obj.insert("subscriptionCycleId".into(), json!(inv.subscription_cycle_id));
-    obj.insert("paymentLinkId".into(), json!(inv.payment_link_id));
-    obj.insert("status".into(), json!(inv.status));
-    obj.insert("paymentAddress".into(), json!(inv.payment_address));
-    obj.insert("paymentNetwork".into(), json!(inv.payment_network));
-    obj.insert("paymentAsset".into(), json!(inv.payment_asset));
-    obj.insert("paymentReference".into(), json!(inv.payment_reference));
-    obj.insert("subtotalAmount".into(), amount_str(inv.subtotal_amount));
-    obj.insert("totalAmount".into(), amount_str(inv.total_amount));
-    obj.insert("feeDelegation".into(), json!(inv.fee_delegation));
-    obj.insert("paymentMode".into(), json!(inv.payment_mode));
-    obj.insert("serviceFeeAmount".into(), amount_str(inv.service_fee_amount));
-    obj.insert("currency".into(), json!(inv.currency));
-    obj.insert("pricingCountryCode".into(), json!(inv.pricing_country_code));
-    obj.insert("metadata".into(), parse_json_or_null(&inv.metadata));
-    obj.insert("expiresAt".into(), json!(inv.expires_at));
-    obj.insert("paidAt".into(), json!(inv.paid_at));
-    obj.insert("cancelledAt".into(), json!(inv.cancelled_at));
-    obj.insert("createdAt".into(), json!(inv.created_at));
-    obj.insert("updatedAt".into(), json!(inv.updated_at));
+    let mut obj = match serde_json::to_value(inv) {
+        Ok(Value::Object(map)) => map,
+        _ => Map::new(),
+    };
 
     // preloaded relations
     obj.insert("items".into(), Value::Array(items.iter().map(serialize_item).collect()));
     // payments / paymentCredits relations are empty until those slices land.
     obj.insert("payments".into(), json!([]));
-    let intent_value = intent.map(serialize_intent);
     obj.insert(
         "kpr1PaymentIntent".into(),
-        intent_value.clone().unwrap_or(Value::Null),
+        intent.map(serialize_intent).unwrap_or(Value::Null),
     );
     obj.insert("paymentCredits".into(), json!([]));
 
     // Invoice.serialize() hoisting
-    if let (Some(intent), Some(iv)) = (intent, intent_value) {
+    if let Some(intent) = intent {
         obj.remove("paymentAddress");
         obj.insert("paymentRail".into(), json!("kpr1_covenant"));
-        obj.insert("paymentRequestUri".into(), iv["paymentRequestUri"].clone());
-        obj.insert("paymentIntentUrl".into(), iv["paymentIntentUrl"].clone());
-        obj.insert("paymentIntentHash".into(), iv["canonicalHash"].clone());
+        obj.insert("paymentRequestUri".into(), json!(intent.payment_request_uri));
+        obj.insert("paymentIntentUrl".into(), json!(intent.payment_intent_url));
+        obj.insert("paymentIntentHash".into(), json!(intent.canonical_hash));
         obj.insert(
             "platformFee".into(),
             json!({
@@ -274,7 +217,7 @@ pub(crate) fn serialize_invoice(inv: &InvoiceRow, items: &[ItemRow], intent: Opt
             Value::Null
         };
         obj.insert("tax".into(), tax);
-        let required = iv["requiredOutputs"].clone();
+        let required = serde_json::from_str::<Value>(&intent.required_outputs).unwrap_or(json!([]));
         let splits: Vec<Value> = required
             .as_array()
             .map(|a| a.iter().filter(|o| o["role"] == "split").cloned().collect())
@@ -292,17 +235,17 @@ pub(crate) async fn load_relations(
     state: &AppState,
     invoice_id: i64,
 ) -> AppResult<(Vec<ItemRow>, Option<IntentRow>)> {
-    let items = sqlx::query_as::<_, ItemRow>(&format!(
+    let items = sqlx::query_as::<_, ItemRow>(
         "SELECT id, invoice_id, name, quantity, unit_amount, total_amount, pricing_country_code, \
          pricing_currency, pricing_source, metadata, created_at, updated_at \
-         FROM invoice_items WHERE invoice_id = ? ORDER BY id ASC"
-    ))
+         FROM invoice_items WHERE invoice_id = $1 ORDER BY id ASC",
+    )
     .bind(invoice_id)
     .fetch_all(&state.db.pool)
     .await?;
 
     let intent = sqlx::query_as::<_, IntentRow>(&format!(
-        "SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE invoice_id = ?"
+        "SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE invoice_id = $1"
     ))
     .bind(invoice_id)
     .fetch_optional(&state.db.pool)
@@ -311,18 +254,112 @@ pub(crate) async fn load_relations(
     Ok((items, intent))
 }
 
-/// expireIfNeeded: flip open->expired when past `expires_at`.
+/// `load_relations` for a whole page of invoices in two queries instead of 2N.
+pub(crate) async fn load_relations_many(
+    state: &AppState,
+    invoice_ids: &[i64],
+) -> AppResult<(
+    std::collections::HashMap<i64, Vec<ItemRow>>,
+    std::collections::HashMap<i64, IntentRow>,
+)> {
+    let items = sqlx::query_as::<_, ItemRow>(
+        "SELECT id, invoice_id, name, quantity, unit_amount, total_amount, pricing_country_code, \
+         pricing_currency, pricing_source, metadata, created_at, updated_at \
+         FROM invoice_items WHERE invoice_id = ANY($1) ORDER BY id ASC",
+    )
+    .bind(invoice_ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let mut items_by: std::collections::HashMap<i64, Vec<ItemRow>> = std::collections::HashMap::new();
+    for item in items {
+        items_by.entry(item.invoice_id).or_default().push(item);
+    }
+
+    let intents = sqlx::query_as::<_, IntentRow>(&format!(
+        "SELECT {INTENT_COLS} FROM kpr1_payment_intents WHERE invoice_id = ANY($1)"
+    ))
+    .bind(invoice_ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let intents_by = intents.into_iter().map(|i| (i.invoice_id, i)).collect();
+
+    Ok((items_by, intents_by))
+}
+
+/// Load invoices by id, preserving the order of `ids` (one query for a page).
+pub(crate) async fn load_many_by_ids(state: &AppState, ids: &[i64]) -> AppResult<Vec<InvoiceRow>> {
+    let rows = sqlx::query_as::<_, InvoiceRow>(&format!(
+        "SELECT {INVOICE_COLS} FROM invoices WHERE id = ANY($1)"
+    ))
+    .bind(ids)
+    .fetch_all(&state.db.pool)
+    .await?;
+    let mut by_id: std::collections::HashMap<i64, InvoiceRow> =
+        rows.into_iter().map(|r| (r.id, r)).collect();
+    Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
+}
+
+/// Mark an unpaid invoice and its still-unfunded covenant expired. A wallet
+/// submission recorded before the deadline is proof that payment started in
+/// time; confirmations may safely finish after the 15-minute window.
+pub(crate) async fn expire_invoice(state: &AppState, invoice_id: i64) -> AppResult<bool> {
+    let now = now_iso();
+    let invoice_update = sqlx::query("UPDATE invoices SET status = 'expired', updated_at = $1 WHERE id = $2 AND status = 'open'")
+        .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET status = 'expired', covenant_state = CASE \
+         WHEN covenant_state IN ('pending', 'awaiting_funding') THEN 'expired' ELSE covenant_state END, \
+         failure_reason = COALESCE(failure_reason, 'payment_window_expired'), updated_at = $1 \
+         WHERE invoice_id = $2 AND tx_id IS NULL",
+    )
+    .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+    sqlx::query(
+        "UPDATE subscription_cycles SET status = 'past_due', past_due_at = COALESCE(past_due_at, $1), \
+         updated_at = $1 WHERE invoice_id = $2 AND status != 'paid'",
+    )
+    .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+
+    // A submission and the expirer can cross between their SELECT and UPDATE.
+    // Reconcile in favor of the wallet when its server-received timestamp is
+    // within the signed deadline.
+    let timely_submission: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM kpr1_payment_intents WHERE invoice_id = $1 \
+         AND tx_id IS NOT NULL AND submitted_at IS NOT NULL AND submitted_at <= expires_at)",
+    )
+    .bind(invoice_id).fetch_one(&state.db.pool).await?;
+    if timely_submission {
+        sqlx::query("UPDATE invoices SET status = 'open', updated_at = $1 WHERE id = $2 AND status = 'expired'")
+            .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+        sqlx::query(
+            "UPDATE kpr1_payment_intents SET status = 'submitted', \
+             covenant_state = CASE WHEN covenant_state = 'expired' THEN 'awaiting_funding' ELSE covenant_state END, \
+             failure_reason = CASE WHEN failure_reason = 'payment_window_expired' THEN NULL ELSE failure_reason END, updated_at = $1 \
+             WHERE invoice_id = $2 AND tx_id IS NOT NULL",
+        )
+        .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+        sqlx::query(
+            "UPDATE subscription_cycles SET status = 'invoiced', past_due_at = NULL, updated_at = $1 \
+             WHERE invoice_id = $2 AND status = 'past_due'",
+        )
+        .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+        return Ok(false);
+    }
+    Ok(invoice_update.rows_affected() > 0)
+}
+
+/// expireIfNeeded: flip open->expired when past `expires_at`, unless a wallet
+/// submitted the broadcast tx before that deadline.
 pub(crate) async fn expire_if_needed(state: &AppState, inv: &mut InvoiceRow) -> AppResult<()> {
-    if inv.status == "open" {
-        if let Some(exp) = &inv.expires_at {
-            if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(exp) {
-                if exp_dt <= chrono::Utc::now() {
-                    inv.status = "expired".to_string();
-                    sqlx::query("UPDATE invoices SET status = 'expired' WHERE id = ?")
-                        .bind(inv.id)
-                        .execute(&state.db.pool)
-                        .await?;
-                }
+    if is_expired_now(inv) {
+        let timely_submission: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kpr1_payment_intents \
+             WHERE invoice_id = $1 AND tx_id IS NOT NULL AND submitted_at IS NOT NULL \
+             AND submitted_at <= expires_at)",
+        )
+        .bind(inv.id).fetch_one(&state.db.pool).await?;
+        if !timely_submission {
+            if expire_invoice(state, inv.id).await? {
+                inv.status = "expired".to_string();
             }
         }
     }
@@ -336,7 +373,7 @@ pub(crate) async fn load_owned_invoice(
     id: i64,
 ) -> AppResult<InvoiceRow> {
     sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE user_id = ? AND store_id = ? AND id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE user_id = $1 AND store_id = $2 AND id = $3"
     ))
     .bind(user_id)
     .bind(store_id)
@@ -362,7 +399,7 @@ pub(crate) fn serialize_kpr1_contract(
 /// Load an invoice by public_id (no user scope) — checkout getByPublicId.
 pub(crate) async fn load_by_public_id(state: &AppState, public_id: &str) -> AppResult<InvoiceRow> {
     sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE public_id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE public_id = $1"
     ))
     .bind(public_id)
     .fetch_optional(&state.db.pool)
@@ -378,7 +415,7 @@ pub(crate) async fn load_owned_by_public_id(
     public_id: &str,
 ) -> AppResult<InvoiceRow> {
     sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE user_id = ? AND store_id = ? AND public_id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE user_id = $1 AND store_id = $2 AND public_id = $3"
     ))
     .bind(user_id)
     .bind(store_id)
@@ -386,18 +423,6 @@ pub(crate) async fn load_owned_by_public_id(
     .fetch_optional(&state.db.pool)
     .await?
     .ok_or_else(|| AppError::commerce(404, "Invoice not found"))
-}
-
-fn meta_bool(metadata: &Option<String>, key: &str) -> Option<bool> {
-    let raw = metadata.as_ref()?;
-    let v: Value = serde_json::from_str(raw).ok()?;
-    v.get(key).and_then(|x| x.as_bool())
-}
-
-fn meta_str(metadata: &Option<String>, key: &str) -> Option<String> {
-    let raw = metadata.as_ref()?;
-    let v: Value = serde_json::from_str(raw).ok()?;
-    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
 fn is_expired_now(inv: &InvoiceRow) -> bool {
@@ -412,44 +437,57 @@ fn is_expired_now(inv: &InvoiceRow) -> bool {
     }
 }
 
-/// Port of PaymentOperationsService.derivePaymentStatus. Confirmation policy is
-/// simplified to the platform default (KASPA_MIN_CONFIRMATIONS = 10); merchant
-/// tenant overrides arrive with the payment-tenant-settings slice.
+/// Port of PaymentOperationsService.derivePaymentStatus. Confirmation policy
+/// comes from the tenant's stored policy (platform default when unset), the
+/// same source the chain observer uses to decide when a payment may settle.
 pub(crate) async fn derive_payment_status(state: &AppState, inv: &InvoiceRow) -> AppResult<Value> {
-    let required_confirmations: i64 = 10;
+    let required_confirmations = required_confirmations_for(
+        state,
+        inv.user_id,
+        inv.payment_network.as_deref().unwrap_or(&state.config.kpr1.default_network),
+        inv.payment_asset.as_deref().unwrap_or(&state.config.kpr1.default_asset),
+        &inv.currency,
+        inv.total_amount as i128,
+    )
+    .await?;
     let invoice_total = inv.total_amount as i128;
 
-    let credits: Vec<i64> = sqlx::query_scalar("SELECT amount FROM payment_credits WHERE invoice_id = ?")
+    let credits: Vec<i64> = sqlx::query_scalar("SELECT amount FROM payment_credits WHERE invoice_id = $1")
         .bind(inv.id)
         .fetch_all(&state.db.pool)
         .await?;
     let applied_credit_total: i128 = credits.iter().map(|a| *a as i128).sum();
 
     let payments = sqlx::query_as::<_, (String, i64, Option<String>)>(
-        "SELECT status, amount, metadata FROM payments WHERE invoice_id = ? ORDER BY id DESC",
+        "SELECT status, amount, metadata FROM payments WHERE invoice_id = $1 ORDER BY id DESC",
     )
     .bind(inv.id)
     .fetch_all(&state.db.pool)
     .await?;
 
-    let confirmed: Vec<&(String, i64, Option<String>)> =
-        payments.iter().filter(|(s, _, _)| s == "confirmed").collect();
+    // Parse each confirmed payment's metadata JSON once.
+    let confirmed: Vec<(i64, Value)> = payments
+        .iter()
+        .filter(|(s, _, _)| s == "confirmed")
+        .map(|(_, a, m)| (*a, json_or_null(m)))
+        .collect();
+    let applied_to_invoice = |m: &Value| m.get("appliedToInvoice").and_then(Value::as_bool);
     let applied_payment_total: i128 = confirmed
         .iter()
-        .filter(|(_, _, m)| meta_bool(m, "appliedToInvoice") != Some(false))
-        .map(|(_, a, _)| *a as i128)
+        .filter(|(_, m)| applied_to_invoice(m) != Some(false))
+        .map(|(a, _)| *a as i128)
         .sum();
     let applied_total = if applied_credit_total > 0 { applied_credit_total } else { applied_payment_total };
     let unapplied_receipt_total: i128 = confirmed
         .iter()
-        .filter(|(_, _, m)| meta_bool(m, "appliedToInvoice") == Some(false))
-        .map(|(_, a, _)| *a as i128)
+        .filter(|(_, m)| applied_to_invoice(m) == Some(false))
+        .map(|(a, _)| *a as i128)
         .sum();
-    let latest_meta = confirmed.first().map(|(_, _, m)| m.clone()).unwrap_or(None);
+    let latest_meta = confirmed.first().map(|(_, m)| m.clone()).unwrap_or(Value::Null);
 
     let observations = sqlx::query_as::<_, (String, i64, i64, Option<String>, Option<String>)>(
         "SELECT status, amount, confirmations, accepted_at, created_at FROM payment_observations \
-         WHERE invoice_id = ? ORDER BY id DESC",
+         WHERE invoice_id = $1 ORDER BY id DESC",
     )
     .bind(inv.id)
     .fetch_all(&state.db.pool)
@@ -515,24 +553,27 @@ fn resolve_status(
     invoice_total: i128,
     applied_total: i128,
     unapplied: i128,
-    latest_meta: &Option<String>,
+    latest_meta: &Value,
     has_confirming: bool,
     has_settleable: bool,
 ) -> &'static str {
-    if unapplied > 0 || meta_bool(latest_meta, "appliedToInvoice") == Some(false) {
+    if unapplied > 0 || latest_meta.get("appliedToInvoice").and_then(Value::as_bool) == Some(false) {
         return "unapplied_receipt";
     }
     if inv.status == "cancelled" {
         return "cancelled";
     }
+    if inv.status == "refunded" {
+        return "refunded";
+    }
     if inv.status == "expired" || is_expired_now(inv) {
         return "expired";
     }
-    let settlement_state = meta_str(latest_meta, "settlementState");
-    if settlement_state.as_deref() == Some("overpaid") || applied_total > invoice_total {
+    let settlement_state = latest_meta.get("settlementState").and_then(Value::as_str);
+    if settlement_state == Some("overpaid") || applied_total > invoice_total {
         return "overpaid";
     }
-    if settlement_state.as_deref() == Some("underpaid") {
+    if settlement_state == Some("underpaid") {
         return "underpaid";
     }
     if inv.status == "paid" || applied_total >= invoice_total {
@@ -560,22 +601,17 @@ pub(crate) fn checkout_state(summary: &Value) -> Value {
         "paid" | "overpaid" => ("paid", "show_receipt", true),
         "expired" => ("expired", "contact_merchant", true),
         "cancelled" => ("cancelled", "contact_merchant", true),
+        "refunded" => ("refunded", "show_refund", true),
         "unapplied_receipt" => ("confirming_payment", "contact_merchant", false),
         _ => ("unavailable", "none", true),
     };
     json!({ "state": s, "nextAction": next, "isTerminal": terminal })
 }
 
-/// Payment status summary for an invoice id (load + derive). Used by exceptions.
-pub(crate) async fn derive_payment_status_by_id(state: &AppState, id: i64) -> AppResult<Value> {
-    let inv = load_by_id(state, id).await?;
-    derive_payment_status(state, &inv).await
-}
-
 /// Load an invoice by id (no scoping) — used after a public link spawn.
 pub(crate) async fn load_by_id(state: &AppState, id: i64) -> AppResult<InvoiceRow> {
     sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE id = $1"
     ))
     .bind(id)
     .fetch_optional(&state.db.pool)
@@ -589,7 +625,7 @@ pub(crate) async fn find_by_public_id(
     public_id: &str,
 ) -> AppResult<Option<InvoiceRow>> {
     Ok(sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE public_id = ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE public_id = $1"
     ))
     .bind(public_id)
     .fetch_optional(&state.db.pool)
@@ -612,38 +648,44 @@ pub(crate) async fn fetch_kpr1_intent(state: &AppState, public_id: &str) -> AppR
         return Err(kpr1_err("KPR1_INTENT_NOT_FOUND", "KPR-1 payment intent not found"));
     };
 
-    if invoice.status != "open" {
-        return Err(kpr1_err(
-            "KPR1_INVOICE_NOT_OPEN",
-            "KPR-1 payment intent is only available for open invoices",
-        ));
-    }
-    // assertInvoiceStoreAcceptsPublicPayment: included default store always accepts.
+    // The signed intent is public, self-contained, tamper-proof data. Serve it for
+    // ANY invoice status — open, expired, paid, or cancelled — so the wallet can
+    // always show the payer the merchant, amount and items. Refusing a not-open or
+    // expired invoice only produced a blank 0-KAS wall; a paid/expired request
+    // instead renders as a reference/receipt. Payment stays gated at submit and by
+    // the wallet's own expiry check; the covenant enforces the terms on-chain.
+    let signed_intent: Value = serde_json::from_str(&intent.canonical_intent).unwrap_or(json!({}));
 
-    let expired = intent
-        .expires_at
-        .as_deref()
+    // Bookkeeping only (never gates the response): flag an intent that lapsed by
+    // its signed `expiresAt` — the value we return, never the separate `expires_at`
+    // column that can drift from it. Leave intents already advanced past the wallet
+    // hand-off (submitted/settled/…) untouched.
+    let time_expired = signed_intent
+        .get("expiresAt")
+        .and_then(|e| e.as_str())
         .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
         .map(|dt| dt <= chrono::Utc::now())
         .unwrap_or(false);
-    if expired {
-        sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = ?")
-            .bind(intent.id)
-            .execute(&state.db.pool)
-            .await?;
-        return Err(kpr1_err("KPR1_INTENT_EXPIRED", "KPR-1 payment intent has expired"));
+    if time_expired {
+        if matches!(intent.status.as_str(), "created" | "fetched") {
+            sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = $1")
+                .bind(intent.id)
+                .execute(&state.db.pool)
+                .await?;
+        }
+        return Ok(signed_intent);
     }
 
     if intent.status == "created" {
         let now = now_iso();
-        sqlx::query("UPDATE kpr1_payment_intents SET status = 'fetched', fetched_at = ? WHERE id = ?")
+        sqlx::query("UPDATE kpr1_payment_intents SET status = 'fetched', fetched_at = $1 WHERE id = $2")
             .bind(&now)
             .bind(intent.id)
             .execute(&state.db.pool)
             .await?;
     }
 
-    Ok(serde_json::from_str(&intent.canonical_intent).unwrap_or(json!({})))
+    Ok(signed_intent)
 }
 
 /// `GET /api/invoices`
@@ -653,15 +695,16 @@ pub async fn index(
     Query(q): Query<InvoiceQuery>,
 ) -> AppResult<Json<Value>> {
     let store_id = resolve_request_store(&state, auth.user_id, q.store_id).await?;
-    let page = q.page.unwrap_or(1).max(1);
-    let per_page = q.per_page.unwrap_or(10).max(1);
+    // Clamp pagination params before multiplying so `offset` can't overflow i64.
+    let page = q.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = q.per_page.unwrap_or(10).clamp(1, 100);
     let offset = (page - 1) * per_page;
     let payment_link_only = q.source.as_deref() == Some("payment_link");
 
     let filter = if payment_link_only {
-        "user_id = ? AND store_id = ? AND payment_link_id IS NOT NULL"
+        "user_id = $1 AND store_id = $2 AND payment_link_id IS NOT NULL"
     } else {
-        "user_id = ? AND store_id = ?"
+        "user_id = $1 AND store_id = $2"
     };
 
     let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM invoices WHERE {filter}"))
@@ -671,7 +714,7 @@ pub async fn index(
         .await?;
 
     let invoices = sqlx::query_as::<_, InvoiceRow>(&format!(
-        "SELECT {INVOICE_COLS} FROM invoices WHERE {filter} ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT {INVOICE_COLS} FROM invoices WHERE {filter} ORDER BY created_at DESC, id DESC LIMIT $3 OFFSET $4"
     ))
     .bind(auth.user_id)
     .bind(store_id)
@@ -680,11 +723,12 @@ pub async fn index(
     .fetch_all(&state.db.pool)
     .await?;
 
-    let mut data = Vec::with_capacity(invoices.len());
-    for inv in &invoices {
-        let (items, intent) = load_relations(&state, inv.id).await?;
-        data.push(serialize_invoice(inv, &items, intent.as_ref()));
-    }
+    let ids: Vec<i64> = invoices.iter().map(|i| i.id).collect();
+    let (items_by, intents_by) = load_relations_many(&state, &ids).await?;
+    let data: Vec<Value> = invoices
+        .iter()
+        .map(|inv| serialize_invoice(inv, items_by.get(&inv.id).map(Vec::as_slice).unwrap_or(&[]), intents_by.get(&inv.id)))
+        .collect();
 
     Ok(Json(json!({
         "meta": paginator_meta(total, per_page, page),
@@ -707,29 +751,13 @@ struct CreateInput {
     payment_network: Option<String>,
     payment_asset: Option<String>,
     fee_delegation: Option<String>,
-    payment_mode: Option<String>,
     store_id: Option<i64>,
     customer_country_code: Option<String>,
     items: Vec<ItemInput>,
 }
 
-fn vpush(errors: &mut Vec<ValidationFailure>, field: &str, rule: &str, message: &str) {
-    errors.push(ValidationFailure {
-        message: message.to_string(),
-        rule: rule.to_string(),
-        field: field.to_string(),
-    });
-}
-
-fn is_atomic_amount(s: &str) -> bool {
-    // ^(0|[1-9]\d*)$
-    s == "0" || (!s.is_empty() && !s.starts_with('0') && s.bytes().all(|b| b.is_ascii_digit()))
-}
-
 fn validate_create(body: &Value) -> AppResult<CreateInput> {
     let mut errors = Vec::new();
-
-    let opt_string = |key: &str| body.get(key).and_then(|v| v.as_str()).map(|s| s.trim().to_string());
 
     let fee_delegation = match body.get("feeDelegation") {
         None | Some(Value::Null) => None,
@@ -739,15 +767,6 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
             None
         }
     };
-    let payment_mode = match body.get("paymentMode") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) if PAYMENT_MODES.contains(&s.as_str()) => Some(s.clone()),
-        Some(_) => {
-            vpush(&mut errors, "paymentMode", "enum", "The selected paymentMode is invalid");
-            None
-        }
-    };
-
     // items: array, minLength 1, each {name 1..255, quantity +int, unitAmount atomic}
     let mut items = Vec::new();
     match body.get("items") {
@@ -778,7 +797,15 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
                     }
                 };
                 let unit_ok = match &unit {
-                    Some(u) if is_atomic_amount(u) => true,
+                    Some(u) if is_atomic_amount(u) => match u.parse::<i128>() {
+                        // Reject amounts that don't fit in i64 up front, so the
+                        // later `as i64` casts can never silently wrap.
+                        Ok(v) if v <= i64::MAX as i128 => true,
+                        _ => {
+                            vpush(&mut errors, &format!("items.{i}.unitAmount"), "max", &format!("The items.{i}.unitAmount field exceeds the maximum"));
+                            false
+                        }
+                    },
                     _ => {
                         vpush(&mut errors, &format!("items.{i}.unitAmount"), "regex", &format!("The items.{i}.unitAmount field format is invalid"));
                         false
@@ -788,7 +815,9 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
                     items.push(ItemInput {
                         name: name.unwrap(),
                         quantity: qty.unwrap(),
-                        unit_amount: unit.unwrap().parse().unwrap_or(0),
+                        // Validated above as atomic and <= i64::MAX, so this parse
+                        // always succeeds — no silent `unwrap_or(0)` free item.
+                        unit_amount: unit.unwrap().parse().expect("unitAmount validated as atomic <= i64::MAX"),
                     });
                 }
             }
@@ -803,28 +832,19 @@ fn validate_create(body: &Value) -> AppResult<CreateInput> {
     }
 
     Ok(CreateInput {
-        external_id: opt_string("externalId").filter(|s| !s.is_empty()),
+        external_id: opt_string(body, "externalId"),
         metadata: body.get("metadata").filter(|v| !v.is_null()).cloned(),
-        expires_at: opt_string("expiresAt").filter(|s| !s.is_empty()),
-        payment_network: opt_string("paymentNetwork").filter(|s| !s.is_empty()),
-        payment_asset: opt_string("paymentAsset").filter(|s| !s.is_empty()),
+        expires_at: opt_string(body, "expiresAt"),
+        payment_network: opt_string(body, "paymentNetwork"),
+        payment_asset: opt_string(body, "paymentAsset"),
         fee_delegation,
-        payment_mode,
         store_id: body.get("storeId").and_then(|v| v.as_i64()),
-        customer_country_code: opt_string("customerCountryCode")
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_uppercase()),
+        customer_country_code: opt_string(body, "customerCountryCode").map(|s| s.to_uppercase()),
         items,
     })
 }
 
 use crate::store_context::assert_can_create_new_payments;
-
-fn random_suffix() -> String {
-    let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
-    b.iter().map(|x| format!("{:02x}", x)).collect()
-}
 
 /// `POST /api/invoices`
 pub async fn store(
@@ -869,7 +889,7 @@ pub(crate) async fn create_for_merchant(
     // externalId uniqueness (user-scoped)
     if let Some(ext) = &input.external_id {
         let existing: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = ? AND external_id = ?")
+            sqlx::query_scalar("SELECT id FROM invoices WHERE user_id = $1 AND external_id = $2")
                 .bind(user_id)
                 .bind(ext)
                 .fetch_optional(&state.db.pool)
@@ -879,37 +899,50 @@ pub(crate) async fn create_for_merchant(
         }
     }
 
-    // expiresAt validation (parseOptionalDateTime)
-    let expires_at = match &input.expires_at {
-        None => None,
-        Some(s) => {
-            if chrono::DateTime::parse_from_rfc3339(s).is_err() {
-                return Err(AppError::commerce(422, "expiresAt must be a valid ISO 8601 date-time"));
-            }
-            Some(s.clone())
-        }
-    };
+    // One contract for every payment request: exactly 15 minutes from mint.
+    // `expiresAt` remains accepted for wire compatibility, but cannot lengthen
+    // or shorten the payment account's lifetime.
+    if input.expires_at.as_deref().is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_err()) {
+        return Err(AppError::commerce(422, "expiresAt must be a valid ISO 8601 date-time"));
+    }
+    let expires_at = Some(to_iso(
+        chrono::Utc::now() + chrono::Duration::seconds(kpr1::PAYMENT_WINDOW_SECONDS),
+    ));
 
-    // amounts
-    let subtotal: i128 = input.items.iter().map(|it| it.unit_amount * it.quantity as i128).sum();
+    // amounts — guard every multiply/add against i128 overflow, then bound the
+    // results to i64 before the DB casts.
+    let too_large = || AppError::commerce(422, "Invoice amount too large");
+    let mut subtotal: i128 = 0;
+    for it in &input.items {
+        let line = it
+            .unit_amount
+            .checked_mul(it.quantity as i128)
+            .ok_or_else(too_large)?;
+        subtotal = subtotal.checked_add(line).ok_or_else(too_large)?;
+    }
     let service_fee: i128 = if fee_delegation == "customer_pays" {
         kpr1::customer_paid_amounts(subtotal, state.config.kpr1.platform_fee_bps, state.config.kpr1.platform_fee_flat_sompi)?.0
     } else {
         0
     };
-    let total = subtotal + service_fee;
+    let total = subtotal.checked_add(service_fee).ok_or_else(too_large)?;
 
-    let public_id = format!("inv_{}", random_suffix());
-    let payment_reference = format!("payref_{}", random_suffix());
+    let to_i64 = |x: i128| i64::try_from(x).map_err(|_| AppError::commerce(422, "amount exceeds maximum"));
+    let subtotal_i64 = to_i64(subtotal)?;
+    let total_i64 = to_i64(total)?;
+    let service_fee_i64 = to_i64(service_fee)?;
+
+    let public_id = format!("inv_{}", random_hex(16));
+    let payment_reference = format!("payref_{}", random_hex(16));
     let now = now_iso();
     let metadata_str = input.metadata.as_ref().map(|m| m.to_string());
 
-    let result = sqlx::query(
+    let invoice_id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO invoices \
          (user_id, store_id, public_id, external_id, payment_link_id, subscription_id, subscription_cycle_id, status, payment_address, payment_network, \
-          payment_asset, payment_reference, subtotal_amount, total_amount, fee_delegation, payment_mode, \
+          payment_asset, payment_reference, subtotal_amount, total_amount, fee_delegation, \
           service_fee_amount, currency, pricing_country_code, metadata, expires_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING id",
     )
     .bind(user_id)
     .bind(store_id)
@@ -922,31 +955,33 @@ pub(crate) async fn create_for_merchant(
     .bind(&network)
     .bind(&asset)
     .bind(&payment_reference)
-    .bind(subtotal as i64)
-    .bind(total as i64)
+    .bind(subtotal_i64)
+    .bind(total_i64)
     .bind(&fee_delegation)
-    .bind(&input.payment_mode)
-    .bind(service_fee as i64)
+    .bind(service_fee_i64)
     .bind(&asset)
     .bind(&input.customer_country_code)
     .bind(&metadata_str)
     .bind(&expires_at)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-    let invoice_id = result.last_insert_rowid();
 
     for it in &input.items {
+        let line = it
+            .unit_amount
+            .checked_mul(it.quantity as i128)
+            .ok_or_else(too_large)?;
         sqlx::query(
             "INSERT INTO invoice_items (invoice_id, name, quantity, unit_amount, total_amount, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(invoice_id)
         .bind(&it.name)
         .bind(it.quantity)
-        .bind(it.unit_amount as i64)
-        .bind((it.unit_amount * it.quantity as i128) as i64)
+        .bind(to_i64(it.unit_amount)?)
+        .bind(to_i64(line)?)
         .bind(&now)
         .bind(&now)
         .execute(&state.db.pool)
@@ -961,16 +996,15 @@ pub(crate) async fn create_for_merchant(
             user_id,
             store_id: Some(store_id),
             public_id: public_id.clone(),
-            total_amount: total as i64,
+            total_amount: total_i64,
             payment_network: network.clone(),
             payment_asset: asset.clone(),
-            payment_mode: input.payment_mode.clone(),
             expires_at: expires_at.clone(),
         },
     )
     .await?;
 
-    sqlx::query("UPDATE invoices SET payment_address = ? WHERE id = ?")
+    sqlx::query("UPDATE invoices SET payment_address = $1 WHERE id = $2")
         .bind(format!("kpr1:{intent_id}"))
         .bind(invoice_id)
         .execute(&state.db.pool)
@@ -1009,7 +1043,7 @@ pub async fn cancel(
     }
 
     let now = now_iso();
-    sqlx::query("UPDATE invoices SET status = 'cancelled', cancelled_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE invoices SET status = 'cancelled', cancelled_at = $1, updated_at = $2 WHERE id = $3")
         .bind(&now)
         .bind(&now)
         .bind(inv.id)

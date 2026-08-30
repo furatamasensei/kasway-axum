@@ -1,88 +1,54 @@
 //! AdonisJS-compatible opaque access tokens (`DbAccessTokensProvider`).
 //!
-//! Token string = `{prefix}{base64url("{id}.{secret}")}`; the DB stores only
+//! Token string = `oat_{base64url("{id}.{secret}")}`; the DB stores only
 //! `sha256(secret)` (hex). Verification decodes the id, loads the row, and
 //! constant-time compares the recomputed hash. Mirrors the merchant (`oat_`)
-//! and team-member (`tmat_`) guards in `config/auth.ts`.
+//! guard in `config/auth.ts`.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
-use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 
-use crate::util::{constant_time_eq, now_iso};
+use crate::util::{constant_time_eq, now_iso, sha256_hex};
 
-pub struct TokenKind {
-    pub table: &'static str,
-    pub type_: &'static str,
-    pub prefix: &'static str,
-}
-
-pub const MERCHANT: TokenKind = TokenKind {
-    table: "auth_access_tokens",
-    type_: "auth_token",
-    prefix: "oat_",
-};
-
-pub const CLIENT: TokenKind = TokenKind {
-    table: "team_member_auth_access_tokens",
-    type_: "team_member_auth_token",
-    prefix: "tmat_",
-};
+const PREFIX: &str = "oat_";
+const TOKEN_TYPE: &str = "auth_token";
 
 pub struct Verified {
     pub tokenable_id: i64,
     pub token_id: i64,
 }
 
-fn sha256_hex(input: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    hasher.finalize().iter().map(|b| format!("{:02x}", b)).collect()
-}
-
 /// Create and persist a token for `tokenable_id`; returns the public value.
-pub async fn mint(
-    pool: &SqlitePool,
-    kind: &TokenKind,
-    tokenable_id: i64,
-) -> Result<String, sqlx::Error> {
+pub async fn mint(pool: &PgPool, tokenable_id: i64) -> Result<String, sqlx::Error> {
     let mut secret_bytes = [0u8; 40];
     rand::thread_rng().fill_bytes(&mut secret_bytes);
     let secret = URL_SAFE_NO_PAD.encode(secret_bytes);
     let hash = sha256_hex(secret.as_bytes());
     let now = now_iso();
 
-    let sql = format!(
-        "INSERT INTO {} (tokenable_id, type, name, hash, abilities, created_at, updated_at, last_used_at, expires_at) \
-         VALUES (?, ?, NULL, ?, '[\"*\"]', ?, ?, NULL, NULL)",
-        kind.table
-    );
-    let result = sqlx::query(&sql)
-        .bind(tokenable_id)
-        .bind(kind.type_)
-        .bind(&hash)
-        .bind(&now)
-        .bind(&now)
-        .execute(pool)
-        .await?;
+    let id: i64 = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO auth_access_tokens \
+         (tokenable_id, type, name, hash, abilities, created_at, updated_at, last_used_at, expires_at) \
+         VALUES ($1, $2, NULL, $3, '[\"*\"]', $4, $5, NULL, NULL) RETURNING id",
+    )
+    .bind(tokenable_id)
+    .bind(TOKEN_TYPE)
+    .bind(&hash)
+    .bind(&now)
+    .bind(&now)
+    .fetch_one(pool)
+    .await?;
 
-    let id = result.last_insert_rowid();
-    let value = format!(
-        "{}{}",
-        kind.prefix,
-        URL_SAFE_NO_PAD.encode(format!("{}.{}", id, secret))
-    );
-    Ok(value)
+    Ok(format!(
+        "{PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(format!("{id}.{secret}"))
+    ))
 }
 
 /// Verify a token string; returns the tokenable + token row id when valid.
-pub async fn verify(
-    pool: &SqlitePool,
-    kind: &TokenKind,
-    token: &str,
-) -> Result<Option<Verified>, sqlx::Error> {
-    let Some(rest) = token.strip_prefix(kind.prefix) else {
+pub async fn verify(pool: &PgPool, token: &str) -> Result<Option<Verified>, sqlx::Error> {
+    let Some(rest) = token.strip_prefix(PREFIX) else {
         return Ok(None);
     };
     let Ok(decoded) = URL_SAFE_NO_PAD.decode(rest) else {
@@ -98,15 +64,13 @@ pub async fn verify(
         return Ok(None);
     };
 
-    let sql = format!(
-        "SELECT tokenable_id, hash, expires_at FROM {} WHERE id = ? AND type = ?",
-        kind.table
-    );
-    let row = sqlx::query_as::<_, (i64, String, Option<String>)>(&sql)
-        .bind(token_id)
-        .bind(kind.type_)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query_as::<_, (i64, String, Option<String>)>(
+        "SELECT tokenable_id, hash, expires_at FROM auth_access_tokens WHERE id = $1 AND type = $2",
+    )
+    .bind(token_id)
+    .bind(TOKEN_TYPE)
+    .fetch_optional(pool)
+    .await?;
 
     let Some((tokenable_id, stored_hash, expires_at)) = row else {
         return Ok(None);
@@ -126,8 +90,10 @@ pub async fn verify(
 }
 
 /// Delete a token row (logout). Matches `accessTokens.delete(user, identifier)`.
-pub async fn delete(pool: &SqlitePool, kind: &TokenKind, token_id: i64) -> Result<(), sqlx::Error> {
-    let sql = format!("DELETE FROM {} WHERE id = ?", kind.table);
-    sqlx::query(&sql).bind(token_id).execute(pool).await?;
+pub async fn delete(pool: &PgPool, token_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM auth_access_tokens WHERE id = $1")
+        .bind(token_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }

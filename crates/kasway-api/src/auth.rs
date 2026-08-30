@@ -1,11 +1,10 @@
-//! Auth extractors mirroring the AdonisJS middleware in `app/middleware/`.
-//!
-//! Phase 1 implements the `internalApiToken()` tier. The merchant (Bearer
-//! access token) and API-key tiers follow as their endpoints are ported.
+//! Auth extractors mirroring the AdonisJS middleware in `app/middleware/`:
+//! the `internalApiToken()` tier and the merchant (Bearer access token) tier.
 
 use crate::auth_token;
 use crate::error::AppError;
 use crate::state::AppState;
+use crate::util::constant_time_eq;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 
@@ -25,34 +24,9 @@ impl FromRequestParts<AppState> for AuthMerchant {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let token = bearer_token(parts).ok_or(AppError::Unauthorized("Unauthorized access"))?;
-        match auth_token::verify(&state.db.pool, &auth_token::MERCHANT, &token).await? {
+        match auth_token::verify(&state.db.pool, &token).await? {
             Some(v) => Ok(AuthMerchant {
                 user_id: v.tokenable_id,
-                token_id: v.token_id,
-            }),
-            None => Err(AppError::Unauthorized("Unauthorized access")),
-        }
-    }
-}
-
-/// Authenticated team member (client guard), resolved from a `tmat_` token.
-pub struct AuthClient {
-    pub member_id: i64,
-    pub token_id: i64,
-}
-
-#[axum::async_trait]
-impl FromRequestParts<AppState> for AuthClient {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        let token = bearer_token(parts).ok_or(AppError::Unauthorized("Unauthorized access"))?;
-        match auth_token::verify(&state.db.pool, &auth_token::CLIENT, &token).await? {
-            Some(v) => Ok(AuthClient {
-                member_id: v.tokenable_id,
                 token_id: v.token_id,
             }),
             None => Err(AppError::Unauthorized("Unauthorized access")),
@@ -95,27 +69,11 @@ impl FromRequestParts<AppState> for InternalToken {
 
 /// `Authorization: Bearer <t>` takes precedence, else `x-internal-api-token`.
 fn extract_token(parts: &Parts) -> Option<String> {
-    if let Some(auth) = parts.headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        if let Some(rest) = auth.strip_prefix("Bearer ") {
-            return Some(rest.trim().to_string());
-        }
-    }
-    parts
-        .headers
-        .get("x-internal-api-token")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_string())
-}
-
-/// Length-aware constant-time comparison, matching the middleware's
-/// `timingSafeEqual` guarded by an equal-length check.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    bearer_token(parts).or_else(|| {
+        parts
+            .headers
+            .get("x-internal-api-token")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim().to_string())
+    })
 }

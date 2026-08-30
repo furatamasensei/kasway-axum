@@ -12,7 +12,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://kasway.db".to_string());
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:postgres@db:5432/kasway".to_string());
     let db = Db::connect(&db_url).await?;
 
     let state = AppState {
@@ -20,12 +21,54 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(AppConfig::from_env()),
     };
 
+    // Background webhook delivery worker (WEBHOOK_WORKER_ENABLED, default on).
+    if kasway_api::webhook_worker::enabled_from_env() {
+        kasway_api::webhook_worker::spawn(state.clone());
+    } else {
+        tracing::info!("webhook delivery worker disabled via WEBHOOK_WORKER_ENABLED");
+    }
+
+    // Background chain observer (CHAIN_OBSERVER_ENABLED; default on only when
+    // KASPA_NODE_URL is configured).
+    if kasway_api::chain_observer::enabled_from_env() {
+        kasway_api::chain_observer::spawn(state.clone());
+    } else {
+        tracing::info!("chain observer disabled (CHAIN_OBSERVER_ENABLED / KASPA_NODE_URL unset)");
+    }
+
+    // Background covenant keeper (COVENANT_KEEPER_ENABLED; default on only when a
+    // keeper fee key and KASPA_NODE_URL are configured). Releases funded covenants
+    // before expiry and auto-refunds after.
+    if kasway_api::covenant_keeper::keeper_enabled("COVENANT_KEEPER_ENABLED") {
+        kasway_api::covenant_keeper::spawn(state.clone());
+    } else {
+        tracing::info!("covenant keeper disabled (COVENANT_KEEPER_ENABLED / fee key / KASPA_NODE_URL unset)");
+    }
+
+    // Background subscription biller (SUBSCRIPTION_BILLER_ENABLED, default on).
+    // Mints due subscription cycles/invoices; needs no chain access.
+    if kasway_api::subscription_biller::enabled_from_env() {
+        kasway_api::subscription_biller::spawn(state.clone());
+    } else {
+        tracing::info!("subscription biller disabled via SUBSCRIPTION_BILLER_ENABLED");
+    }
+
+    // Every KPR-1 payment address is single-use and payable for 15 minutes.
+    // Timely submissions remain open while confirmations finish.
+    kasway_api::invoice_expirer::spawn(state.clone());
+
     let app = kasway_api::build_router(state);
 
     let addr = std::env::var("HOST_PORT").unwrap_or_else(|_| "0.0.0.0:3333".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("kasway-api listening on {addr}");
-    axum::serve(listener, app).await?;
+    // ConnectInfo: the rate limiter needs the peer address as a fallback when the
+    // request carries no proxy IP header.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

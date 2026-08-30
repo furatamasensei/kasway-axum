@@ -1,7 +1,7 @@
 mod common;
 
 use axum::{routing::{get, post}, Json, Router};
-use serde_json::{json, Value};
+use serde_json::json;
 
 /// Spin a tiny mock Google OAuth server (token + userinfo). Returns its base URL.
 async fn spawn_mock_google(email: &'static str) -> String {
@@ -50,6 +50,22 @@ async fn google_callback_missing_code() {
 }
 
 #[tokio::test]
+async fn google_callback_rejects_missing_or_invalid_state() {
+    let app = common::spawn_with_config(|c| {
+        c.google.client_id = "cid".into();
+        c.google.client_secret = "secret".into();
+    }, false).await;
+
+    // A code with no state (CSRF: attacker-delivered callback) is rejected.
+    let res = app.client.get(app.url("/auth/google/callback?code=abc123")).send().await.unwrap();
+    assert_eq!(res.status(), 401, "missing OAuth state must be rejected");
+
+    // A forged/garbage state is rejected too.
+    let res2 = app.client.get(app.url("/auth/google/callback?code=abc123&state=1700000000.deadbeef")).send().await.unwrap();
+    assert_eq!(res2.status(), 401, "invalid OAuth state must be rejected");
+}
+
+#[tokio::test]
 async fn google_callback_happy_path_creates_user_and_redirects() {
     let mock = spawn_mock_google("oauthuser@example.com").await;
     let mock_token = format!("{mock}/token");
@@ -62,9 +78,23 @@ async fn google_callback_happy_path_creates_user_and_redirects() {
         c.google.userinfo_url = mock_userinfo;
     }, false).await;
 
+    // CSRF: obtain a valid, signed `state` from the redirect endpoint and round-
+    // trip it back through the callback (mirrors Google echoing `state`).
+    let redirect_url = app.client.get(app.url("/api/auth/google/redirect")).send().await.unwrap().text().await.unwrap();
+    let csrf_state = reqwest::Url::parse(&redirect_url)
+        .unwrap()
+        .query_pairs()
+        .find(|(k, _)| k == "state")
+        .map(|(_, v)| v.into_owned())
+        .expect("redirect URL carries a state param");
+
     // don't follow the redirect — inspect Location
     let no_redirect = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
-    let res = no_redirect.get(app.url("/auth/google/callback?code=abc123")).send().await.unwrap();
+    let res = no_redirect
+        .get(app.url(&format!("/auth/google/callback?code=abc123&state={csrf_state}")))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status(), 302);
     let loc = res.headers().get("location").unwrap().to_str().unwrap().to_string();
     assert!(loc.starts_with("https://app.kasway.test/auth/callback?token="), "loc={loc}");
@@ -73,15 +103,19 @@ async fn google_callback_happy_path_creates_user_and_redirects() {
     // user created
     let uid = common::merchant_user_id(&app.db, "oauthuser@example.com").await;
     assert!(uid > 0);
-    let (name, avatar): (Option<String>, Option<String>) = sqlx::query_as("SELECT full_name, avatar_url FROM users WHERE id = ?")
+    let (name, avatar): (Option<String>, Option<String>) = sqlx::query_as("SELECT full_name, avatar_url FROM users WHERE id = $1")
         .bind(uid).fetch_one(&app.db.pool).await.unwrap();
     assert_eq!(name.as_deref(), Some("Mock User"));
     assert_eq!(avatar.as_deref(), Some("https://img.test/a.png"));
 
     // second login with same email reuses the user (firstOrCreate)
-    let res2 = no_redirect.get(app.url("/auth/google/callback?code=def456")).send().await.unwrap();
+    let res2 = no_redirect
+        .get(app.url(&format!("/auth/google/callback?code=def456&state={csrf_state}")))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res2.status(), 302);
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = ?")
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE email = $1")
         .bind("oauthuser@example.com").fetch_one(&app.db.pool).await.unwrap();
     assert_eq!(count, 1);
 

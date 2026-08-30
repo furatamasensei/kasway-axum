@@ -7,13 +7,13 @@
 use crate::auth::AuthMerchant;
 use crate::error::{AppError, AppResult, ValidationFailure};
 use crate::state::AppState;
-use crate::util::{now_iso, paginator_meta, sha256_hex};
+use crate::util::{encode_hex, now_iso, paginator_meta, ser_json_arr, sha256_hex};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 const KEY_PREFIX: &str = "ksw";
@@ -35,12 +35,15 @@ const API_KEY_SCOPES: &[&str] = &[
     "mcp:subscriptions:read",
 ];
 
-#[derive(sqlx::FromRow)]
+/// Serialized like Lucid (camelCase); `keyHash` is never selected, so it cannot leak.
+#[derive(Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
 struct ApiKeyRow {
     id: i64,
     user_id: i64,
     name: String,
     prefix: String,
+    #[serde(serialize_with = "ser_json_arr")]
     scopes: String,
     last_used_at: Option<String>,
     expires_at: Option<String>,
@@ -52,27 +55,14 @@ struct ApiKeyRow {
 const SELECT_COLS: &str = "id, user_id, name, prefix, scopes, last_used_at, expires_at, \
                            revoked_at, created_at, updated_at";
 
-/// Serialize a row like Lucid (camelCase, declaration order, `keyHash` omitted).
 fn serialize_row(row: &ApiKeyRow) -> Value {
-    let scopes: Value = serde_json::from_str(&row.scopes).unwrap_or(Value::Array(vec![]));
-    json!({
-        "id": row.id,
-        "userId": row.user_id,
-        "name": row.name,
-        "prefix": row.prefix,
-        "scopes": scopes,
-        "lastUsedAt": row.last_used_at,
-        "expiresAt": row.expires_at,
-        "revokedAt": row.revoked_at,
-        "createdAt": row.created_at,
-        "updatedAt": row.updated_at,
-    })
+    serde_json::to_value(row).unwrap_or(Value::Null)
 }
 
 fn generate_key_material() -> (String, String, String) {
     let mut prefix_bytes = [0u8; 6];
     rand::thread_rng().fill_bytes(&mut prefix_bytes);
-    let prefix: String = prefix_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    let prefix = encode_hex(&prefix_bytes);
 
     let mut secret_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut secret_bytes);
@@ -89,7 +79,7 @@ async fn fetch_owned(
     user_id: i64,
 ) -> AppResult<ApiKeyRow> {
     let row = sqlx::query_as::<_, ApiKeyRow>(&format!(
-        "SELECT {SELECT_COLS} FROM api_keys WHERE id = ?"
+        "SELECT {SELECT_COLS} FROM api_keys WHERE id = $1"
     ))
     .bind(id)
     .fetch_optional(&state.db.pool)
@@ -115,18 +105,18 @@ pub async fn index(
     State(state): State<AppState>,
     Query(params): Query<PageParams>,
 ) -> AppResult<Json<Value>> {
-    let page = params.page.unwrap_or(1).max(1);
-    let per_page = params.per_page.unwrap_or(10).max(1);
+    let page = params.page.unwrap_or(1).clamp(1, 100_000);
+    let per_page = params.per_page.unwrap_or(10).clamp(1, 100);
     let offset = (page - 1) * per_page;
 
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = ?")
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
         .bind(auth.user_id)
         .fetch_one(&state.db.pool)
         .await?;
 
     let rows = sqlx::query_as::<_, ApiKeyRow>(&format!(
-        "SELECT {SELECT_COLS} FROM api_keys WHERE user_id = ? \
-         ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        "SELECT {SELECT_COLS} FROM api_keys WHERE user_id = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3"
     ))
     .bind(auth.user_id)
     .bind(per_page)
@@ -154,10 +144,10 @@ pub async fn store(
     let now = now_iso();
     let scopes_json = serde_json::to_string(&scopes).unwrap();
 
-    let result = sqlx::query(
+    let id: i64 = sqlx::query_scalar::<_, i64>(
         "INSERT INTO api_keys \
          (user_id, name, prefix, key_hash, scopes, last_used_at, expires_at, revoked_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)",
+         VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, $7, $8) RETURNING id",
     )
     .bind(auth.user_id)
     .bind(&name)
@@ -167,10 +157,8 @@ pub async fn store(
     .bind(&expires_at)
     .bind(&now)
     .bind(&now)
-    .execute(&state.db.pool)
+    .fetch_one(&state.db.pool)
     .await?;
-
-    let id = result.last_insert_rowid();
     let row = fetch_owned(&state, id, auth.user_id).await?;
     let mut value = serialize_row(&row);
     value["key"] = Value::String(key);
@@ -196,7 +184,7 @@ pub async fn revoke(
 ) -> AppResult<Json<Value>> {
     fetch_owned(&state, id, auth.user_id).await?;
     let now = now_iso();
-    sqlx::query("UPDATE api_keys SET revoked_at = ?, updated_at = ? WHERE id = ?")
+    sqlx::query("UPDATE api_keys SET revoked_at = $1, updated_at = $2 WHERE id = $3")
         .bind(&now)
         .bind(&now)
         .bind(id)
@@ -217,8 +205,8 @@ pub async fn rotate(
     let (prefix, key, key_hash) = generate_key_material();
     let now = now_iso();
     sqlx::query(
-        "UPDATE api_keys SET prefix = ?, key_hash = ?, last_used_at = NULL, revoked_at = NULL, \
-         updated_at = ? WHERE id = ?",
+        "UPDATE api_keys SET prefix = $1, key_hash = $2, last_used_at = NULL, revoked_at = NULL, \
+         updated_at = $3 WHERE id = $4",
     )
     .bind(&prefix)
     .bind(&key_hash)
@@ -340,9 +328,5 @@ fn validate_future_date(s: &str) -> Result<String, (&'static str, String)> {
 }
 
 fn push(errors: &mut Vec<ValidationFailure>, field: &str, rule: &str, message: &str) {
-    errors.push(ValidationFailure {
-        message: message.to_string(),
-        rule: rule.to_string(),
-        field: field.to_string(),
-    });
+    errors.push(ValidationFailure::new(field, rule, message));
 }

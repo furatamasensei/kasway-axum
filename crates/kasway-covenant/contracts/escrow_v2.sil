@@ -1,0 +1,124 @@
+pragma silverscript ^0.1.0;
+
+// Kasway escrow V2 — tiered dispute resolution (successor to RefundWindow).
+//
+// One invoice funds one P2SH covenant output holding `gross_amount`. Funds can
+// only ever leave through one of the tiered settlement paths below, and the
+// CUSTOMER can never unilaterally refund themselves.
+//
+// Tier 0 — optimistic (no arbiter):
+//   release_confirmed(sig)  — the customer signs ("confirm delivery").
+//   release_captured()      — after `capture_time`, permissionless auto-capture
+//                             pays the merchant by default (protects the merchant
+//                             from a customer who receives goods then goes quiet).
+//
+// Tier 1 — bilateral mutual settlement (no arbiter):
+//   release_settled(sig, sig) — customer AND merchant both sign. Because both
+//                             sign SIG_HASH_ALL (which commits the entire output
+//                             set), the two signatures ARE joint consent to the
+//                             exact split — any number of outputs, any amounts —
+//                             so the covenant need not enumerate the split.
+//
+// Tier 2 — M-of-N consented arbiter panel (Kasway is NOT a member):
+//   release_arbitrated(sig[], int[]) — a threshold of the per-trade arbiter panel
+//                             rules for the merchant.
+//   refund_by_arbiter(sig[], int[])  — a threshold of the panel rules for the customer.
+//   The panel `arbiter_pubkeys` is chosen and consented to by both parties at
+//   funding time; Kasway's key is never in it, so Kasway cannot decide a dispute.
+//
+// Merchant may always voluntarily refund:
+//   refund_by_merchant(sig)  — the merchant refunds the full gross to the customer.
+//
+// Destinations carry a 32-byte payload + kind (0 = schnorr P2PK, 1 = P2SH); the
+// scriptPubKey is rebuilt in-script. customer/merchant/arbiter keys are 32-byte
+// schnorr keys.
+contract EscrowV2(
+    byte[32][] payout_payloads,
+    int[] payout_kinds,
+    int[] payout_values,
+    int payout_count,
+    byte[32] customer_pubkey,
+    byte[32] merchant_pubkey,
+    byte[32][] arbiter_pubkeys,
+    int arbiter_count,
+    int arbiter_threshold,
+    int gross_amount,
+    int capture_time
+) {
+    // The spend must consume exactly the covenant's value (rejects under/overfund)
+    // and pay every payout to its exact scriptPubKey and amount.
+    function assert_merchant_split() {
+        require(tx.inputs[this.activeInputIndex].value == gross_amount);
+        for (i, 0, payout_count, 8) {
+            byte[] spk = payout_kinds[i] == 0
+                ? byte[](new ScriptPubKeyP2PK(pubkey(payout_payloads[i])))
+                : byte[](new ScriptPubKeyP2SH(payout_payloads[i]));
+            require(tx.outputs[i].scriptPubKey == spk);
+            require(tx.outputs[i].value == payout_values[i]);
+        }
+    }
+
+    // The spend must return the full gross to the customer's P2PK output.
+    function assert_customer_refund() {
+        require(tx.inputs[this.activeInputIndex].value == gross_amount);
+        require(tx.outputs[0].scriptPubKey == byte[](new ScriptPubKeyP2PK(pubkey(customer_pubkey))));
+        require(tx.outputs[0].value == gross_amount);
+    }
+
+    // Verify a threshold of distinct arbiter signatures over the spending tx.
+    // `signer_idx` are the panel indices of the signers, STRICTLY INCREASING so
+    // the same arbiter can never be counted twice, each in range and each a valid
+    // SIG_HASH_ALL signature over this transaction.
+    function assert_arbiter_threshold(sig[] arbiter_sigs, int[] signer_idx) {
+        require(arbiter_sigs.length == arbiter_threshold);
+        require(signer_idx.length == arbiter_threshold);
+        int prev = 0 - 1;
+        for (i, 0, arbiter_threshold, arbiter_count) {
+            int si = signer_idx[i];
+            require(si > prev);
+            require(si < arbiter_count);
+            require(checkSig(arbiter_sigs[i], pubkey(arbiter_pubkeys[si])));
+            prev = si;
+        }
+    }
+
+    // ---- Tier 0: optimistic ----
+
+    entrypoint function release_confirmed(sig customer_sig) {
+        require(checkSig(customer_sig, pubkey(customer_pubkey)));
+        assert_merchant_split();
+    }
+
+    entrypoint function release_captured() {
+        require(tx.time >= capture_time);
+        assert_merchant_split();
+    }
+
+    // ---- Tier 1: bilateral mutual settlement ----
+
+    entrypoint function release_settled(sig customer_sig, sig merchant_sig) {
+        // Both sign SIG_HASH_ALL -> the pair endorses the exact output set.
+        require(tx.inputs[this.activeInputIndex].value == gross_amount);
+        require(checkSig(customer_sig, pubkey(customer_pubkey)));
+        require(checkSig(merchant_sig, pubkey(merchant_pubkey)));
+    }
+
+    // ---- Tier 2: M-of-N consented arbiter panel ----
+
+    entrypoint function release_arbitrated(sig[] arbiter_sigs, int[] signer_idx) {
+        assert_arbiter_threshold(arbiter_sigs, signer_idx);
+        assert_merchant_split();
+    }
+
+    entrypoint function refund_by_arbiter(sig[] arbiter_sigs, int[] signer_idx) {
+        assert_arbiter_threshold(arbiter_sigs, signer_idx);
+        assert_customer_refund();
+    }
+
+    // ---- Merchant voluntary refund ----
+
+    entrypoint function refund_by_merchant(sig merchant_sig) {
+        require(checkSig(merchant_sig, pubkey(merchant_pubkey)));
+        assert_customer_refund();
+    }
+}

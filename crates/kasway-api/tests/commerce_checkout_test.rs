@@ -2,20 +2,11 @@ mod common;
 
 use serde_json::{json, Value};
 
-/// Register a merchant, seed default store + payout setup, return (token, email).
-async fn merchant_with_setup(app: &common::TestApp, email: &str) -> String {
-    let token = common::register_merchant(app, email, "secret123").await;
-    let uid = common::merchant_user_id(&app.db, email).await;
-    let store = common::seed_default_store(&app.db, uid).await;
-    common::seed_setup(&app.db, uid, store, "kaspatest:merchantpayout00001").await;
-    token
-}
-
 async fn create_invoice(app: &common::TestApp, token: &str) -> Value {
     app.client
         .post(app.url("/api/invoices"))
         .bearer_auth(token)
-        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "1000" }] }))
+        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }] }))
         .send()
         .await
         .unwrap()
@@ -29,13 +20,13 @@ async fn create_invoice(app: &common::TestApp, token: &str) -> Value {
 #[tokio::test]
 async fn commerce_store_returns_kpr1_contract() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "com1@example.com").await;
+    let token = common::merchant_with_setup(&app, "com1@example.com").await;
 
     let res = app
         .client
         .post(app.url("/api/commerce/invoices"))
         .bearer_auth(&token)
-        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "1000" }] }))
+        .json(&json!({ "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }] }))
         .send()
         .await
         .unwrap();
@@ -51,7 +42,7 @@ async fn commerce_store_returns_kpr1_contract() {
 #[tokio::test]
 async fn commerce_show_roundtrip_and_missing() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "com2@example.com").await;
+    let token = common::merchant_with_setup(&app, "com2@example.com").await;
     let created = create_invoice(&app, &token).await;
     let public_id = created["publicId"].as_str().unwrap();
 
@@ -83,7 +74,7 @@ async fn commerce_show_roundtrip_and_missing() {
 #[tokio::test]
 async fn checkout_show_returns_status_and_state() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "chk1@example.com").await;
+    let token = common::merchant_with_setup(&app, "chk1@example.com").await;
     let created = create_invoice(&app, &token).await;
     let public_id = created["publicId"].as_str().unwrap();
 
@@ -101,8 +92,8 @@ async fn checkout_show_returns_status_and_state() {
     assert!(body.get("paymentAddress").is_none());
     // payment status baseline
     assert_eq!(body["paymentStatus"]["status"]["paymentState"], "awaiting_payment");
-    assert_eq!(body["paymentStatus"]["totals"]["invoice"], "1000");
-    assert_eq!(body["paymentStatus"]["totals"]["remaining"], "1000");
+    assert_eq!(body["paymentStatus"]["totals"]["invoice"], "500000000");
+    assert_eq!(body["paymentStatus"]["totals"]["remaining"], "500000000");
     assert_eq!(body["paymentStatus"]["finality"]["confirmationsRequired"], 10);
     // checkout state
     assert_eq!(body["checkoutState"]["state"], "awaiting_payment");
@@ -126,7 +117,7 @@ async fn checkout_show_missing_404() {
 #[tokio::test]
 async fn checkout_kpr1_intent_returns_canonical_and_marks_fetched() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "chk2@example.com").await;
+    let token = common::merchant_with_setup(&app, "chk2@example.com").await;
     let created = create_invoice(&app, &token).await;
     let public_id = created["publicId"].as_str().unwrap();
 
@@ -147,13 +138,88 @@ async fn checkout_kpr1_intent_returns_canonical_and_marks_fetched() {
 
     // status transitioned created -> fetched
     let status: String = sqlx::query_scalar(
-        "SELECT status FROM kpr1_payment_intents WHERE intent_id = ?",
+        "SELECT status FROM kpr1_payment_intents WHERE intent_id = $1",
     )
     .bind(intent["intentId"].as_str().unwrap())
     .fetch_one(&app.db.pool)
     .await
     .unwrap();
     assert_eq!(status, "fetched");
+}
+
+// The `expires_at` column can drift from the signed intent's own `expiresAt`
+// (e.g. a manual edit). The endpoint must judge expiry from the value it signed
+// and returns, so it never serves a request the pending list calls "awaiting"
+// while the review screen 422s it as expired.
+#[tokio::test]
+async fn checkout_kpr1_intent_ignores_stale_expires_column() {
+    let app = common::spawn_app().await;
+    let token = common::merchant_with_setup(&app, "chk_drift@example.com").await;
+    let created = create_invoice(&app, &token).await;
+    let public_id = created["publicId"].as_str().unwrap();
+
+    // Drift the column into the deep past while the signed intent stays valid.
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET expires_at = '2020-01-01T00:00:00+00:00' \
+         WHERE invoice_id = (SELECT id FROM invoices WHERE public_id = $1)",
+    )
+    .bind(public_id)
+    .execute(&app.db.pool)
+    .await
+    .unwrap();
+
+    let res = app
+        .client
+        .get(app.url(&format!("/api/checkout/invoices/{public_id}/kpr1-intent")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "signed intent is still valid; stale column must not expire it");
+    assert_eq!(res.json::<Value>().await.unwrap()["version"], "kpr-1");
+}
+
+// An expired (but open) intent is still SERVED with its details, so the wallet
+// can show the payer what lapsed instead of a blank wall — the wallet refuses to
+// pay it from the signed `expiresAt`. The intent is also marked expired for the
+// merchant's records.
+#[tokio::test]
+async fn checkout_kpr1_intent_expired_still_served_with_details() {
+    let app = common::spawn_app().await;
+    let token = common::merchant_with_setup(&app, "chk_exp@example.com").await;
+    let created = create_invoice(&app, &token).await;
+    let public_id = created["publicId"].as_str().unwrap();
+
+    // Expire the SIGNED value itself.
+    sqlx::query(
+        "UPDATE kpr1_payment_intents \
+         SET canonical_intent = jsonb_set(canonical_intent::jsonb, '{expiresAt}', '\"2020-01-01T00:00:00+00:00\"')::text \
+         WHERE invoice_id = (SELECT id FROM invoices WHERE public_id = $1)",
+    )
+    .bind(public_id)
+    .execute(&app.db.pool)
+    .await
+    .unwrap();
+
+    let res = app
+        .client
+        .get(app.url(&format!("/api/checkout/invoices/{public_id}/kpr1-intent")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "expired intent must still return its details");
+    let intent: Value = res.json().await.unwrap();
+    assert_eq!(intent["version"], "kpr-1");
+    assert!(intent["outputs"].is_array(), "details (outputs/items) are present");
+    assert_eq!(intent["expiresAt"], "2020-01-01T00:00:00+00:00");
+
+    // ...and it was recorded as expired for the merchant.
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM kpr1_payment_intents WHERE invoice_id = (SELECT id FROM invoices WHERE public_id = $1)")
+            .bind(public_id)
+            .fetch_one(&app.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "expired");
 }
 
 #[tokio::test]
@@ -171,10 +237,13 @@ async fn checkout_kpr1_intent_missing_422() {
     assert_eq!(body["message"], "KPR-1 payment intent not found");
 }
 
+// A closed invoice (cancelled/paid) still hands back its signed details, so the
+// wallet renders a reference/receipt view instead of a blank 0-KAS wall. It's
+// public signed data; payment is refused at submit, not by hiding the details.
 #[tokio::test]
-async fn checkout_kpr1_intent_not_open_422() {
+async fn checkout_kpr1_intent_not_open_still_served() {
     let app = common::spawn_app().await;
-    let token = merchant_with_setup(&app, "chk3@example.com").await;
+    let token = common::merchant_with_setup(&app, "chk3@example.com").await;
     let created = create_invoice(&app, &token).await;
     let id = created["id"].as_i64().unwrap();
     let public_id = created["publicId"].as_str().unwrap().to_string();
@@ -193,7 +262,8 @@ async fn checkout_kpr1_intent_not_open_422() {
         .send()
         .await
         .unwrap();
-    assert_eq!(res.status(), 422);
-    let body: Value = res.json().await.unwrap();
-    assert_eq!(body["code"], "KPR1_INVOICE_NOT_OPEN");
+    assert_eq!(res.status(), 200, "closed invoice still serves its details for reference");
+    let intent: Value = res.json().await.unwrap();
+    assert_eq!(intent["version"], "kpr-1");
+    assert!(intent["outputs"].is_array());
 }

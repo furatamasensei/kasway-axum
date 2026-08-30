@@ -22,8 +22,6 @@ pub enum AppError {
     /// Forbidden with no body, matching bare `response.forbidden()`.
     #[error("forbidden")]
     Forbidden,
-    #[error("forbidden")]
-    ForbiddenWithMessage(String),
     #[error("not found")]
     NotFound(&'static str),
     #[error("service unavailable")]
@@ -50,6 +48,16 @@ pub struct ValidationFailure {
     pub field: String,
 }
 
+impl ValidationFailure {
+    pub fn new(field: &str, rule: &str, message: &str) -> Self {
+        ValidationFailure {
+            message: message.to_string(),
+            rule: rule.to_string(),
+            field: field.to_string(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct MessageBody {
     message: String,
@@ -68,11 +76,12 @@ impl AppError {
 
     /// Single-field VineJS-shaped 422.
     pub fn validation_field(field: &str, rule: &str, message: &str) -> Self {
-        AppError::Validation(vec![ValidationFailure {
-            message: message.to_string(),
-            rule: rule.to_string(),
-            field: field.to_string(),
-        }])
+        AppError::Validation(vec![ValidationFailure::new(field, rule, message)])
+    }
+
+    /// 422 `{ message }` (CommerceError shape).
+    pub fn unprocessable(msg: impl Into<String>) -> Self {
+        AppError::commerce(422, msg.into())
     }
 
     pub fn bad_request(msg: impl Into<String>) -> Self {
@@ -100,9 +109,6 @@ impl IntoResponse for AppError {
                 (StatusCode::UNAUTHORIZED, Json(MessageBody { message: msg.into() })).into_response()
             }
             AppError::Forbidden => StatusCode::FORBIDDEN.into_response(),
-            AppError::ForbiddenWithMessage(msg) => {
-                (StatusCode::FORBIDDEN, Json(MessageBody { message: msg })).into_response()
-            }
             AppError::NotFound(msg) => {
                 (StatusCode::NOT_FOUND, Json(MessageBody { message: msg.into() })).into_response()
             }
@@ -115,11 +121,17 @@ impl IntoResponse for AppError {
                 let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 (code, Json(MessageBody { message })).into_response()
             }
-            AppError::Kpr1 { code, message } => (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({ "message": message, "code": code })),
-            )
-                .into_response(),
+            AppError::Kpr1 { code, message } => {
+                // The other funnel for KPR-1 refusals (checkout.rs has its own,
+                // which returns a Response directly and never reaches here). The
+                // access log only shows 422 — the code is what says why.
+                tracing::warn!("kpr1 refused: {code} — {message}");
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "message": message, "code": code })),
+                )
+                    .into_response()
+            }
             AppError::Validation(failures) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 Json(ErrorsBody { errors: failures }),
