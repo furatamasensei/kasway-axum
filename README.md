@@ -176,3 +176,12 @@ appears.
 KPR-1 covenant settlement, chain observation, and both dispute paths are
 implemented and covered by integration tests. `build_router` in
 `crates/kasway-api/src/lib.rs` is the authoritative list of endpoints.
+
+## License
+
+- `crates/kasway-covenant` (covenant scripts and compiler integration) and the
+  whitepaper (`docs/`) are licensed under [Apache-2.0](crates/kasway-covenant/LICENSE)
+  so wallets, indexers, and integrators can build on the protocol freely.
+- Everything else (the API server, `crates/kasway-api`, `crates/kasway-db`) is
+  licensed under [AGPL-3.0-only](LICENSE): run it, modify it, self-host it — but a
+  hosted service built on a modified version must publish its modifications.

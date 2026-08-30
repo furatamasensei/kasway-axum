@@ -19,7 +19,7 @@ opt-level = 3
 
 [workspace.package]
 edition = "2021"
-license = "UNLICENSED"
+license = "AGPL-3.0-only"
 publish = false
 
 [workspace.dependencies]
