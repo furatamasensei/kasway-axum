@@ -115,7 +115,7 @@ pub async fn plans_store(auth: AuthMerchant, State(state): State<AppState>, Json
     .bind(&currency).bind(&network).bind(&asset)
     .bind(body.get("intervalUnit").and_then(|v| v.as_str()).unwrap())
     .bind(interval_count.unwrap())
-    .bind(body.get("invoiceExpiresAfterSeconds").and_then(|v| v.as_i64()))
+    .bind(Some(crate::kpr1::PAYMENT_WINDOW_SECONDS))
     .bind(body.get("metadata").filter(|v| !v.is_null()).map(|m| m.to_string()))
     .bind(&now).bind(&now)
     .execute(&state.db.pool).await?;
@@ -429,24 +429,49 @@ pub(crate) async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, 
     let sub = sqlx::query_as::<_, SubRow>(&format!("SELECT {SUB_COLS} FROM subscriptions WHERE id = $1"))
         .bind(cycle.subscription_id).fetch_one(&state.db.pool).await?;
     let snap: Value = serde_json::from_str(&sub.plan_snapshot).unwrap_or(json!({}));
+    let plan = sqlx::query_as::<_, PlanRow>(&format!("SELECT {PLAN_COLS} FROM subscription_plans WHERE id = $1"))
+        .bind(sub.subscription_plan_id).fetch_one(&state.db.pool).await?;
     let attempt = cycle.attempt_count + 1;
-    let expires_at = snap.get("invoiceExpiresAfterSeconds").and_then(|v| v.as_i64())
-        .map(|secs| to_iso(chrono::Utc::now() + chrono::Duration::seconds(secs)));
-    let mut body = json!({
+    let previous_amount = snap.get("amount").and_then(Value::as_str).unwrap_or("0");
+    let current_amount = plan.amount.to_string();
+    let price_changed = previous_amount != current_amount;
+    let body = json!({
         "externalId": format!("{}:{}:{}", sub.public_id, cycle.public_id, attempt),
-        "paymentNetwork": snap["paymentNetwork"],
-        "paymentAsset": snap["paymentAsset"],
-        "items": [{ "name": snap["name"], "quantity": 1, "unitAmount": snap["amount"] }],
-        "metadata": { "source": "subscription", "subscriptionId": sub.public_id, "subscriptionCycleId": cycle.public_id, "subscriptionAttempt": attempt },
+        "paymentNetwork": plan.payment_network,
+        "paymentAsset": plan.payment_asset,
+        "items": [{ "name": plan.name, "quantity": 1, "unitAmount": current_amount }],
+        "metadata": {
+            "source": "subscription",
+            "paymentType": "subscription",
+            "subscriptionId": sub.public_id,
+            "subscriptionCycleId": cycle.public_id,
+            "subscriptionAttempt": attempt,
+            "intervalUnit": plan.interval_unit,
+            "intervalCount": plan.interval_count,
+            "nextBillingAt": sub.next_billing_at,
+            "priceChange": {
+                "changed": price_changed,
+                "previousAmountSompi": previous_amount,
+                "currentAmountSompi": current_amount,
+                "noticeRequired": price_changed,
+            },
+        },
     });
-    if let (Value::Object(m), Some(exp)) = (&mut body, expires_at) {
-        m.insert("expiresAt".into(), json!(exp));
-    }
     let (invoice_id, store_id) = invoices::create_for_merchant(state, sub.user_id, &body, None, Some(sub.id), Some(cycle.id)).await?;
 
     let now = now_iso();
     sqlx::query("UPDATE subscription_cycles SET invoice_id = $1, status = 'invoiced', attempt_count = $2, invoiced_at = $3, past_due_at = NULL, updated_at = $4 WHERE id = $5")
         .bind(invoice_id).bind(attempt).bind(&now).bind(&now).bind(cycle.id).execute(&state.db.pool).await?;
+
+    let current_snapshot = json!({
+        "planId": plan.id, "planPublicId": plan.public_id, "name": plan.name, "description": plan.description,
+        "amount": plan.amount.to_string(), "currency": plan.currency, "paymentNetwork": plan.payment_network,
+        "paymentAsset": plan.payment_asset, "intervalUnit": plan.interval_unit, "intervalCount": plan.interval_count,
+        "invoiceExpiresAfterSeconds": crate::kpr1::PAYMENT_WINDOW_SECONDS,
+        "metadata": json_or_null(&plan.metadata),
+    });
+    sqlx::query("UPDATE subscriptions SET plan_snapshot = $1, updated_at = $2 WHERE id = $3")
+        .bind(current_snapshot.to_string()).bind(&now).bind(sub.id).execute(&state.db.pool).await?;
 
     // Webhook: a delivery failure must never fail the billing itself.
     if let Ok(inv) = invoices::load_by_id(state, invoice_id).await {
@@ -457,6 +482,20 @@ pub(crate) async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, 
                 state, sub.user_id, Some(store_id), "subscription.invoice.created", "invoice", &resource_id, &payload,
             ).await {
                 tracing::warn!("subscription.invoice.created emit failed for invoice {invoice_id}: {e}");
+            }
+            if price_changed {
+                let price_payload = json!({
+                    "subscriptionId": sub.public_id,
+                    "invoiceId": resource_id,
+                    "previousAmountSompi": previous_amount,
+                    "currentAmountSompi": current_amount,
+                    "effectiveAt": cycle.period_start,
+                });
+                if let Err(e) = crate::handlers::webhooks::emit_event(
+                    state, sub.user_id, Some(store_id), "subscription.price.changed", "subscription", &sub.public_id, &price_payload,
+                ).await {
+                    tracing::warn!("subscription.price.changed emit failed for subscription {}: {e}", sub.public_id);
+                }
             }
         }
     }
@@ -526,10 +565,13 @@ pub async fn subs_index(auth: AuthMerchant, State(state): State<AppState>, Query
 }
 
 pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(body): Json<Value>) -> AppResult<(StatusCode, Json<Value>)> {
-    let payment_mode = body.get("paymentMode").and_then(|v| v.as_str()).unwrap_or("recurring_invoice").to_string();
-    if !SUPPORTED_PAYMENT_MODES.contains(&payment_mode.as_str()) {
+    let requested_mode = body.get("paymentMode").and_then(|v| v.as_str()).unwrap_or("recurring_invoice");
+    if !SUPPORTED_PAYMENT_MODES.contains(&requested_mode) {
         return Err(AppError::commerce(422, "Unsupported subscription payment mode"));
     }
+    // Legacy wallet_autopay input is accepted during migration, but all new
+    // subscriptions use per-cycle invoices; renewal authority lives locally.
+    let payment_mode = "recurring_invoice".to_string();
     let plan_public = match body.get("planPublicId").and_then(|v| v.as_str()) {
         Some(p) if !p.trim().is_empty() => p.trim().to_string(),
         _ => return Err(AppError::Validation(vec![ValidationFailure { message: "The planPublicId field is required".into(), rule: "required".into(), field: "planPublicId".into() }])),
@@ -543,6 +585,13 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
     if plan.status != "active" {
         return Err(AppError::commerce(422, "Subscription plan is archived"));
     }
+    // The initial invoice is part of subscription creation. Run all KPR-1
+    // payout/setup validation before inserting even an inline customer, so a
+    // rejected invoice cannot leave an active subscription and pending cycle
+    // for the biller to retry forever.
+    let store_id = crate::store_context::resolve_request_store(&state, auth.user_id, None).await?;
+    crate::store_context::assert_can_create_new_payments(&state, store_id).await?;
+    crate::kpr1::preflight_invoice(&state, auth.user_id, store_id, plan.amount).await?;
     // resolve customer
     let cust_public = opt_string(&body, "customerPublicId");
     let cust_inline = body.get("customer").filter(|v| v.is_object());
@@ -572,23 +621,19 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
         "planId": plan.id, "planPublicId": plan.public_id, "name": plan.name, "description": plan.description,
         "amount": plan.amount.to_string(), "currency": plan.currency, "paymentNetwork": plan.payment_network,
         "paymentAsset": plan.payment_asset, "intervalUnit": plan.interval_unit, "intervalCount": plan.interval_count,
-        "invoiceExpiresAfterSeconds": plan.invoice_expires_after_seconds,
+        "invoiceExpiresAfterSeconds": crate::kpr1::PAYMENT_WINDOW_SECONDS,
         "metadata": json_or_null(&plan.metadata),
     });
     let now_s = now_iso();
     let public_id = format!("sub_{}", random_hex(16));
-    // wallet_autopay: the subscription is an offer until the customer funds the
-    // covenant cell — created 'pending' with no billing anchor; the keeper
-    // activates it (and anchors billing) when it first recognizes funding.
-    let autopay = payment_mode == "wallet_autopay";
-    let status = if autopay { "pending" } else { "active" };
-    let next_billing_at = if autopay { None } else { Some(to_iso(starts_at)) };
+    let status = "active";
+    let next_billing_at = Some(to_iso(starts_at));
     let sub_id: i64 = sqlx::query_scalar::<_, i64>("INSERT INTO subscriptions (user_id, subscription_plan_id, subscription_customer_id, public_id, external_id, status, payment_mode, plan_snapshot, next_billing_at, metadata, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id")
         .bind(auth.user_id).bind(plan.id).bind(customer_id).bind(&public_id).bind(&external_id).bind(status).bind(&payment_mode)
         .bind(snapshot.to_string()).bind(next_billing_at).bind(body.get("metadata").filter(|v| !v.is_null()).map(|m| m.to_string()))
         .bind(&now_s).bind(&now_s).fetch_one(&state.db.pool).await?;
 
-    if !autopay && starts_at <= now {
+    if starts_at <= now {
         generate_due_invoice(&state, sub_id, now).await?;
     }
 
@@ -640,18 +685,14 @@ pub async fn subs_cancel(auth: AuthMerchant, State(state): State<AppState>, Path
     Ok(Json(cancel_subscription(&state, auth.user_id, &public_id).await?))
 }
 
-/// Cancel a subscription: status/cell flips + `subscription.cancelled` emit.
-/// Shared by the merchant endpoint and the public checkout cancel (which
-/// authenticates via publicId capability / refund-key signature instead).
+/// Cancel a subscription: stop future invoice generation and emit the event.
+/// Shared by the merchant endpoint and public checkout capability URL.
 pub(crate) async fn cancel_subscription(state: &AppState, user_id: i64, public_id: &str) -> AppResult<Value> {
     let sub = load_subscription(state, user_id, public_id).await?;
     let transitioned = sub.status != "cancelled";
     if transitioned {
         sqlx::query("UPDATE subscriptions SET status = 'cancelled', cancelled_at = $1, next_billing_at = NULL, updated_at = $2 WHERE id = $3")
             .bind(now_iso()).bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
-        // The autopay cell (if any) stops claiming; funds stay customer-withdrawable.
-        sqlx::query("UPDATE subscription_cells SET state = 'cancelled', updated_at = $1 WHERE subscription_id = $2 AND state != 'withdrawn'")
-            .bind(now_iso()).bind(sub.id).execute(&state.db.pool).await?;
     }
     let sub = load_subscription(state, user_id, public_id).await?;
     let out = serialize_subscription(state, &sub, true).await?;

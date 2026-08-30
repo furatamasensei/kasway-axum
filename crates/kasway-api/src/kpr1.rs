@@ -25,7 +25,7 @@ const TEMPLATE_ID: &str = "split_settlement";
 const TEMPLATE_VERSION: &str = "v1";
 const SIGNATURE_ALGORITHM: &str = "ed25519";
 /// Hard ceiling on how long a KPR-1 payment intent stays payable.
-const MAX_INTENT_EXPIRY_MINUTES: i64 = 15;
+pub(crate) const PAYMENT_WINDOW_SECONDS: i64 = 15 * 60;
 pub(crate) const MAX_BPS: i128 = 10_000;
 pub(crate) const MAX_SPLIT_ADDRESSES: usize = 5;
 
@@ -525,6 +525,23 @@ pub(crate) async fn compute_split_plan(
     })
 }
 
+/// Validate everything that can make a freshly-created invoice impossible to
+/// mint before callers persist their own parent records. Subscription creation
+/// uses this to avoid leaving an active subscription/cycle behind when KPR-1
+/// rejects the initial invoice.
+pub(crate) async fn preflight_invoice(
+    state: &AppState,
+    user_id: i64,
+    store_id: i64,
+    amount: i64,
+) -> AppResult<()> {
+    if !state.config.kpr1.enabled {
+        return Err(err("KPR-1 covenant payments are disabled"));
+    }
+    compute_split_plan(state, user_id, Some(store_id), amount as i128).await?;
+    Ok(())
+}
+
 /// Mint and persist a KPR-1 intent for an invoice; returns the intentId.
 pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> AppResult<String> {
     let cfg = &state.config.kpr1;
@@ -549,7 +566,7 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
     // The intent commits to a fixed payout set, so a long-lived one is a stale
     // quote. Callers (e.g. an invoice's own `expiresAt`) may ask for less, never
     // more: anything longer — or unparseable — is clamped to the cap.
-    let max_expires_at = chrono::Utc::now() + chrono::Duration::minutes(MAX_INTENT_EXPIRY_MINUTES);
+    let max_expires_at = chrono::Utc::now() + chrono::Duration::seconds(PAYMENT_WINDOW_SECONDS);
     let expires_at = to_iso(
         ctx.expires_at
             .as_deref()
@@ -613,7 +630,22 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
         "kind": "refund_window_covenant",
         "status": "pending_finalize",
     });
-    let intent_unsigned = json!({
+    // Subscription identity and price-change notices are part of the signed
+    // request. The wallet must never infer recurring authority from a memo or
+    // from an untrusted checkout response.
+    let invoice_metadata: Value =
+        sqlx::query_scalar::<_, Option<String>>("SELECT metadata FROM invoices WHERE id = $1")
+            .bind(ctx.invoice_id)
+            .fetch_one(&state.db.pool)
+            .await?
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok())
+            .unwrap_or_else(|| json!({}));
+    let subscription_id = invoice_metadata.get("subscriptionId").and_then(Value::as_str);
+    let subscription_cycle_id = invoice_metadata.get("subscriptionCycleId").and_then(Value::as_str);
+    let payment_type = if subscription_id.is_some() { "subscription" } else { "one_time" };
+
+    let mut intent_unsigned = json!({
         "version": KPR1_VERSION,
         "network": ctx.payment_network,
         "asset": ctx.payment_asset,
@@ -644,7 +676,20 @@ pub async fn create_for_invoice(state: &AppState, ctx: &IntentInvoiceCtx) -> App
             "currencyCode": ctx.payment_asset,
             "items": display_items,
         },
+        "paymentType": payment_type,
     });
+    if let Some(public_id) = subscription_id {
+        intent_unsigned["subscriptionId"] = json!(public_id);
+        intent_unsigned["subscriptionCycleId"] = subscription_cycle_id.map(Value::from).unwrap_or(Value::Null);
+        intent_unsigned["subscription"] = json!({
+            "publicId": public_id,
+            "cyclePublicId": subscription_cycle_id,
+            "intervalUnit": invoice_metadata.get("intervalUnit").cloned().unwrap_or(Value::Null),
+            "intervalCount": invoice_metadata.get("intervalCount").cloned().unwrap_or(Value::Null),
+            "nextBillingAt": invoice_metadata.get("nextBillingAt").cloned().unwrap_or(Value::Null),
+            "priceChange": invoice_metadata.get("priceChange").cloned().unwrap_or(Value::Null),
+        });
+    }
 
     let unsigned_payload = canonicalize(&intent_unsigned);
     let signature_value = sign(&unsigned_payload, &cfg.signing_seed);
@@ -748,14 +793,14 @@ pub async fn finalize_covenant_for_invoice(
         return Err(err("KPR-1 payment intent not found"));
     };
 
-    let row = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>, String, Option<String>, Option<String>)>(
+    let row = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>, String, Option<String>, Option<String>, Option<String>)>(
         "SELECT id, network, required_outputs, gross_amount, expiry_ts, covenant_state, covenant_address, \
-         customer_refund_address FROM kpr1_payment_intents WHERE invoice_id = $1",
+         customer_refund_address, expires_at FROM kpr1_payment_intents WHERE invoice_id = $1",
     )
     .bind(inv_id)
     .fetch_optional(&state.db.pool)
     .await?;
-    let Some((intent_pk, network, required_outputs, gross_opt, expiry_opt, covenant_state, existing_address, existing_refund)) = row else {
+    let Some((intent_pk, network, required_outputs, gross_opt, expiry_opt, covenant_state, existing_address, existing_refund, payment_expires_at)) = row else {
         return Err(err("KPR-1 payment intent not found"));
     };
 
@@ -773,6 +818,14 @@ pub async fn finalize_covenant_for_invoice(
     }
     if inv_status != "open" {
         return Err(err("KPR-1 covenant can only be finalized for open invoices"));
+    }
+    if payment_expires_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|deadline| deadline <= chrono::Utc::now())
+    {
+        let _ = crate::handlers::invoices::expire_invoice(state, inv_id).await?;
+        return Err(err("KPR-1 payment intent has expired"));
     }
 
     let prefix = kasway_covenant::network_prefix(&network).map_err(|e| err(&e.to_string()))?;

@@ -8,7 +8,7 @@ use crate::error::{AppError, AppResult};
 use crate::handlers::{invoices, payment_links};
 use crate::state::AppState;
 use crate::store_context::assert_can_create_new_payments;
-use crate::util::now_iso;
+use crate::util::to_iso;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -41,6 +41,10 @@ pub async fn submit_kpr1_payment(
     Path(public_id): Path<String>,
     Json(body): Json<Value>,
 ) -> AppResult<Response> {
+    // The request-arrival timestamp is the payment deadline authority. Database
+    // work or scheduler order after this point must not invalidate a timely tx.
+    let received_at = chrono::Utc::now();
+    let received_at_iso = to_iso(received_at);
     let invoice = sqlx::query_as::<_, (i64, Option<i64>, String)>(
         "SELECT id, store_id, status FROM invoices WHERE public_id = $1",
     ).bind(&public_id).fetch_optional(&state.db.pool).await?;
@@ -54,7 +58,12 @@ pub async fn submit_kpr1_payment(
         return Ok(kpr1_err("KPR1_INTENT_NOT_FOUND", "KPR-1 payment intent not found", None));
     };
 
-    if inv_status != "open" {
+    let arrived_in_time = expires_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|deadline| received_at <= deadline)
+        .unwrap_or(true);
+    if inv_status != "open" && !(inv_status == "expired" && arrived_in_time) {
         return Ok(kpr1_err("KPR1_INVOICE_NOT_OPEN", "KPR-1 payments can only be submitted for open invoices", None));
     }
     if let Some(sid) = store_id {
@@ -62,13 +71,12 @@ pub async fn submit_kpr1_payment(
             return Ok(kpr1_err("KPR1_STORE_ENTITLEMENT_REQUIRED", "KPR-1 payments require an active store entitlement", None));
         }
     }
-    if let Some(exp) = expires_at.as_deref().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
-        if exp.with_timezone(&chrono::Utc) <= chrono::Utc::now() {
-            sqlx::query("UPDATE kpr1_payment_intents SET status = 'expired' WHERE id = $1").bind(intent_id).execute(&state.db.pool).await?;
-            return Ok(kpr1_err("KPR1_INTENT_EXPIRED", "KPR-1 payment intent has expired", None));
-        }
+    if !arrived_in_time {
+        let _ = invoices::expire_invoice(&state, inv_id).await?;
+        return Ok(kpr1_err("KPR1_INTENT_EXPIRED", "KPR-1 payment intent has expired", None));
     }
-    if !matches!(status.as_str(), "created" | "fetched" | "submitted") {
+    if !matches!(status.as_str(), "created" | "fetched" | "submitted")
+        && !(status == "expired" && arrived_in_time) {
         return Ok(kpr1_err("KPR1_INTENT_NOT_ACCEPTING_PAYMENTS",
             &format!("KPR-1 payment intent is not accepting wallet submissions in status {status}"),
             Some(json!({ "status": status }))));
@@ -96,14 +104,16 @@ pub async fn submit_kpr1_payment(
     if let Value::Object(m) = &mut meta {
         m.insert("walletSubmission".into(), body.get("metadata").cloned().unwrap_or(json!({})));
     }
-    let now = now_iso();
+    let now = received_at_iso;
     // Atomic claim of the tx id: only write when it is still unset (or already the
     // same tx — idempotent re-submit) and the intent is still accepting payments.
     // This closes the race where two concurrent submissions both pass the earlier
     // SELECT-then-check and clobber each other.
     let res = sqlx::query(
         "UPDATE kpr1_payment_intents SET status = 'submitted', tx_id = $1, submitted_at = COALESCE(submitted_at, $2), metadata = $3, updated_at = $4 \
-         WHERE id = $5 AND status IN ('created', 'fetched', 'submitted') AND (tx_id IS NULL OR tx_id = $1)")
+         WHERE id = $5 AND (status IN ('created', 'fetched', 'submitted') \
+         OR (status = 'expired' AND expires_at IS NOT NULL AND $2 <= expires_at)) \
+         AND (tx_id IS NULL OR tx_id = $1)")
         .bind(&tx_id).bind(&now).bind(meta.to_string()).bind(&now).bind(intent_id)
         .execute(&state.db.pool).await?;
     if res.rows_affected() == 0 {
@@ -118,12 +128,19 @@ pub async fn submit_kpr1_payment(
         ));
     }
 
+    // If the expiry worker crossed this request, restore the payable state. The
+    // intent timestamp above remains the auditable proof it arrived on time.
+    sqlx::query("UPDATE invoices SET status = 'open', updated_at = $1 WHERE id = $2 AND status = 'expired' AND expires_at >= $1")
+        .bind(&now).bind(inv_id).execute(&state.db.pool).await?;
+    sqlx::query("UPDATE subscription_cycles SET status = 'invoiced', past_due_at = NULL, updated_at = $1 WHERE invoice_id = $2 AND status = 'past_due'")
+        .bind(&now).bind(inv_id).execute(&state.db.pool).await?;
+
     let (_i, updated) = invoices::load_relations(&state, inv_id).await?;
     let updated = updated.ok_or_else(|| AppError::commerce(500, "intent vanished"))?;
     let mut out = invoices::serialize_intent(&updated);
     out["settlement"] = json!({
         "relayed": false, "observed": false, "observationId": Value::Null,
-        "settled": false, "invoiceStatus": inv_status, "intentStatus": "submitted",
+        "settled": false, "invoiceStatus": "open", "intentStatus": "submitted",
     });
     Ok((StatusCode::OK, Json(out)).into_response())
 }

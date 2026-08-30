@@ -53,14 +53,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("subscription biller disabled via SUBSCRIPTION_BILLER_ENABLED");
     }
 
-    // Background subscription autopay keeper (SUBSCRIPTION_KEEPER_ENABLED;
-    // default on only when a keeper fee key and KASPA_NODE_URL are configured).
-    // Recognizes cell funding and claims one period per due cycle.
-    if kasway_api::covenant_keeper::keeper_enabled("SUBSCRIPTION_KEEPER_ENABLED") {
-        kasway_api::subscription_keeper::spawn(state.clone());
-    } else {
-        tracing::info!("subscription keeper disabled (SUBSCRIPTION_KEEPER_ENABLED / fee key / KASPA_NODE_URL unset)");
-    }
+    // Every KPR-1 payment address is single-use and payable for 15 minutes.
+    // Timely submissions remain open while confirmations finish.
+    kasway_api::invoice_expirer::spawn(state.clone());
 
     let app = kasway_api::build_router(state);
 

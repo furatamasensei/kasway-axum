@@ -81,20 +81,43 @@ uses the `postgres` maintenance DB).
 
 ## Background workers
 
-Three workers start in-process at boot; each is independently gated:
+Five workers start in-process at boot:
 
 - **Webhook delivery** (`webhook_worker.rs`) — delivers queued webhook events.
   `WEBHOOK_WORKER_ENABLED` (default on; `0`/`false`/`off` disables).
 - **Chain observer** (`chain_observer.rs`) — observes/confirms on-chain KPR-1
   payments. `CHAIN_OBSERVER_ENABLED` (default on only when `KASPA_NODE_URL` is
   set). See below.
-- **Covenant keeper** (`covenant_keeper.rs`) — auto-refunds expired covenants
-  (returns gross to the customer, marks the invoice `expired`, emits
-  `invoice.refunded`). Merchant *release* now requires the customer's
-  "confirm delivery" signature and is driven by a customer-facing endpoint, not
-  this worker — the keeper only ever signs its own fee input.
+- **Covenant keeper** (`covenant_keeper.rs`) — settles funded one-time invoice
+  covenants after their capture window. The keeper only signs its own fee input.
   `COVENANT_KEEPER_ENABLED` (default on when a keeper fee key and
   `KASPA_NODE_URL` are set); needs `COVENANT_KEEPER_FEE_SECRET`.
+- **Subscription biller** (`subscription_biller.rs`) — creates one ordinary
+  KPR-1 invoice for each due subscription cycle.
+  `SUBSCRIPTION_BILLER_ENABLED` defaults to on.
+- **Invoice expirer** (`invoice_expirer.rs`) — expires an invoice and retires its
+  unfunded covenant when no wallet submission arrives within 15 minutes. A
+  transaction submitted before the deadline remains valid while confirmations
+  finish after the deadline.
+
+## Subscription payments
+
+Kasway bills subscriptions through the same KPR-1 invoice flow as one-time
+payments. Every signed intent includes `paymentType: "one_time"` or
+`paymentType: "subscription"`. Subscription intents also include the public
+subscription ID, cycle ID, next billing time, interval, and signed price-change
+notice.
+
+The wallet stores the customer's optional auto-renew mandate and signing key on
+their device. The backend creates a fresh invoice at each due date, and the
+wallet verifies, signs, broadcasts, and submits that invoice. Kasway does not
+create a pre-funded subscription cell, hold a subscription balance, or run a
+keeper that claims recurring funds.
+
+Every invoice has a fixed 900-second payment window. The API accepts the legacy
+`paymentMode: "wallet_autopay"` input during migration but stores new
+subscriptions as `recurring_invoice`. The old `/autopay/prepare`, `/autopay`, and
+`/autopay/withdraw/*` public routes no longer exist.
 
 ## Covenant settlement (KPR-1 on-chain)
 

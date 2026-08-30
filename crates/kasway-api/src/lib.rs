@@ -7,6 +7,7 @@ pub mod auth;
 pub mod auth_token;
 pub mod chain_observer;
 pub mod chain_source;
+pub mod invoice_expirer;
 pub mod covenant_keeper;
 pub mod error;
 pub mod handlers;
@@ -17,7 +18,6 @@ pub mod rate_limit;
 pub mod state;
 pub mod store_context;
 pub mod subscription_biller;
-pub mod subscription_keeper;
 pub mod util;
 pub(crate) mod validate;
 pub mod webhook_worker;
@@ -192,14 +192,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/checkout/links/:publicId/invoices",
             post(handlers::checkout::link_create_invoice),
         )
-        // --- Public checkout: Subscription Pocket autopay ---
+        // --- Public checkout: per-cycle subscription invoices ---
         .route("/api/checkout/subscriptions/:publicId", get(handlers::checkout_subscriptions::show))
         .route("/api/checkout/subscriptions/:publicId/kpr1-intent", get(handlers::checkout_subscriptions::intent))
-        .route("/api/checkout/subscriptions/:publicId/autopay/prepare", post(handlers::checkout_subscriptions::autopay_prepare))
-        .route("/api/checkout/subscriptions/:publicId/autopay", post(handlers::checkout_subscriptions::autopay_record))
         .route("/api/checkout/subscriptions/:publicId/cancel", post(handlers::checkout_subscriptions::cancel))
-        .route("/api/checkout/subscriptions/:publicId/autopay/withdraw/prepare", post(handlers::checkout_subscriptions::withdraw_prepare))
-        .route("/api/checkout/subscriptions/:publicId/autopay/withdraw", post(handlers::checkout_subscriptions::withdraw_submit))
         // --- Setup (default store) ---
         .route(
             "/api/setup",

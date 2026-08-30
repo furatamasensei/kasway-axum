@@ -33,6 +33,7 @@ const WEBHOOK_EVENT_TYPES: &[&str] = &[
     "subscription.cancelled",
     "subscription.invoice.created",
     "subscription.invoice.paid",
+    "subscription.price.changed",
     "subscription.past_due",
 ];
 

@@ -10,7 +10,7 @@ use crate::handlers::payment_ops_settings::required_confirmations_for;
 use crate::kpr1::{self, IntentInvoiceCtx};
 use crate::state::AppState;
 use crate::store_context::resolve_request_store;
-use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_amount_opt, ser_json, ser_json_arr, ser_json_obj};
+use crate::util::{is_atomic_amount, json_or_null, now_iso, paginator_meta, random_hex, ser_amount, ser_amount_opt, ser_json, ser_json_arr, ser_json_obj, to_iso};
 use crate::validate::{opt_string, vpush};
 use axum::extract::{Path, Query, State};
 use axum::Json;
@@ -299,14 +299,69 @@ pub(crate) async fn load_many_by_ids(state: &AppState, ids: &[i64]) -> AppResult
     Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
-/// expireIfNeeded: flip open->expired when past `expires_at`.
+/// Mark an unpaid invoice and its still-unfunded covenant expired. A wallet
+/// submission recorded before the deadline is proof that payment started in
+/// time; confirmations may safely finish after the 15-minute window.
+pub(crate) async fn expire_invoice(state: &AppState, invoice_id: i64) -> AppResult<bool> {
+    let now = now_iso();
+    let invoice_update = sqlx::query("UPDATE invoices SET status = 'expired', updated_at = $1 WHERE id = $2 AND status = 'open'")
+        .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+    sqlx::query(
+        "UPDATE kpr1_payment_intents SET status = 'expired', covenant_state = CASE \
+         WHEN covenant_state IN ('pending', 'awaiting_funding') THEN 'expired' ELSE covenant_state END, \
+         failure_reason = COALESCE(failure_reason, 'payment_window_expired'), updated_at = $1 \
+         WHERE invoice_id = $2 AND tx_id IS NULL",
+    )
+    .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+    sqlx::query(
+        "UPDATE subscription_cycles SET status = 'past_due', past_due_at = COALESCE(past_due_at, $1), \
+         updated_at = $1 WHERE invoice_id = $2 AND status != 'paid'",
+    )
+    .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+
+    // A submission and the expirer can cross between their SELECT and UPDATE.
+    // Reconcile in favor of the wallet when its server-received timestamp is
+    // within the signed deadline.
+    let timely_submission: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM kpr1_payment_intents WHERE invoice_id = $1 \
+         AND tx_id IS NOT NULL AND submitted_at IS NOT NULL AND submitted_at <= expires_at)",
+    )
+    .bind(invoice_id).fetch_one(&state.db.pool).await?;
+    if timely_submission {
+        sqlx::query("UPDATE invoices SET status = 'open', updated_at = $1 WHERE id = $2 AND status = 'expired'")
+            .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+        sqlx::query(
+            "UPDATE kpr1_payment_intents SET status = 'submitted', \
+             covenant_state = CASE WHEN covenant_state = 'expired' THEN 'awaiting_funding' ELSE covenant_state END, \
+             failure_reason = CASE WHEN failure_reason = 'payment_window_expired' THEN NULL ELSE failure_reason END, updated_at = $1 \
+             WHERE invoice_id = $2 AND tx_id IS NOT NULL",
+        )
+        .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+        sqlx::query(
+            "UPDATE subscription_cycles SET status = 'invoiced', past_due_at = NULL, updated_at = $1 \
+             WHERE invoice_id = $2 AND status = 'past_due'",
+        )
+        .bind(&now).bind(invoice_id).execute(&state.db.pool).await?;
+        return Ok(false);
+    }
+    Ok(invoice_update.rows_affected() > 0)
+}
+
+/// expireIfNeeded: flip open->expired when past `expires_at`, unless a wallet
+/// submitted the broadcast tx before that deadline.
 pub(crate) async fn expire_if_needed(state: &AppState, inv: &mut InvoiceRow) -> AppResult<()> {
     if is_expired_now(inv) {
-        inv.status = "expired".to_string();
-        sqlx::query("UPDATE invoices SET status = 'expired' WHERE id = $1")
-            .bind(inv.id)
-            .execute(&state.db.pool)
-            .await?;
+        let timely_submission: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM kpr1_payment_intents \
+             WHERE invoice_id = $1 AND tx_id IS NOT NULL AND submitted_at IS NOT NULL \
+             AND submitted_at <= expires_at)",
+        )
+        .bind(inv.id).fetch_one(&state.db.pool).await?;
+        if !timely_submission {
+            if expire_invoice(state, inv.id).await? {
+                inv.status = "expired".to_string();
+            }
+        }
     }
     Ok(())
 }
@@ -844,16 +899,15 @@ pub(crate) async fn create_for_merchant(
         }
     }
 
-    // expiresAt validation (parseOptionalDateTime)
-    let expires_at = match &input.expires_at {
-        None => None,
-        Some(s) => {
-            if chrono::DateTime::parse_from_rfc3339(s).is_err() {
-                return Err(AppError::commerce(422, "expiresAt must be a valid ISO 8601 date-time"));
-            }
-            Some(s.clone())
-        }
-    };
+    // One contract for every payment request: exactly 15 minutes from mint.
+    // `expiresAt` remains accepted for wire compatibility, but cannot lengthen
+    // or shorten the payment account's lifetime.
+    if input.expires_at.as_deref().is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_err()) {
+        return Err(AppError::commerce(422, "expiresAt must be a valid ISO 8601 date-time"));
+    }
+    let expires_at = Some(to_iso(
+        chrono::Utc::now() + chrono::Duration::seconds(kpr1::PAYMENT_WINDOW_SECONDS),
+    ));
 
     // amounts — guard every multiply/add against i128 overflow, then bound the
     // results to i64 before the DB casts.
