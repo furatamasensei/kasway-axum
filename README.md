@@ -182,6 +182,9 @@ target architecture (whitepaper section 13).
 
 ## History
 
+Kasway v1 shipped as a point-of-sale app on Kaspa; v2 rebuilds it as a
+self-custodial commerce-payment protocol.
+
 The codebase started as a Rust/Axum port of the `kasway-v2-api` HTTP layer
 (AdonisJS 6 + PostgreSQL), validated contract-test-first against the original
 request/response shapes. The chain layer that the port originally stubbed is now
