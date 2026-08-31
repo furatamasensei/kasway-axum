@@ -41,7 +41,3 @@ tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
-# Used only by examples (subscription_tn10_smoke) to assemble the plain P2PK
-# funding transaction. Same tag kasway-covenant pins, so nothing new is built.
-kaspa-consensus-core = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }
-kaspa-txscript = { git = "https://github.com/kaspanet/rusty-kaspa", tag = "v2.0.1" }

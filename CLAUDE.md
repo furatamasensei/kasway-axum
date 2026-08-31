@@ -14,13 +14,17 @@ docker compose up --build                   # server + PostgreSQL; API on :8080
 make test-db-clean                          # force-drop leftover disposable test DBs
 ```
 
-TN10 on-chain smoke harnesses (never move funds on their own; broadcast gated
-behind `SMOKE_BROADCAST=1`, dry-run otherwise):
+TN10 on-chain covenant smoke harness (never moves funds on its own; broadcast
+is gated behind `SMOKE_BROADCAST=1`, dry-run otherwise):
 
 ```bash
 KASPA_NODE_URL=ws://<node>:18210 cargo run -p kasway-api --example covenant_tn10_smoke -- <mode>
-KASPA_NODE_URL=ws://<node>:18210 cargo run -p kasway-api --example subscription_tn10_smoke -- <mode>
 ```
+
+Subscription renewal is no longer a server-side covenant smoke: every cycle is
+a fresh signed KPR-1 invoice and the wallet owns verification, signing, and
+broadcast. Exercise that flow through the mobile TN10 E2E harness and keep the
+backend contract covered by `subscription_autopay_test`.
 
 Testing model: integration tests in `crates/kasway-api/tests/` spawn the app on
 an ephemeral port and hit it with reqwest. Each test creates a fresh disposable
@@ -35,8 +39,8 @@ Kasway is a commerce-payment protocol on Kaspa: the API mints signed single-use
 KPR-1 payment intents, a self-custodial wallet verifies and signs locally, an
 independent chain observer confirms funding, and a Kaspa covenant is the only
 authority that settles. `docs/WHITEPAPER.md` is the design source of truth —
-its section 13 separates what is implemented from target architecture (the
-evaluator marketplace, encrypted case rooms, and commit-reveal are NOT built),
+its section 13 separates implemented draft behavior from remaining target work,
+`docs/ARBITRATION_PROTOCOL_V1.md` defines the implemented evaluator protocol,
 and Appendix A is the normative KPR-1 intent format.
 
 Trust invariants every change must preserve:
@@ -59,11 +63,12 @@ Cargo workspace, three crates:
 
 - `crates/kasway-db` — sqlx PostgreSQL pool + embedded migrations.
 - `crates/kasway-covenant` — the ONLY crate that touches rusty-kaspa or
-  assembles covenant script bytes. Covenants (`escrow_v2.rs`, tiered dispute
-  escrow; `subscription_v1.rs`, self-replicating recurring claim) are compiled
-  by the SilverScript compiler (`silverscript_lang`) — there is no
-  hand-assembled opcode anywhere. Licensed Apache-2.0, unlike the rest of the
-  workspace (AGPL-3.0) — keep protocol logic here, server logic out.
+  assembles covenant script bytes. Live escrow/dispute covenants and the legacy
+  `subscription_v1.rs` protocol artifact are compiled by the SilverScript
+  compiler (`silverscript_lang`) — there is no hand-assembled opcode anywhere.
+  New subscriptions do not use the legacy pre-funded cell. This crate is
+  licensed Apache-2.0, unlike the rest of the workspace (AGPL-3.0) — keep
+  protocol logic here, server logic out.
 - `crates/kasway-api` — axum app. `build_router` in `src/lib.rs` is the
   authoritative endpoint list. Auth is Adonis-compatible (Bearer access
   tokens, `x-kasway-api-key`, internal token for `/internal/*`).
@@ -96,7 +101,10 @@ no pre-funded balance, no autopay keeper, and the old `/autopay/*` routes are
 gone. The API still accepts legacy `paymentMode: "wallet_autopay"` input but
 stores `recurring_invoice`.
 
-Disputes: bilateral co-signed settlement or an M-of-N arbiter panel
+Disputes: evaluator protocol v1 uses signed profiles, quotes, three-party
+engagements, encrypted case envelopes, commit-reveal, and the
+`EscrowV3`/`DisputeV1` covenant transition. Legacy flows retain bilateral
+co-signed settlement or an M-of-N arbiter panel
 (`COVENANT_ARBITER_PANEL`/`COVENANT_ARBITER_THRESHOLD`).
 `validate_production_arbiter` in `state.rs` refuses to boot a production config
 whose panel is empty or contains Kasway's own arbiter key. Dev/test fall back

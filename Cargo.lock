@@ -2482,8 +2482,6 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hmac",
- "kaspa-consensus-core",
- "kaspa-txscript",
  "kasway-covenant",
  "kasway-db",
  "rand 0.8.6",
