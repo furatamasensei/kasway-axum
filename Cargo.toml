@@ -8,6 +8,11 @@ members = ["crates/kasway-db", "crates/kasway-api", "crates/kasway-covenant"]
 # can raise this back to 2 locally.
 [profile.dev]
 debug = "line-tables-only"
+# Incremental cache grew to ~3 GB of `target/` on this dep graph and its only
+# payoff is faster *workspace-crate* rebuilds (deps aren't incremental). Off, it
+# trades a few seconds per edit for that disk back. Deps stay cached, so this
+# does not trigger a rusty-kaspa rebuild.
+incremental = false
 
 # Dependencies are compiled optimized even in dev/test. scrypt's default params
 # are deliberately expensive (~128 MiB, log_n=17); unoptimized it runs for
@@ -16,6 +21,13 @@ debug = "line-tables-only"
 # Workspace crates stay unoptimized, so rebuilds and debugging are unaffected.
 [profile.dev.package."*"]
 opt-level = 3
+# No debug info for dependencies. `[profile.dev]` above gives everything
+# line-tables; that debug info is then statically linked into each of the ~22
+# integration-test binaries (every one embeds the whole rusty-kaspa graph),
+# which was most of the multi-GB `target/deps`. Workspace crates keep their
+# line-tables, so backtraces through our own code still resolve; we never step
+# into kaspa/sqlx internals, so losing their file:line costs nothing.
+debug = false
 
 [workspace.package]
 edition = "2021"
