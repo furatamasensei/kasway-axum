@@ -277,3 +277,70 @@ async fn intent_expiry_is_clamped_to_15_minutes() {
         "expiry should be clamped to ~15 minutes, got {minutes_out}m ({expires_at})"
     );
 }
+
+async fn create_with_expires_at(app: &common::TestApp, token: &str, expires_at: &str) -> reqwest::Response {
+    app.client
+        .post(app.url("/api/invoices"))
+        .bearer_auth(token)
+        .json(&json!({
+            "items": [{ "name": "Widget", "quantity": 1, "unitAmount": "500000000" }],
+            "expiresAt": expires_at,
+        }))
+        .send()
+        .await
+        .unwrap()
+}
+
+fn seconds_from_now(value: &Value) -> i64 {
+    let at = chrono::DateTime::parse_from_rfc3339(value.as_str().expect("expiresAt")).expect("rfc3339 expiresAt");
+    (at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_seconds()
+}
+
+// A SHORTER `expiresAt` is honored: the 15-minute window is a cap, not the only
+// contract. Both the invoice and its signed intent carry the requested deadline.
+#[tokio::test]
+async fn shorter_expires_at_is_honored() {
+    let app = common::spawn_app().await;
+    let token = common::merchant_with_setup(&app, "cinvexp2@example.com").await;
+
+    let requested = (chrono::Utc::now() + chrono::Duration::seconds(300)).to_rfc3339();
+    let res = create_with_expires_at(&app, &token, &requested).await;
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    for expires_at in [&body["expiresAt"], &body["kpr1PaymentIntent"]["expiresAt"]] {
+        let secs = seconds_from_now(expires_at);
+        assert!((295..=305).contains(&secs), "expected ~300 s, got {secs} s ({expires_at})");
+    }
+}
+
+// A LONGER `expiresAt` (1 h) is clamped to the 15-minute cap.
+#[tokio::test]
+async fn longer_expires_at_is_clamped_to_the_window() {
+    let app = common::spawn_app().await;
+    let token = common::merchant_with_setup(&app, "cinvexp3@example.com").await;
+
+    let requested = (chrono::Utc::now() + chrono::Duration::seconds(3600)).to_rfc3339();
+    let body: Value = create_with_expires_at(&app, &token, &requested).await.json().await.unwrap();
+    for expires_at in [&body["expiresAt"], &body["kpr1PaymentIntent"]["expiresAt"]] {
+        let secs = seconds_from_now(expires_at);
+        assert!((890..=900).contains(&secs), "expected ~900 s, got {secs} s ({expires_at})");
+    }
+}
+
+// A past `expiresAt` is a request for an unpayable invoice: reject it.
+#[tokio::test]
+async fn past_expires_at_is_rejected() {
+    let app = common::spawn_app().await;
+    let token = common::merchant_with_setup(&app, "cinvexp4@example.com").await;
+
+    let past = (chrono::Utc::now() - chrono::Duration::seconds(60)).to_rfc3339();
+    let res = create_with_expires_at(&app, &token, &past).await;
+    assert_eq!(res.status(), 422);
+    assert_eq!(res.json::<Value>().await.unwrap()["message"], "expiresAt must be at least 60 seconds in the future");
+
+    // Under the 60-second floor is just as unpayable.
+    let too_soon = (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339();
+    let res = create_with_expires_at(&app, &token, &too_soon).await;
+    assert_eq!(res.status(), 422);
+    assert_eq!(res.json::<Value>().await.unwrap()["message"], "expiresAt must be at least 60 seconds in the future");
+}

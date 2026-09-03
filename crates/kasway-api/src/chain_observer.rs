@@ -9,18 +9,19 @@
 //!
 //! - creates/updates the `payment_observations` row (observed amount/outputs,
 //!   accepted DAA score, confirmations),
-//! - verifies the covenant funding (one output paying the covenant P2SH
-//!   address EXACTLY the gross amount — under- or overfunding is rejected).
-//!   On mismatch it FAILS CLOSED: the intent is marked
-//!   `failed` with a stable `failure_reason` and a `payment_anomaly_signals`
-//!   row records the discrepancy — the invoice is never marked paid,
+//! - verifies the covenant funding (EXACTLY ONE output paying the covenant
+//!   P2SH address EXACTLY the gross amount — a second covenant output, under-
+//!   or overfunding is rejected). On mismatch it FAILS CLOSED: the intent is
+//!   marked `failed` with a stable `failure_reason` and a
+//!   `payment_anomaly_signals` row records the discrepancy — the invoice is
+//!   never marked paid,
 //! - once confirmations (`virtual DAA score - accepting DAA score`) meet the
 //!   tenant's confirmation policy (`payment_tenant_settings`, platform
-//!   default 10), settles: `payments` row `confirmed` (the same signal
-//!   `derivePaymentStatus` treats as applied), observation + intent →
-//!   `settled`, invoice → `paid`, and an `invoice.paid` webhook event is
-//!   emitted through the standard fan-out (deliveries are then sent by the
-//!   existing webhook worker).
+//!   default 10), marks the intent `funded` and emits `payment.confirmed`
+//!   through the standard fan-out. The invoice stays OPEN: the covenant keeper
+//!   auto-captures to the merchant after the capture window (there is no
+//!   auto-refund), or the customer releases / a dispute settles — only that
+//!   covenant spend marks the invoice paid and emits `invoice.paid`.
 //!
 //! Observer progress is checkpointed per (network, asset) in
 //! `payment_indexer_checkpoints` (source `chain_observer`, checkpoint = last
@@ -110,6 +111,7 @@ struct Candidate {
     intent_pk: i64,
     invoice_id: i64,
     user_id: i64,
+    store_id: Option<i64>,
     intent_id: String,
     tx_id: String,
     network: String,
@@ -132,7 +134,7 @@ pub async fn run_tick<S: ChainSource>(state: &AppState, source: &S) -> Result<us
         "SELECT i.id AS intent_pk, i.invoice_id, i.user_id, i.intent_id, \
                 i.tx_id, i.network, i.asset_id, i.script_hash, \
                 i.covenant_address, i.gross_amount, i.evaluator_fee_sompi, \
-                inv.public_id, inv.currency, inv.total_amount \
+                inv.public_id, inv.store_id, inv.currency, inv.total_amount \
          FROM kpr1_payment_intents i \
          JOIN invoices inv ON inv.id = i.invoice_id \
          WHERE i.tx_id IS NOT NULL AND i.covenant_address IS NOT NULL \
@@ -212,26 +214,32 @@ async fn observe_candidate<S: ChainSource>(
         .accepting_daa_score
         .map(|acc| virtual_daa.saturating_sub(acc) as i64)
         .unwrap_or(0);
-    let funded: i64 = tx
-        .outputs
-        .iter()
-        .filter(|o| o.address == covenant_address)
-        .map(|o| o.amount_sompi as i64)
-        .sum();
+    let covenant_outputs: Vec<i64> =
+        tx.outputs.iter().filter(|o| o.address == covenant_address).map(|o| o.amount_sompi as i64).collect();
+    let funded: i64 = covenant_outputs.iter().sum();
     let metadata = covenant_observation_metadata(c, &covenant_address, funded, &tx);
     let now = now_iso();
 
     let expected = gross.saturating_add(c.evaluator_fee_sompi.unwrap_or(0));
-    if funded != expected {
-        // Wrong-valued funding: fail closed with a stable reason + anomaly signal.
-        let reason = if funded < expected { "covenant_underfunded" } else { "covenant_overfunded" };
+    if covenant_outputs.len() != 1 || funded != expected {
+        // Wrong-shaped or wrong-valued funding: fail closed with a stable reason
+        // + anomaly signal. The covenant is ONE UTXO worth exactly `expected`;
+        // two outputs that merely sum to it are two unspendable UTXOs.
+        let reason = if covenant_outputs.len() != 1 {
+            "covenant_output_count"
+        } else if funded < expected {
+            "covenant_underfunded"
+        } else {
+            "covenant_overfunded"
+        };
         upsert_observation(state, c, "mismatched", funded, confirmations, &tx, &metadata, &now).await?;
         fail_intent(state, c, reason, &now).await?;
         tracing::warn!(
-            "chain observer: covenant intent {} tx {} funded {} != required covenant value {} ({reason})",
+            "chain observer: covenant intent {} tx {} paid {} across {} covenant output(s); required exactly one of {} ({reason})",
             c.intent_id,
             c.tx_id,
             kas(funded),
+            covenant_outputs.len(),
             kas(expected)
         );
         return Ok(Progress::Advanced);
@@ -242,10 +250,11 @@ async fn observe_candidate<S: ChainSource>(
 
     if confirmations >= required_confirmations {
         // Covenant is funded and confirmed. The invoice stays OPEN — the keeper
-        // releases the split (or auto-refunds after expiry) and only then marks
-        // the invoice paid/refunded.
+        // auto-captures to the merchant after the capture window (or the
+        // customer releases / a dispute settles) and only then closes it.
         upsert_observation(state, c, "settled", funded, confirmations, &tx, &metadata, &now).await?;
         mark_funded(state, c, &now).await?;
+        emit_payment_confirmed(state, c, confirmations).await;
         // The only line that says the happy path happened. Without it the
         // observer is silent on success and looks dead while it is working.
         tracing::info!(
@@ -366,8 +375,8 @@ async fn mark_verified(state: &AppState, c: &Candidate, now: &str) -> Result<(),
 }
 
 /// Covenant funded and confirmed: mark it `funded` + verified. The invoice stays
-/// OPEN — the covenant keeper releases the split (or auto-refunds after expiry)
-/// and only then closes the invoice.
+/// OPEN — the covenant keeper auto-captures to the merchant after the capture
+/// window (or the customer releases / a dispute settles) and only then closes it.
 async fn mark_funded(state: &AppState, c: &Candidate, now: &str) -> Result<(), sqlx::Error> {
     let mut tx = state.db.pool.begin().await?;
     sqlx::query(
@@ -385,6 +394,27 @@ async fn mark_funded(state: &AppState, c: &Candidate, now: &str) -> Result<(), s
     ).bind(now).bind(c.intent_pk).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// `payment.confirmed`: the covenant is funded and confirmed (the invoice is
+/// still open — `invoice.paid` follows settlement). Payload = the serialized
+/// invoice plus the funding `txId` and `confirmations`. A delivery failure is
+/// logged and never fails the tick.
+async fn emit_payment_confirmed(state: &AppState, c: &Candidate, confirmations: i64) {
+    let mut payload = crate::covenant_keeper::invoice_payload(state, c.invoice_id)
+        .await
+        .unwrap_or_else(|| json!({ "publicId": c.public_id }));
+    if let Some(map) = payload.as_object_mut() {
+        map.insert("txId".into(), json!(c.tx_id));
+        map.insert("confirmations".into(), json!(confirmations));
+    }
+    if let Err(err) = crate::handlers::webhooks::emit_event(
+        state, c.user_id, c.store_id, "payment.confirmed", "invoice", &c.public_id, &payload,
+    )
+    .await
+    {
+        tracing::warn!("chain observer: payment.confirmed emit failed for invoice {}: {err}", c.public_id);
+    }
 }
 
 /// Observed outputs do not satisfy the intent: mark the intent failed with a

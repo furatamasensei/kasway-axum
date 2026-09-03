@@ -3,6 +3,8 @@
 //! An invoice with no wallet submission recorded by its signed deadline is
 //! retired together with its unfunded covenant. A timely submission remains
 //! open while the chain observer waits for confirmations.
+//!
+//! Env: `INVOICE_EXPIRER_ENABLED` (default on; `0`/`false`/`off` disable).
 
 use crate::handlers::{invoices, webhooks};
 use crate::state::AppState;
@@ -10,6 +12,30 @@ use crate::util::now_iso;
 
 const POLL_INTERVAL_SECS: u64 = 5;
 const SCAN_BATCH: i64 = 100;
+
+/// `INVOICE_EXPIRER_ENABLED` gate (default on; `0`/`false`/`off`, any case, disable).
+pub fn enabled_from_env() -> bool {
+    enabled_from(std::env::var("INVOICE_EXPIRER_ENABLED").ok().as_deref())
+}
+
+fn enabled_from(value: Option<&str>) -> bool {
+    !matches!(value.map(|v| v.trim().to_ascii_lowercase()).as_deref(), Some("0" | "false" | "off"))
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::enabled_from;
+
+    #[test]
+    fn gate_defaults_on_and_disables_case_insensitively() {
+        assert!(enabled_from(None));
+        assert!(enabled_from(Some("1")));
+        assert!(enabled_from(Some("true")));
+        for off in ["0", "false", "off", "FALSE", " Off "] {
+            assert!(!enabled_from(Some(off)), "{off:?} should disable");
+        }
+    }
+}
 
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

@@ -3,23 +3,30 @@
 //! Backend is deliberately a verifier/indexer. It stores public profile terms,
 //! canonical commitments, signatures, ciphertext, and chain references; it has
 //! no participant private keys and never receives case plaintext.
+//!
+//! Every signed payload carries the v1 envelope (`domain`, `protocolVersion`,
+//! `network`, `action`, `nonce`, `expiresAt`); `(signer, nonce)` is consumed
+//! exactly once so a captured payload cannot be replayed.
 
 use crate::error::{AppError, AppResult};
 use crate::kpr1::canonicalize;
 use crate::state::AppState;
-use crate::util::{decode_hex, decode_hex32, encode_hex, now_iso};
+use crate::util::{decode_hex, decode_hex32, encode_hex, now_iso, to_iso};
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgRow;
 use sqlx::{Postgres, Row, Transaction};
 
 const PROTOCOL_VERSION: &str = "1";
 const MAX_LIST_LIMIT: i64 = 100;
 const MAX_CIPHERTEXT_BYTES: usize = 256 * 1024;
 const MAX_TAGS: usize = 8;
+const MAX_CASE_ID_LEN: usize = 128;
+const NONCE_REPLAY_CODE: &str = "ARBITRATION_NONCE_REPLAY";
 
 const PROFILE_DOMAIN: &str = "kasway/evaluator-profile/v1";
 const QUOTE_DOMAIN: &str = "kasway/evaluator-quote/v1";
@@ -30,12 +37,27 @@ const DECISION_COMMIT_DOMAIN: &str = "kasway/evaluator-decision-commit/v1";
 const DECISION_REVEAL_DOMAIN: &str = "kasway/evaluator-decision-reveal/v1";
 const FEEDBACK_DOMAIN: &str = "kasway/evaluator-feedback/v1";
 
+const MESSAGE_ACTIONS: &[&str] = &["negotiation", "evidence", "question", "response", "statement"];
+
+/// Fee a profile advertises for the `maxFeeSompi` filter and `sort=fee`.
+const FEE_EXPR: &str = "(CASE p.fee_kind WHEN 'fixed' THEN p.fee_value ELSE p.minimum_fee_sompi END)";
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListQuery {
     pub limit: Option<i64>,
+    pub offset: Option<i64>,
     pub category: Option<String>,
     pub language: Option<String>,
+    pub max_fee_sompi: Option<i64>,
+    pub sort: Option<String>,
+    pub order: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ActionRule {
+    Exact(&'static str),
+    OneOf(&'static [&'static str]),
 }
 
 fn obj<'a>(value: &'a Value, field: &str) -> AppResult<&'a Map<String, Value>> {
@@ -61,6 +83,14 @@ fn i64_field(value: &Value, field: &str) -> AppResult<i64> {
                 .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         })
         .ok_or_else(|| AppError::unprocessable(format!("{field} must be an integer")))
+}
+
+/// `None` when the field is absent or null; an error when present but not an integer.
+fn opt_i64_field(value: &Value, field: &str) -> AppResult<Option<i64>> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(_) => i64_field(value, field).map(Some),
+    }
 }
 
 fn string_array(value: &Value, field: &str, max: usize) -> AppResult<Vec<String>> {
@@ -124,12 +154,24 @@ fn validate_time(value: &str, field: &str) -> AppResult<DateTime<Utc>> {
         .map_err(|_| AppError::unprocessable(format!("{field} must be an RFC3339 timestamp")))
 }
 
+/// A signed RFC3339 field normalized to UTC [`to_iso`] form, so stored
+/// timestamps compare as TEXT and cast in SQL (chrono accepts offsets up to
+/// ±23:59; Postgres rejects anything past ±15:59). Never use for values that
+/// are later compared for equality against the signed terms.
+fn iso_field(value: &Value, field: &str) -> AppResult<String> {
+    Ok(to_iso(validate_time(str_field(value, field)?, field)?))
+}
+
+/// Verify the signed envelope (domain, version, network, action, nonce,
+/// expiry) and the BIP-340 signature. Returns `(payload hash hex, nonce)`; the
+/// caller must still `consume_nonce` for the signer.
 fn verify_payload(
     payload: &Value,
     signature_hex: &str,
     signer_key: &str,
     domain: &str,
-) -> AppResult<String> {
+    action: ActionRule,
+) -> AppResult<(String, String)> {
     obj(payload, "payload")?;
     if str_field(payload, "domain")? != domain {
         return Err(AppError::unprocessable(format!(
@@ -145,6 +187,23 @@ fn verify_payload(
     if !matches!(network, "tn10" | "mainnet") {
         return Err(AppError::unprocessable("network must be tn10 or mainnet"));
     }
+    let actual = str_field(payload, "action")?;
+    let allowed = match action {
+        ActionRule::Exact(expected) => actual == expected,
+        ActionRule::OneOf(list) => list.contains(&actual),
+    };
+    if !allowed {
+        let expected = match action {
+            ActionRule::Exact(expected) => expected.to_string(),
+            ActionRule::OneOf(list) => format!("one of {}", list.join(", ")),
+        };
+        return Err(AppError::unprocessable(format!("action must be {expected}")));
+    }
+    let nonce = str_field(payload, "nonce")?;
+    validate_hex(nonce, 32, "nonce")?;
+    if validate_time(str_field(payload, "expiresAt")?, "expiresAt")? <= Utc::now() {
+        return Err(AppError::unprocessable("expiresAt must be in the future"));
+    }
     let key = validate_key(signer_key, "signerKey")?;
     let sig = decode_hex(signature_hex)
         .filter(|v| v.len() == 64)
@@ -155,7 +214,27 @@ fn verify_payload(
     if !kasway_covenant::verify_schnorr_digest(&key, &digest, &sig) {
         return Err(AppError::commerce(401, "Invalid BIP-340 payload signature"));
     }
-    Ok(encode_hex(&digest))
+    Ok((encode_hex(&digest), nonce.to_ascii_lowercase()))
+}
+
+/// Record `(signer, nonce)`; a second use is a replay (409).
+async fn consume_nonce<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    signer_key: &str,
+    nonce: &str,
+) -> AppResult<()> {
+    let inserted = sqlx::query(
+        "INSERT INTO arbitration_nonces (signer_key, nonce, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(signer_key.to_ascii_lowercase())
+    .bind(nonce)
+    .bind(now_iso())
+    .execute(executor)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        return Err(AppError::coded(409, NONCE_REPLAY_CODE, "nonce already used by this signer"));
+    }
+    Ok(())
 }
 
 fn signed_parts(body: &Value) -> AppResult<(&Value, &str)> {
@@ -171,7 +250,7 @@ fn deterministic_id(prefix: &str, key: &str) -> String {
     format!("{prefix}_{}", &encode_hex(&digest)[..32])
 }
 
-fn profile_json(row: &sqlx::postgres::PgRow) -> Value {
+fn profile_json(row: &PgRow) -> Value {
     let categories: Value =
         serde_json::from_str(row.get::<&str, _>("categories")).unwrap_or_else(|_| json!([]));
     let languages: Value =
@@ -203,35 +282,113 @@ fn profile_json(row: &sqlx::postgres::PgRow) -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Reputation: settled-case aggregates per profile, computed in SQL so the
+// listing can filter and sort on them.
+// ---------------------------------------------------------------------------
+
+const REPUTATION_CTE: &str = "WITH settled AS ( \
+    SELECT d.case_id, e.profile_id, d.decision_outcome, d.opened_at::timestamptz AS opened_at, \
+           d.settled_at::timestamptz AS settled_at, d.decision_due_at::timestamptz AS due_at, \
+           (SELECT MIN(COALESCE(m.received_at, m.created_at)::timestamptz) FROM dispute_messages m WHERE m.case_id=d.case_id AND m.participant_role='evaluator') AS first_evaluator_at \
+    FROM dispute_cases d JOIN evaluator_engagements e ON e.engagement_id=d.engagement_id WHERE d.state='settled' \
+  ), fb AS ( \
+    SELECT profile_id, COUNT(*) AS ratings, \
+           AVG(score) FILTER (WHERE author_role='customer')::FLOAT8 AS customer_average, \
+           AVG(score) FILTER (WHERE author_role='seller')::FLOAT8 AS seller_average \
+    FROM evaluator_feedback GROUP BY profile_id \
+  ), rep AS ( \
+    SELECT s.profile_id, COUNT(*) AS verified_cases, \
+           COALESCE(MAX(fb.ratings), 0) AS ratings, MAX(fb.customer_average) AS customer_average, MAX(fb.seller_average) AS seller_average, \
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (s.first_evaluator_at - s.opened_at))::FLOAT8) AS median_response_seconds, \
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (s.settled_at - s.opened_at))::FLOAT8) AS median_resolution_seconds, \
+           AVG(CASE WHEN s.settled_at <= s.due_at THEN 1.0 ELSE 0.0 END)::FLOAT8 AS sla_completion_rate, \
+           COUNT(*) FILTER (WHERE s.decision_outcome='release') AS release_count, \
+           COUNT(*) FILTER (WHERE s.decision_outcome='refund') AS refund_count \
+    FROM settled s LEFT JOIN fb ON fb.profile_id=s.profile_id GROUP BY s.profile_id \
+  )";
+
+const REPUTATION_COLUMNS: &str = "COALESCE(r.verified_cases, 0) AS verified_cases, COALESCE(r.ratings, 0) AS ratings, \
+    r.customer_average, r.seller_average, r.median_response_seconds, r.median_resolution_seconds, r.sla_completion_rate, \
+    COALESCE(r.release_count, 0) AS release_count, COALESCE(r.refund_count, 0) AS refund_count";
+
+fn reputation_json(row: &PgRow) -> Value {
+    json!({
+        "verifiedCases": row.get::<i64, _>("verified_cases"),
+        "ratings": row.get::<i64, _>("ratings"),
+        "customerAverage": row.get::<Option<f64>, _>("customer_average"),
+        "sellerAverage": row.get::<Option<f64>, _>("seller_average"),
+        "medianResponseSeconds": row.get::<Option<f64>, _>("median_response_seconds"),
+        "medianResolutionSeconds": row.get::<Option<f64>, _>("median_resolution_seconds"),
+        "slaCompletionRate": row.get::<Option<f64>, _>("sla_completion_rate"),
+        "outcomes": {
+            "release": row.get::<i64, _>("release_count"),
+            "refund": row.get::<i64, _>("refund_count"),
+        },
+    })
+}
+
+async fn reputation_value(state: &AppState, profile_id: &str) -> AppResult<Value> {
+    let sql = format!(
+        "{REPUTATION_CTE} SELECT {REPUTATION_COLUMNS} FROM (SELECT $1::text AS profile_id) p LEFT JOIN rep r ON r.profile_id=p.profile_id",
+    );
+    let row = sqlx::query(&sql).bind(profile_id).fetch_one(&state.db.pool).await?;
+    Ok(reputation_json(&row))
+}
+
 pub async fn evaluator_index(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let limit = query.limit.unwrap_or(50).clamp(1, MAX_LIST_LIMIT);
-    let rows = sqlx::query(
-        "SELECT * FROM evaluator_profiles WHERE status = 'active' AND expires_at > $1 ORDER BY created_at DESC LIMIT $2",
-    )
-    .bind(now_iso())
-    .bind(limit)
-    .fetch_all(&state.db.pool)
-    .await?;
-    let mut data: Vec<Value> = rows.iter().map(profile_json).collect();
-    if let Some(category) = query.category.as_deref() {
-        data.retain(|profile| {
-            profile["categories"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|v| v.as_str() == Some(category)))
-        });
-    }
-    if let Some(language) = query.language.as_deref() {
-        data.retain(|profile| {
-            profile["languages"]
-                .as_array()
-                .is_some_and(|items| items.iter().any(|v| v.as_str() == Some(language)))
-        });
-    }
+    let offset = query.offset.unwrap_or(0).max(0);
+    let (sort_expr, default_order, nulls_last) = match query.sort.as_deref().unwrap_or("newest") {
+        "newest" => ("p.created_at", "DESC", false),
+        "fee" => (FEE_EXPR, "ASC", false),
+        "cases" => ("COALESCE(r.verified_cases, 0)", "DESC", false),
+        "resolution_time" => ("r.median_resolution_seconds", "ASC", true),
+        "rating" => ("COALESCE(r.customer_average, 0) + COALESCE(r.seller_average, 0)", "DESC", false),
+        _ => {
+            return Err(AppError::unprocessable(
+                "sort must be one of newest, fee, cases, resolution_time, rating",
+            ))
+        }
+    };
+    let order = match query.order.as_deref() {
+        None => default_order,
+        Some("asc") => "ASC",
+        Some("desc") => "DESC",
+        Some(_) => return Err(AppError::unprocessable("order must be asc or desc")),
+    };
+    let nulls = if nulls_last { " NULLS LAST" } else { "" };
+    let sql = format!(
+        "{REPUTATION_CTE} SELECT p.*, {REPUTATION_COLUMNS} \
+         FROM evaluator_profiles p LEFT JOIN rep r ON r.profile_id=p.profile_id \
+         WHERE p.status='active' AND p.expires_at > $1 \
+           AND ($2::text IS NULL OR p.categories::jsonb ? $2) \
+           AND ($3::text IS NULL OR p.languages::jsonb ? $3) \
+           AND ($4::bigint IS NULL OR {FEE_EXPR} <= $4) \
+         ORDER BY {sort_expr} {order}{nulls}, p.created_at DESC LIMIT $5 OFFSET $6",
+    );
+    let rows = sqlx::query(&sql)
+        .bind(now_iso())
+        .bind(query.category.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .bind(query.language.as_deref().map(str::trim).filter(|s| !s.is_empty()))
+        .bind(query.max_fee_sompi)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db.pool)
+        .await?;
+    let data: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut profile = profile_json(row);
+            profile["reputation"] = reputation_json(row);
+            profile
+        })
+        .collect();
     Ok(Json(
-        json!({ "data": data, "meta": { "limit": limit, "count": data.len() } }),
+        json!({ "data": data, "meta": { "limit": limit, "offset": offset, "count": data.len() } }),
     ))
 }
 
@@ -256,7 +413,9 @@ pub async fn evaluator_store(
 ) -> AppResult<Json<Value>> {
     let (payload, signature) = signed_parts(&body)?;
     let identity_key = str_field(payload, "identityKey")?;
-    let payload_hash = verify_payload(payload, signature, identity_key, PROFILE_DOMAIN)?;
+    let (payload_hash, nonce) = verify_payload(
+        payload, signature, identity_key, PROFILE_DOMAIN, ActionRule::Exact("publish_profile"),
+    )?;
     let expected_id = deterministic_id("eval", identity_key);
     if str_field(payload, "profileId")? != expected_id {
         return Err(AppError::unprocessable(format!(
@@ -283,10 +442,7 @@ pub async fn evaluator_store(
     }
     let fee_value = i64_field(fee, "value")?;
     let min_fee = i64_field(fee, "minimumSompi")?;
-    let max_fee = fee.get("maximumSompi").and_then(|v| {
-        v.as_i64()
-            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-    });
+    let max_fee = opt_i64_field(fee, "maximumSompi")?;
     if fee_value < 0
         || min_fee < 0
         || max_fee.is_some_and(|v| v < min_fee)
@@ -303,13 +459,10 @@ pub async fn evaluator_store(
     if version <= 0 {
         return Err(AppError::unprocessable("profileVersion must be positive"));
     }
-    let expires_at = str_field(payload, "expiresAt")?;
-    if validate_time(expires_at, "expiresAt")? <= Utc::now() {
-        return Err(AppError::unprocessable(
-            "evaluator profile is already expired",
-        ));
-    }
+    let expires_at = iso_field(payload, "expiresAt")?;
     let now = now_iso();
+    let mut tx = state.db.pool.begin().await?;
+    consume_nonce(&mut *tx, identity_key, &nonce).await?;
     sqlx::query(
         "INSERT INTO evaluator_profiles (profile_id, identity_key, messaging_key, pseudonym, categories, languages, policy_hash, fee_kind, fee_value, minimum_fee_sompi, maximum_fee_sompi, response_sla_seconds, decision_sla_seconds, bond_reference, profile_version, expires_at, payload_hash, signature, status, created_at, updated_at) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'active',$19,$20) \
@@ -321,8 +474,32 @@ pub async fn evaluator_store(
     .bind(str_field(payload, "policyHash")?).bind(fee_kind).bind(fee_value).bind(min_fee).bind(max_fee)
     .bind(response_sla).bind(decision_sla).bind(payload.get("bondReference").and_then(Value::as_str))
     .bind(version).bind(expires_at).bind(payload_hash).bind(signature).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?;
+    .execute(&mut *tx).await?;
+    tx.commit().await?;
     evaluator_show(State(state), Path(expected_id)).await
+}
+
+/// Validate the shared fee fields (`feeSompi`, `feePayer`, `feeBps?`,
+/// `feeCapSompi?`) and return `(feeSompi, feeBps, feeCapSompi)`.
+fn fee_fields(value: &Value) -> AppResult<(i64, Option<i64>, Option<i64>)> {
+    let fee_sompi = i64_field(value, "feeSompi")?;
+    if fee_sompi <= 0 {
+        return Err(AppError::unprocessable("feeSompi must be positive"));
+    }
+    if str_field(value, "feePayer")? != "customer" {
+        return Err(AppError::unprocessable(
+            "protocol v1 requires feePayer customer",
+        ));
+    }
+    let fee_bps = opt_i64_field(value, "feeBps")?;
+    if fee_bps.is_some_and(|b| !(0..=10_000).contains(&b)) {
+        return Err(AppError::unprocessable("feeBps must be between 0 and 10000"));
+    }
+    let fee_cap = opt_i64_field(value, "feeCapSompi")?;
+    if fee_cap.is_some_and(|c| c <= 0) {
+        return Err(AppError::unprocessable("feeCapSompi must be positive"));
+    }
+    Ok((fee_sompi, fee_bps, fee_cap))
 }
 
 pub async fn quote_store(
@@ -331,7 +508,9 @@ pub async fn quote_store(
 ) -> AppResult<Json<Value>> {
     let (payload, signature) = signed_parts(&body)?;
     let evaluator_key = str_field(payload, "evaluatorKey")?;
-    let payload_hash = verify_payload(payload, signature, evaluator_key, QUOTE_DOMAIN)?;
+    let (payload_hash, nonce) = verify_payload(
+        payload, signature, evaluator_key, QUOTE_DOMAIN, ActionRule::Exact("issue_quote"),
+    )?;
     let quote_id = str_field(payload, "quoteId")?;
     let profile_id = str_field(payload, "profileId")?;
     let invoice_id = str_field(payload, "invoiceId")?;
@@ -348,15 +527,7 @@ pub async fn quote_store(
         32,
         "evidenceFormatHash",
     )?;
-    let fee_sompi = i64_field(payload, "feeSompi")?;
-    if fee_sompi <= 0 {
-        return Err(AppError::unprocessable("feeSompi must be positive"));
-    }
-    if str_field(payload, "feePayer")? != "customer" {
-        return Err(AppError::unprocessable(
-            "protocol v1 requires feePayer customer",
-        ));
-    }
+    let (fee_sompi, fee_bps, fee_cap) = fee_fields(payload)?;
     let allowed = string_array(payload, "allowedOutcomes", 2)?;
     if allowed.is_empty()
         || allowed
@@ -369,9 +540,9 @@ pub async fn quote_store(
     }
     let decision_sla = i64_field(payload, "decisionSlaSeconds")?;
     let dispute_deadline = str_field(payload, "disputeDeadline")?;
-    let expires_at = str_field(payload, "expiresAt")?;
-    if decision_sla <= 0 || validate_time(expires_at, "expiresAt")? <= Utc::now() {
-        return Err(AppError::unprocessable("quote SLA or expiry is invalid"));
+    let expires_at = iso_field(payload, "expiresAt")?;
+    if decision_sla <= 0 {
+        return Err(AppError::unprocessable("quote SLA is invalid"));
     }
     validate_time(dispute_deadline, "disputeDeadline")?;
     let reward_address = str_field(payload, "rewardAddress")?;
@@ -381,7 +552,7 @@ pub async fn quote_store(
     if let Some(key) = payload.get("backupEvaluatorKey").and_then(Value::as_str) {
         validate_key(key, "backupEvaluatorKey")?;
     }
-    let profile = sqlx::query("SELECT identity_key, policy_hash, status, expires_at FROM evaluator_profiles WHERE profile_id=$1")
+    let profile = sqlx::query("SELECT identity_key, policy_hash, status, minimum_fee_sompi, maximum_fee_sompi FROM evaluator_profiles WHERE profile_id=$1")
         .bind(profile_id).fetch_optional(&state.db.pool).await?.ok_or_else(AppError::row_not_found)?;
     if profile.get::<String, _>("identity_key") != evaluator_key
         || profile.get::<String, _>("policy_hash") != str_field(payload, "policyHash")?
@@ -391,27 +562,47 @@ pub async fn quote_store(
             "quote does not match an active evaluator profile",
         ));
     }
-    let invoice_exists: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM invoices WHERE public_id=$1 AND status='open')",
+    let min_fee = profile.get::<i64, _>("minimum_fee_sompi");
+    let max_fee = profile.get::<Option<i64>, _>("maximum_fee_sompi");
+    if fee_sompi < min_fee || max_fee.is_some_and(|m| fee_sompi > m) {
+        return Err(AppError::unprocessable(
+            "feeSompi is outside the evaluator profile fee bounds",
+        ));
+    }
+    let gross: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT k.gross_amount FROM invoices i JOIN kpr1_payment_intents k ON k.invoice_id=i.id WHERE i.public_id=$1 AND i.status='open' ORDER BY k.id DESC LIMIT 1",
     )
     .bind(invoice_id)
-    .fetch_one(&state.db.pool)
+    .fetch_optional(&state.db.pool)
     .await?;
-    if !invoice_exists {
+    let Some(gross) = gross else {
         return Err(AppError::unprocessable("quote invoice is not open"));
+    };
+    if let Some(bps) = fee_bps {
+        let gross = gross.ok_or_else(|| AppError::unprocessable("quote invoice has no gross amount"))?;
+        let from_bps = (i128::from(gross) * i128::from(bps) / 10_000) as i64;
+        let expected = fee_cap.map_or(from_bps, |cap| cap.min(from_bps));
+        if fee_sompi != expected {
+            return Err(AppError::unprocessable(format!(
+                "feeSompi must equal min(feeCapSompi, invoiceGross * feeBps / 10000) = {expected}"
+            )));
+        }
     }
     let now = now_iso();
+    let mut tx = state.db.pool.begin().await?;
+    consume_nonce(&mut *tx, evaluator_key, &nonce).await?;
     sqlx::query(
-        "INSERT INTO evaluator_quotes (quote_id,profile_id,invoice_public_id,customer_key,evaluator_key,case_key_commitment,fee_sompi,fee_payer,reward_address,policy_hash,evidence_format_hash,allowed_outcomes,dispute_deadline,decision_sla_seconds,backup_evaluator_key,quote_version,expires_at,payload_hash,signature,status,created_at,updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,'customer',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'open',$19,$20)",
+        "INSERT INTO evaluator_quotes (quote_id,profile_id,invoice_public_id,customer_key,evaluator_key,case_key_commitment,fee_sompi,fee_payer,reward_address,policy_hash,evidence_format_hash,allowed_outcomes,dispute_deadline,decision_sla_seconds,backup_evaluator_key,quote_version,expires_at,payload_hash,signature,status,created_at,updated_at,fee_bps,fee_cap_sompi) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'customer',$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'open',$19,$20,$21,$22)",
     )
     .bind(quote_id).bind(profile_id).bind(invoice_id).bind(customer_key).bind(evaluator_key)
     .bind(str_field(payload, "caseKeyCommitment")?).bind(fee_sompi).bind(reward_address)
     .bind(str_field(payload, "policyHash")?).bind(str_field(payload, "evidenceFormatHash")?)
     .bind(serde_json::to_string(&allowed).unwrap()).bind(dispute_deadline).bind(decision_sla)
     .bind(payload.get("backupEvaluatorKey").and_then(Value::as_str)).bind(i64_field(payload, "quoteVersion")?)
-    .bind(expires_at).bind(payload_hash).bind(signature).bind(&now).bind(&now)
-    .execute(&state.db.pool).await?;
+    .bind(expires_at).bind(payload_hash).bind(signature).bind(&now).bind(&now).bind(fee_bps).bind(fee_cap)
+    .execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(Json(
         json!({ "quoteId": quote_id, "status": "open", "payloadHash": canonical_hash_hex(payload) }),
     ))
@@ -438,31 +629,33 @@ pub async fn engagement_store(
         .get("terms")
         .ok_or_else(|| AppError::unprocessable("terms is required"))?;
     obj(terms, "terms")?;
-    if str_field(terms, "domain")? != ENGAGEMENT_DOMAIN
-        || str_field(terms, "protocolVersion")? != PROTOCOL_VERSION
-    {
-        return Err(AppError::unprocessable(
-            "invalid engagement domain or protocolVersion",
-        ));
-    }
     let customer_key = str_field(terms, "customerKey")?;
     let seller_key = str_field(terms, "sellerKey")?;
     let evaluator_key = str_field(terms, "evaluatorKey")?;
     let customer_sig = str_field(&body, "customerSignature")?;
     let seller_sig = str_field(&body, "sellerSignature")?;
     let evaluator_sig = str_field(&body, "evaluatorSignature")?;
-    let engagement_hash = canonical_hash_hex(terms);
-    verify_payload(terms, customer_sig, customer_key, ENGAGEMENT_DOMAIN)?;
-    verify_payload(terms, seller_sig, seller_key, ENGAGEMENT_DOMAIN)?;
-    verify_payload(terms, evaluator_sig, evaluator_key, ENGAGEMENT_DOMAIN)?;
+    let action = ActionRule::Exact("accept_engagement");
+    let (engagement_hash, nonce) =
+        verify_payload(terms, customer_sig, customer_key, ENGAGEMENT_DOMAIN, action)?;
+    verify_payload(terms, seller_sig, seller_key, ENGAGEMENT_DOMAIN, action)?;
+    verify_payload(terms, evaluator_sig, evaluator_key, ENGAGEMENT_DOMAIN, action)?;
     let engagement_id = str_field(terms, "engagementId")?;
+    let engagement_version = i64_field(terms, "engagementVersion")?;
+    if engagement_version < 1 {
+        return Err(AppError::unprocessable("engagementVersion must be >= 1"));
+    }
     let invoice_id = str_field(terms, "invoiceId")?;
+    let order_id = terms.get("orderId").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let case_id = str_field(terms, "caseId")?;
+    if case_id.len() > MAX_CASE_ID_LEN {
+        return Err(AppError::unprocessable(format!(
+            "caseId may not exceed {MAX_CASE_ID_LEN} characters"
+        )));
+    }
     let quote_id = str_field(terms, "quoteId")?;
     let profile_id = str_field(terms, "profileId")?;
-    let expires_at = str_field(terms, "expiresAt")?;
-    if validate_time(expires_at, "expiresAt")? <= Utc::now() {
-        return Err(AppError::unprocessable("engagement is already expired"));
-    }
+    let expires_at = iso_field(terms, "expiresAt")?;
     let messaging_keys = terms
         .get("messagingKeys")
         .ok_or_else(|| AppError::unprocessable("messagingKeys is required"))?;
@@ -472,12 +665,25 @@ pub async fn engagement_store(
             &format!("messagingKeys.{role}"),
         )?;
     }
+    let (fee_sompi, fee_bps, fee_cap) = fee_fields(terms)?;
     let mut tx = state.db.pool.begin().await?;
     let expected_seller = invoice_seller_key(&mut tx, invoice_id).await?;
     if !expected_seller.eq_ignore_ascii_case(seller_key) {
         return Err(AppError::unprocessable(
             "sellerKey does not match invoice merchant signing address",
         ));
+    }
+    if let Some(order_id) = order_id {
+        let external_id: Option<String> =
+            sqlx::query_scalar("SELECT external_id FROM invoices WHERE public_id=$1")
+                .bind(invoice_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if external_id.is_some_and(|ext| ext != order_id) {
+            return Err(AppError::unprocessable(
+                "orderId does not match the invoice external id",
+            ));
+        }
     }
     let quote = sqlx::query("SELECT * FROM evaluator_quotes WHERE quote_id=$1 FOR UPDATE")
         .bind(quote_id)
@@ -494,6 +700,9 @@ pub async fn engagement_store(
             "engagement does not match the open evaluator quote",
         ));
     }
+    if validate_time(quote.get::<&str, _>("expires_at"), "quote.expiresAt")? <= Utc::now() {
+        return Err(AppError::unprocessable("evaluator quote has expired"));
+    }
     let equality = [
         ("caseKeyCommitment", "case_key_commitment"),
         ("rewardAddress", "reward_address"),
@@ -508,8 +717,9 @@ pub async fn engagement_store(
             )));
         }
     }
-    let fee_sompi = i64_field(terms, "feeSompi")?;
-    if fee_sompi != quote.get::<i64, _>("fee_sompi") || str_field(terms, "feePayer")? != "customer"
+    if fee_sompi != quote.get::<i64, _>("fee_sompi")
+        || fee_bps != quote.get::<Option<i64>, _>("fee_bps")
+        || fee_cap != quote.get::<Option<i64>, _>("fee_cap_sompi")
     {
         return Err(AppError::unprocessable(
             "engagement fee differs from evaluator quote",
@@ -529,10 +739,21 @@ pub async fn engagement_store(
             "engagement allowedOutcomes differs from evaluator quote",
         ));
     }
+    let case_taken: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM evaluator_engagements WHERE case_id=$1)")
+            .bind(case_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if case_taken {
+        return Err(AppError::commerce(409, "caseId is already bound to another engagement"));
+    }
+    for signer in [customer_key, seller_key, evaluator_key] {
+        consume_nonce(&mut *tx, signer, &nonce).await?;
+    }
     let now = now_iso();
     sqlx::query(
-        "INSERT INTO evaluator_engagements (engagement_id,invoice_public_id,quote_id,profile_id,customer_key,seller_key,evaluator_key,messaging_keys,case_key_commitment,fee_sompi,fee_payer,reward_address,policy_hash,evidence_format_hash,allowed_outcomes,dispute_deadline,decision_sla_seconds,backup_evaluator_key,terms_json,engagement_hash,customer_signature,seller_signature,evaluator_signature,status,expires_at,created_at,updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'customer',$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,'accepted',$23,$24,$25)",
+        "INSERT INTO evaluator_engagements (engagement_id,invoice_public_id,quote_id,profile_id,customer_key,seller_key,evaluator_key,messaging_keys,case_key_commitment,fee_sompi,fee_payer,reward_address,policy_hash,evidence_format_hash,allowed_outcomes,dispute_deadline,decision_sla_seconds,backup_evaluator_key,terms_json,engagement_hash,customer_signature,seller_signature,evaluator_signature,status,expires_at,created_at,updated_at,engagement_version,order_id,case_id,fee_bps,fee_cap_sompi) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'customer',$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,'accepted',$23,$24,$25,$26,$27,$28,$29,$30)",
     )
     .bind(engagement_id).bind(invoice_id).bind(quote_id).bind(profile_id).bind(customer_key).bind(seller_key).bind(evaluator_key)
     .bind(canonicalize(messaging_keys)).bind(str_field(terms, "caseKeyCommitment")?).bind(fee_sompi)
@@ -540,6 +761,7 @@ pub async fn engagement_store(
     .bind(canonicalize(&allowed_outcomes)).bind(str_field(terms, "disputeDeadline")?).bind(i64_field(terms, "decisionSlaSeconds")?)
     .bind(terms.get("backupEvaluatorKey").and_then(Value::as_str)).bind(canonicalize(terms)).bind(&engagement_hash)
     .bind(customer_sig).bind(seller_sig).bind(evaluator_sig).bind(expires_at).bind(&now).bind(&now)
+    .bind(engagement_version).bind(order_id).bind(case_id).bind(fee_bps).bind(fee_cap)
     .execute(&mut *tx).await?;
     sqlx::query("UPDATE evaluator_quotes SET status='accepted', updated_at=$1 WHERE quote_id=$2")
         .bind(&now)
@@ -552,6 +774,31 @@ pub async fn engagement_store(
     Ok(Json(
         json!({ "engagementId": engagement_id, "engagementHash": engagement_hash, "status": "accepted" }),
     ))
+}
+
+/// Public engagement record: the exact signed terms plus all three
+/// signatures, so a wallet can re-verify before funding.
+pub async fn engagement_show(
+    State(state): State<AppState>,
+    Path(engagement_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let row = sqlx::query(
+        "SELECT engagement_id,engagement_hash,status,terms_json,customer_signature,seller_signature,evaluator_signature FROM evaluator_engagements WHERE engagement_id=$1",
+    )
+    .bind(&engagement_id)
+    .fetch_optional(&state.db.pool)
+    .await?
+    .ok_or_else(AppError::row_not_found)?;
+    let terms: Value = serde_json::from_str(row.get::<&str, _>("terms_json")).unwrap_or(Value::Null);
+    Ok(Json(json!({
+        "engagementId": row.get::<String, _>("engagement_id"),
+        "engagementHash": row.get::<String, _>("engagement_hash"),
+        "status": row.get::<String, _>("status"),
+        "terms": terms,
+        "customerSignature": row.get::<String, _>("customer_signature"),
+        "sellerSignature": row.get::<String, _>("seller_signature"),
+        "evaluatorSignature": row.get::<String, _>("evaluator_signature"),
+    })))
 }
 
 async fn engagement_keys(
@@ -570,7 +817,9 @@ pub async fn case_open(
 ) -> AppResult<Json<Value>> {
     let (payload, signature) = signed_parts(&body)?;
     let opener_key = str_field(payload, "openerKey")?;
-    let payload_hash = verify_payload(payload, signature, opener_key, CASE_OPEN_DOMAIN)?;
+    let (payload_hash, nonce) = verify_payload(
+        payload, signature, opener_key, CASE_OPEN_DOMAIN, ActionRule::Exact("open_case"),
+    )?;
     let engagement_id = str_field(payload, "engagementId")?;
     let (customer_key, seller_key, _, _, decision_sla) =
         engagement_keys(&state, engagement_id).await?;
@@ -604,12 +853,17 @@ pub async fn case_open(
     let now = now_iso();
     let due = (now_dt + Duration::seconds(decision_sla)).to_rfc3339();
     let mut tx = state.db.pool.begin().await?;
-    let state_row: Option<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT e.status,k.covenant_state,k.dispute_covenant_address FROM evaluator_engagements e JOIN kpr1_payment_intents k ON k.engagement_id=e.engagement_id WHERE e.engagement_id=$1 AND e.invoice_public_id=$2 FOR UPDATE",
+    let state_row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT e.status,k.covenant_state,k.dispute_covenant_address,e.case_id FROM evaluator_engagements e JOIN kpr1_payment_intents k ON k.engagement_id=e.engagement_id WHERE e.engagement_id=$1 AND e.invoice_public_id=$2 FOR UPDATE",
     ).bind(engagement_id).bind(invoice_id).fetch_optional(&mut *tx).await?;
-    let Some((engagement_status, covenant_state, expected_dispute_address)) = state_row else {
+    let Some((engagement_status, covenant_state, expected_dispute_address, expected_case_id)) = state_row else {
         return Err(AppError::row_not_found());
     };
+    if expected_case_id.as_deref() != Some(case_id) {
+        return Err(AppError::unprocessable(
+            "caseId does not match the signed engagement",
+        ));
+    }
     if engagement_status != "funded" || covenant_state != "dispute_submitted" {
         return Err(AppError::unprocessable(
             "case can open only after the signed dispute covenant transition was submitted",
@@ -620,6 +874,7 @@ pub async fn case_open(
             "disputeCovenantAddress does not match the covenant committed before funding",
         ));
     }
+    consume_nonce(&mut *tx, opener_key, &nonce).await?;
     sqlx::query(
         "INSERT INTO dispute_cases (case_id,engagement_id,invoice_public_id,opener_role,opener_key,opening_reason_hash,opening_payload_hash,opening_signature,dispute_tx_id,dispute_covenant_address,state,opened_at,decision_due_at,updated_at) \
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'open',$11,$12,$13)",
@@ -712,7 +967,9 @@ pub async fn message_store(
             "message sender key does not match engagement role",
         ));
     }
-    let envelope_hash = verify_payload(payload, signature, sender_key, MESSAGE_DOMAIN)?;
+    let (envelope_hash, nonce) = verify_payload(
+        payload, signature, sender_key, MESSAGE_DOMAIN, ActionRule::OneOf(MESSAGE_ACTIONS),
+    )?;
     validate_hex(str_field(payload, "payloadHash")?, 32, "payloadHash")?;
     let ciphertext = str_field(payload, "ciphertext")?;
     if ciphertext.len() > MAX_CIPHERTEXT_BYTES {
@@ -768,18 +1025,18 @@ pub async fn message_store(
         ));
     }
     let message_id = str_field(payload, "messageId")?;
-    let created_at = str_field(payload, "createdAt")?;
-    validate_time(created_at, "createdAt")?;
-    if let Some(expires) = payload.get("expiresAt").and_then(Value::as_str) {
-        validate_time(expires, "expiresAt")?;
-    }
+    let created_at = iso_field(payload, "createdAt")?;
+    let expires_at = iso_field(payload, "expiresAt")?;
+    let mut tx = state.db.pool.begin().await?;
+    consume_nonce(&mut *tx, sender_key, &nonce).await?;
     sqlx::query(
-        "INSERT INTO dispute_messages (message_id,case_id,sequence,previous_message_hash,participant_role,sender_key,payload_hash,ciphertext,envelope_hash,signature,chain_tx_id,chain_commitment,anchor_status,created_at,expires_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'submitted',$13,$14)",
+        "INSERT INTO dispute_messages (message_id,case_id,sequence,previous_message_hash,participant_role,sender_key,payload_hash,ciphertext,envelope_hash,signature,chain_tx_id,chain_commitment,anchor_status,created_at,expires_at,received_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'submitted',$13,$14,$15)",
     ).bind(message_id).bind(&case_id).bind(sequence).bind(supplied_previous).bind(role).bind(sender_key)
     .bind(str_field(payload, "payloadHash")?).bind(ciphertext).bind(&envelope_hash).bind(signature).bind(chain_tx)
-    .bind(chain_commitment).bind(created_at).bind(payload.get("expiresAt").and_then(Value::as_str))
-    .execute(&state.db.pool).await?;
+    .bind(chain_commitment).bind(created_at).bind(expires_at).bind(now_iso())
+    .execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(Json(
         json!({ "messageId": message_id, "sequence": sequence, "envelopeHash": envelope_hash, "anchorStatus": "submitted" }),
     ))
@@ -823,20 +1080,25 @@ pub async fn decision_commit(
             "decision signer is not case evaluator",
         ));
     }
-    let payload_hash = verify_payload(payload, signature, &evaluator, DECISION_COMMIT_DOMAIN)?;
+    let (payload_hash, nonce) = verify_payload(
+        payload, signature, &evaluator, DECISION_COMMIT_DOMAIN, ActionRule::Exact("commit_decision"),
+    )?;
     let commitment = str_field(payload, "decisionCommitment")?;
     validate_hex(commitment, 32, "decisionCommitment")?;
     let chain_tx = str_field(payload, "chainTxId")?;
     validate_hex(chain_tx, 32, "chainTxId")?;
     let now = now_iso();
+    let mut tx = state.db.pool.begin().await?;
+    consume_nonce(&mut *tx, &evaluator, &nonce).await?;
     let result = sqlx::query("UPDATE dispute_cases SET state='committed',decision_commitment=$1,decision_commit_tx_id=$2,decision_signature=$3,updated_at=$4 WHERE case_id=$5 AND state='open'")
-        .bind(commitment).bind(chain_tx).bind(signature).bind(&now).bind(&case_id).execute(&state.db.pool).await?;
+        .bind(commitment).bind(chain_tx).bind(signature).bind(&now).bind(&case_id).execute(&mut *tx).await?;
     if result.rows_affected() != 1 {
         return Err(AppError::commerce(
             409,
             "case is not open for a decision commitment",
         ));
     }
+    tx.commit().await?;
     Ok(Json(
         json!({ "caseId": case_id, "state": "committed", "decisionCommitment": commitment, "payloadHash": payload_hash }),
     ))
@@ -858,7 +1120,9 @@ pub async fn decision_reveal(
             "decision signer is not case evaluator",
         ));
     }
-    verify_payload(payload, signature, &evaluator, DECISION_REVEAL_DOMAIN)?;
+    let (_, nonce) = verify_payload(
+        payload, signature, &evaluator, DECISION_REVEAL_DOMAIN, ActionRule::Exact("reveal_decision"),
+    )?;
     let outcome = str_field(payload, "outcome")?;
     if !matches!(outcome, "release" | "refund") {
         return Err(AppError::unprocessable("outcome must be release or refund"));
@@ -894,8 +1158,17 @@ pub async fn decision_reveal(
         ));
     }
     let now = now_iso();
-    sqlx::query("UPDATE dispute_cases SET state='revealed',decision_outcome=$1,decision_reason_hash=$2,decision_salt=$3,decision_signature=$4,decision_reveal_tx_id=$5,updated_at=$6 WHERE case_id=$7 AND state='committed'")
-        .bind(outcome).bind(reason_hash).bind(salt).bind(signature).bind(reveal_tx).bind(&now).bind(&case_id).execute(&state.db.pool).await?;
+    let mut tx = state.db.pool.begin().await?;
+    consume_nonce(&mut *tx, &evaluator, &nonce).await?;
+    let result = sqlx::query("UPDATE dispute_cases SET state='revealed',decision_outcome=$1,decision_reason_hash=$2,decision_salt=$3,decision_signature=$4,decision_reveal_tx_id=$5,updated_at=$6 WHERE case_id=$7 AND state='committed'")
+        .bind(outcome).bind(reason_hash).bind(salt).bind(signature).bind(reveal_tx).bind(&now).bind(&case_id).execute(&mut *tx).await?;
+    if result.rows_affected() != 1 {
+        return Err(AppError::commerce(
+            409,
+            "case is no longer awaiting a decision reveal",
+        ));
+    }
+    tx.commit().await?;
     Ok(Json(
         json!({ "caseId": case_id, "state": "revealed", "outcome": outcome, "decisionCommitment": committed }),
     ))
@@ -932,6 +1205,61 @@ pub async fn settlement_submit(
     ))
 }
 
+/// `{ split: [{ address, amountSompi }], feePayerAddress }` for the mutual
+/// settlement escape hatch.
+fn mutual_settlement_body(body: &Value) -> AppResult<(Vec<(String, u64)>, &str)> {
+    let split = body
+        .get("split")
+        .and_then(Value::as_array)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::unprocessable("split must be a non-empty array of { address, amountSompi }"))?;
+    let split = split
+        .iter()
+        .map(|item| {
+            let amount = i64_field(item, "amountSompi")?;
+            if amount <= 0 {
+                return Err(AppError::unprocessable("split amountSompi must be positive"));
+            }
+            Ok((str_field(item, "address")?.to_string(), amount as u64))
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok((split, str_field(body, "feePayerAddress")?))
+}
+
+pub async fn mutual_settlement_prepare(
+    State(state): State<AppState>,
+    Path(case_id): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult<Json<Value>> {
+    let (split, fee_payer) = mutual_settlement_body(&body)?;
+    Ok(Json(
+        crate::covenant_keeper::dispute_mutual_settle_prepare(&state, &case_id, fee_payer, &split).await?,
+    ))
+}
+
+pub async fn mutual_settlement_submit(
+    State(state): State<AppState>,
+    Path(case_id): Path<String>,
+    Json(body): Json<Value>,
+) -> AppResult<Json<Value>> {
+    let (split, fee_payer) = mutual_settlement_body(&body)?;
+    let customer_signature = str_field(&body, "customerSignature")?;
+    let seller_signature = str_field(&body, "sellerSignature")?;
+    let fee_signature = str_field(&body, "feeSignature")?;
+    Ok(Json(
+        crate::covenant_keeper::dispute_mutual_settle_submit(
+            &state,
+            &case_id,
+            fee_payer,
+            &split,
+            customer_signature,
+            seller_signature,
+            fee_signature,
+        )
+        .await?,
+    ))
+}
+
 pub async fn feedback_store(
     State(state): State<AppState>,
     Path(case_id): Path<String>,
@@ -959,7 +1287,9 @@ pub async fn feedback_store(
             "feedback author key does not match case role",
         ));
     }
-    verify_payload(payload, signature, author_key, FEEDBACK_DOMAIN)?;
+    let (_, nonce) = verify_payload(
+        payload, signature, author_key, FEEDBACK_DOMAIN, ActionRule::Exact("submit_feedback"),
+    )?;
     let score = i64_field(payload, "score")?;
     if !(1..=5).contains(&score) {
         return Err(AppError::unprocessable("score must be between 1 and 5"));
@@ -975,29 +1305,19 @@ pub async fn feedback_store(
     }
     let commitment = canonical_hash_hex(payload);
     let feedback_id = str_field(payload, "feedbackId")?;
-    sqlx::query("INSERT INTO evaluator_feedback (feedback_id,case_id,profile_id,author_role,author_key,score,tags,feedback_commitment,signature,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+    let mut tx = state.db.pool.begin().await?;
+    consume_nonce(&mut *tx, author_key, &nonce).await?;
+    let inserted = sqlx::query("INSERT INTO evaluator_feedback (feedback_id,case_id,profile_id,author_role,author_key,score,tags,feedback_commitment,signature,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (case_id, author_role) DO NOTHING")
         .bind(feedback_id).bind(&case_id).bind(&profile_id).bind(role).bind(author_key).bind(score)
         .bind(serde_json::to_string(&tags).unwrap()).bind(&commitment).bind(signature).bind(now_iso())
-        .execute(&state.db.pool).await?;
+        .execute(&mut *tx).await?;
+    if inserted.rows_affected() == 0 {
+        return Err(AppError::commerce(409, "feedback already submitted for this case role"));
+    }
+    tx.commit().await?;
     Ok(Json(
         json!({ "feedbackId": feedback_id, "caseId": case_id, "commitment": commitment }),
     ))
-}
-
-async fn reputation_value(state: &AppState, profile_id: &str) -> AppResult<Value> {
-    let row = sqlx::query(
-        "SELECT COUNT(DISTINCT d.case_id) AS cases, COUNT(f.feedback_id) AS ratings, AVG(f.score)::FLOAT8 AS average, \
-         AVG(f.score) FILTER (WHERE f.author_role='customer')::FLOAT8 AS customer_average, \
-         AVG(f.score) FILTER (WHERE f.author_role='seller')::FLOAT8 AS seller_average \
-         FROM dispute_cases d JOIN evaluator_engagements e ON e.engagement_id=d.engagement_id \
-         LEFT JOIN evaluator_feedback f ON f.case_id=d.case_id WHERE e.profile_id=$1 AND d.state='settled'",
-    ).bind(profile_id).fetch_one(&state.db.pool).await?;
-    Ok(json!({
-        "verifiedCases": row.get::<i64,_>("cases"), "ratings": row.get::<i64,_>("ratings"),
-        "average": row.try_get::<f64,_>("average").ok(),
-        "customerAverage": row.try_get::<f64,_>("customer_average").ok(),
-        "sellerAverage": row.try_get::<f64,_>("seller_average").ok(),
-    }))
 }
 
 pub async fn reputation_show(
@@ -1030,6 +1350,7 @@ pub async fn case_show(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kasway_covenant::KeeperKey;
 
     #[test]
     fn evaluator_profile_id_is_key_bound() {
@@ -1048,5 +1369,38 @@ mod tests {
         let a = json!({"domain":"kasway/evaluator-decision/v1","protocolVersion":"1","network":"tn10","engagementHash":"aa","caseId":"case_1","outcome":"release","reasonHash":"bb","salt":"cc"});
         let b = json!({"salt":"cc","reasonHash":"bb","outcome":"release","caseId":"case_1","engagementHash":"aa","network":"tn10","protocolVersion":"1","domain":"kasway/evaluator-decision/v1"});
         assert_eq!(canonical_hash_hex(&a), canonical_hash_hex(&b));
+    }
+
+    fn signed(key: &KeeperKey, payload: &Value) -> String {
+        encode_hex(&key.sign_datasig(&canonical_hash(payload)).unwrap())
+    }
+
+    fn verify(key: &KeeperKey, payload: &Value) -> AppResult<(String, String)> {
+        let sig = signed(key, payload);
+        verify_payload(payload, &sig, &encode_hex(&key.x_only_pubkey()), PROFILE_DOMAIN, ActionRule::Exact("publish_profile"))
+    }
+
+    #[test]
+    fn envelope_requires_action_nonce_and_future_expiry() {
+        let key = KeeperKey::from_secret_bytes(&[7u8; 32]).unwrap();
+        let future = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        let ok = json!({
+            "domain": PROFILE_DOMAIN, "protocolVersion": "1", "network": "tn10",
+            "action": "publish_profile", "nonce": "ab".repeat(32), "expiresAt": future,
+        });
+        let (_, nonce) = verify(&key, &ok).expect("valid envelope");
+        assert_eq!(nonce, "ab".repeat(32));
+
+        let mut missing_nonce = ok.clone();
+        missing_nonce.as_object_mut().unwrap().remove("nonce");
+        assert!(verify(&key, &missing_nonce).is_err());
+
+        let mut wrong_action = ok.clone();
+        wrong_action["action"] = json!("issue_quote");
+        assert!(verify(&key, &wrong_action).is_err());
+
+        let mut expired = ok.clone();
+        expired["expiresAt"] = json!((Utc::now() - Duration::seconds(1)).to_rfc3339());
+        assert!(verify(&key, &expired).is_err());
     }
 }

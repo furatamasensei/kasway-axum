@@ -400,6 +400,14 @@ async fn load_subscription(state: &AppState, user_id: i64, public_id: &str) -> A
         .ok_or_else(|| AppError::commerce(404, "Subscription not found"))
 }
 
+/// The plan's effective payment window: `invoiceExpiresAfterSeconds` when it is
+/// shorter than the 15-minute cap (`60 <= s < 900`), else the cap.
+fn plan_payment_window(plan: &PlanRow) -> i64 {
+    plan.invoice_expires_after_seconds
+        .filter(|s| (invoices::MIN_EXPIRES_IN_SECONDS..crate::kpr1::PAYMENT_WINDOW_SECONDS).contains(s))
+        .unwrap_or(crate::kpr1::PAYMENT_WINDOW_SECONDS)
+}
+
 fn add_interval(start: chrono::DateTime<chrono::Utc>, unit: &str, count: i64) -> chrono::DateTime<chrono::Utc> {
     match unit {
         "day" => start + chrono::Duration::days(count),
@@ -435,7 +443,7 @@ pub(crate) async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, 
     let previous_amount = snap.get("amount").and_then(Value::as_str).unwrap_or("0");
     let current_amount = plan.amount.to_string();
     let price_changed = previous_amount != current_amount;
-    let body = json!({
+    let mut body = json!({
         "externalId": format!("{}:{}:{}", sub.public_id, cycle.public_id, attempt),
         "paymentNetwork": plan.payment_network,
         "paymentAsset": plan.payment_asset,
@@ -457,6 +465,12 @@ pub(crate) async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, 
             },
         },
     });
+    // A plan may ask for a shorter payment window than the cap (never longer):
+    // pass it as the invoice's `expiresAt`; otherwise the minter's default applies.
+    let window = plan_payment_window(&plan);
+    if window < crate::kpr1::PAYMENT_WINDOW_SECONDS {
+        body["expiresAt"] = json!(to_iso(chrono::Utc::now() + chrono::Duration::seconds(window)));
+    }
     let (invoice_id, store_id) = invoices::create_for_merchant(state, sub.user_id, &body, None, Some(sub.id), Some(cycle.id)).await?;
 
     let now = now_iso();
@@ -467,7 +481,7 @@ pub(crate) async fn generate_invoice_for_cycle(state: &AppState, cycle_id: i64, 
         "planId": plan.id, "planPublicId": plan.public_id, "name": plan.name, "description": plan.description,
         "amount": plan.amount.to_string(), "currency": plan.currency, "paymentNetwork": plan.payment_network,
         "paymentAsset": plan.payment_asset, "intervalUnit": plan.interval_unit, "intervalCount": plan.interval_count,
-        "invoiceExpiresAfterSeconds": crate::kpr1::PAYMENT_WINDOW_SECONDS,
+        "invoiceExpiresAfterSeconds": plan_payment_window(&plan),
         "metadata": json_or_null(&plan.metadata),
     });
     sqlx::query("UPDATE subscriptions SET plan_snapshot = $1, updated_at = $2 WHERE id = $3")
@@ -621,7 +635,7 @@ pub async fn subs_store(auth: AuthMerchant, State(state): State<AppState>, Json(
         "planId": plan.id, "planPublicId": plan.public_id, "name": plan.name, "description": plan.description,
         "amount": plan.amount.to_string(), "currency": plan.currency, "paymentNetwork": plan.payment_network,
         "paymentAsset": plan.payment_asset, "intervalUnit": plan.interval_unit, "intervalCount": plan.interval_count,
-        "invoiceExpiresAfterSeconds": crate::kpr1::PAYMENT_WINDOW_SECONDS,
+        "invoiceExpiresAfterSeconds": plan_payment_window(&plan),
         "metadata": json_or_null(&plan.metadata),
     });
     let now_s = now_iso();

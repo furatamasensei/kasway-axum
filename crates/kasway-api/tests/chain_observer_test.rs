@@ -3,11 +3,13 @@
 //! `covenant_state = 'awaiting_funding'`, invoice open, wallet `tx_id` recorded),
 //! asks the [`ChainSource`] for that tx's outputs to the covenant address, and:
 //!  - funded `== gross` + enough confirmations -> `covenant_state = 'funded'`
-//!    (the invoice stays OPEN; the keeper releases/settles later),
+//!    + one `payment.confirmed` webhook event (the invoice stays OPEN; the
+//!    keeper auto-captures / the parties settle later),
 //!  - funded `== gross` but too few confirmations -> observed + verified, keeps
 //!    waiting (still `awaiting_funding`),
-//!  - funded `!= gross` (under/overfund) -> FAIL CLOSED: intent `failed` with a
-//!    stable reason + a critical anomaly signal; the invoice is never funded.
+//!  - funded `!= gross` (under/overfund) or more than ONE covenant output ->
+//!    FAIL CLOSED: intent `failed` with a stable reason + a critical anomaly
+//!    signal; the invoice is never funded.
 //! Ticks are driven directly with an in-memory `ChainSource`; no polling loop,
 //! no real node.
 
@@ -207,9 +209,10 @@ async fn count(app: &common::TestApp, sql: &str, id: i64) -> i64 {
 // ---------- tests ----------
 
 // Covenant funded with EXACTLY gross + enough confirmations: the observer marks
-// it `funded` and records a settled observation, but the invoice stays OPEN and
-// NO payment/`invoice.paid` is produced — that is the keeper's job on release.
-// A second tick is a no-op (funded is terminal for the observer).
+// it `funded`, records a settled observation and emits `payment.confirmed`, but
+// the invoice stays OPEN and NO payment/`invoice.paid` is produced — that is the
+// keeper's job on release. A second tick is a no-op (funded is terminal for the
+// observer), so no duplicate event.
 #[tokio::test]
 async fn covenant_funded_and_confirmed_marks_funded() {
     let app = spawn_covenant_app().await;
@@ -254,9 +257,25 @@ async fn covenant_funded_and_confirmed_marks_funded() {
     assert_eq!(meta_outputs[0]["role"], "covenant");
     assert_eq!(meta_outputs[0]["address"], cov_addr);
 
-    // No payment row, no invoice.paid event yet (keeper produces those on release).
+    // No payment row, no invoice.paid event yet (keeper produces those on release);
+    // exactly one payment.confirmed carrying the invoice + funding tx + confirmations.
     assert_eq!(count(&app, "SELECT COUNT(*) FROM payments WHERE invoice_id = $1", invoice_id).await, 0);
-    assert_eq!(count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1", user_id).await, 0);
+    let events: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT event_type, resource_type, resource_id, payload FROM webhook_events WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_all(&app.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "payment.confirmed");
+    assert_eq!(events[0].1, "invoice");
+    assert_eq!(events[0].2, public_id);
+    let payload: Value = serde_json::from_str(&events[0].3).unwrap();
+    assert_eq!(payload["publicId"], public_id);
+    assert_eq!(payload["status"], "open");
+    assert_eq!(payload["txId"], tx_id);
+    assert_eq!(payload["confirmations"], 15);
 
     // Checkpoint tracks the virtual DAA score.
     let checkpoint: Option<String> = sqlx::query_scalar(
@@ -268,9 +287,11 @@ async fn covenant_funded_and_confirmed_marks_funded() {
     .unwrap();
     assert_eq!(checkpoint.as_deref(), Some("1015"));
 
-    // Funded intent is terminal for the observer: next tick does nothing.
+    // Funded intent is terminal for the observer: next tick does nothing — and
+    // emits nothing again.
     let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
     assert_eq!(progressed, 0);
+    assert_eq!(count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1", user_id).await, 1);
 }
 
 // Funded == gross but too few confirmations: observed + verified, still
@@ -318,10 +339,17 @@ async fn insufficient_confirmations_stay_awaiting_until_policy_met() {
     assert_eq!(observations.len(), 1, "observation row is updated, not duplicated");
     assert_eq!(observations[0].0, "settled");
     assert_eq!(observations[0].2, 12);
-    // Still the keeper's job to pay: no invoice.paid from the observer.
+    // Still the keeper's job to pay: payment.confirmed now, no invoice.paid.
     let (status, _) = invoice_row(&app, invoice_id).await;
     assert_eq!(status, "open");
-    assert_eq!(count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1", user_id).await, 0);
+    assert_eq!(
+        count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1 AND event_type = 'payment.confirmed'", user_id).await,
+        1
+    );
+    assert_eq!(
+        count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1 AND event_type = 'invoice.paid'", user_id).await,
+        0
+    );
 }
 
 // Underfunded covenant (gross - 1): fail closed — intent failed with
@@ -412,6 +440,52 @@ async fn overfunded_covenant_fails_closed() {
     assert_eq!(verification_status.as_deref(), Some("failed"));
     assert_eq!(failure_reason.as_deref(), Some("covenant_overfunded"));
     assert_eq!(covenant_state, "failed");
+}
+
+// Two outputs to the covenant address that SUM to gross: fail closed with
+// `covenant_output_count`. The covenant is ONE UTXO worth exactly gross; two
+// half-value UTXOs are unspendable and must never count as funding.
+#[tokio::test]
+async fn split_covenant_funding_fails_closed() {
+    let app = spawn_covenant_app().await;
+    let (_token, user_id, invoice, cov_addr, gross) =
+        setup_finalized_intent(&app, "chain6@example.com").await;
+    let invoice_id = invoice["id"].as_i64().unwrap();
+    let public_id = invoice["publicId"].as_str().unwrap();
+
+    let tx_id = "ff12dd34ff12dd34ff12dd34ff12dd34ff12dd34ff12dd34ff12dd34ff12dd34";
+    submit_tx(&app, public_id, tx_id).await;
+
+    let chain = MockChain::default();
+    let half = gross as u64 / 2;
+    chain.set_tx(tx_id, vec![(cov_addr.clone(), half), (cov_addr.clone(), gross as u64 - half)], Some(6_000));
+    chain.set_virtual_daa(6_050); // plenty of confirmations — must still fail
+
+    let progressed = chain_observer::run_tick(&app.state, &chain).await.unwrap();
+    assert_eq!(progressed, 1);
+
+    let (status, paid_at) = invoice_row(&app, invoice_id).await;
+    assert_eq!(status, "open");
+    assert!(paid_at.is_none());
+    let (intent_status, verification_status, failure_reason, covenant_state) =
+        intent_row(&app, invoice_id).await;
+    assert_eq!(intent_status, "failed");
+    assert_eq!(verification_status.as_deref(), Some("failed"));
+    assert_eq!(failure_reason.as_deref(), Some("covenant_output_count"));
+    assert_eq!(covenant_state, "failed");
+    let observations = observation_rows(&app, invoice_id).await;
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].0, "mismatched");
+
+    let anomalies: Vec<(String, String)> =
+        sqlx::query_as("SELECT signal_type, severity FROM payment_anomaly_signals WHERE user_id = $1")
+            .bind(user_id)
+            .fetch_all(&app.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(anomalies, vec![("kpr1_output_mismatch".to_string(), "critical".to_string())]);
+    // Never funded: no payment.confirmed either.
+    assert_eq!(count(&app, "SELECT COUNT(*) FROM webhook_events WHERE user_id = $1", user_id).await, 0);
 }
 
 // Unobserved tx: nothing on chain yet -> no progress, intent keeps waiting.

@@ -92,6 +92,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/media/:id", delete(handlers::medias::destroy))
         // --- Public misc (price) ---
         .route("/api/price", get(handlers::public_misc::price))
+        // --- Public KPR-1 signing keys (verify intents offline) ---
+        .route("/api/kpr1/signing-keys", get(handlers::kpr1_keys::index))
         // --- Public KPR-1 explorer ---
         .route("/api/explorer/kpr1/intents/:intentId", get(handlers::explorer_kpr1::show_intent))
         .route("/api/explorer/kpr1/intents/:intentId/wallet-verification", get(handlers::explorer_kpr1::wallet_verification))
@@ -108,6 +110,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/arbitration/evaluators/:profileId/reputation", get(arbitration::reputation_show))
         .route("/api/arbitration/quotes", post(arbitration::quote_store))
         .route("/api/arbitration/engagements", post(arbitration::engagement_store))
+        .route("/api/arbitration/engagements/:engagementId", get(arbitration::engagement_show))
         .route("/api/arbitration/engagements/:engagementId/dispute/prepare", post(arbitration::dispute_prepare))
         .route("/api/arbitration/engagements/:engagementId/dispute/submit", post(arbitration::dispute_submit))
         .route("/api/arbitration/cases", post(arbitration::case_open))
@@ -117,6 +120,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/arbitration/cases/:caseId/decision/reveal", post(arbitration::decision_reveal))
         .route("/api/arbitration/cases/:caseId/settlement/prepare", post(arbitration::settlement_prepare))
         .route("/api/arbitration/cases/:caseId/settlement/submit", post(arbitration::settlement_submit))
+        .route("/api/arbitration/cases/:caseId/mutual-settlement/prepare", post(arbitration::mutual_settlement_prepare))
+        .route("/api/arbitration/cases/:caseId/mutual-settlement/submit", post(arbitration::mutual_settlement_submit))
         .route("/api/arbitration/cases/:caseId/feedback", post(arbitration::feedback_store))
         // --- Public auth (/api/auth) ---
         .route("/api/auth/login", post(handlers::auth::login))

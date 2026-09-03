@@ -9,6 +9,7 @@ pub mod health;
 pub mod internal_kpr1_ops;
 pub mod internal_payment_indexer;
 pub mod invoices;
+pub mod kpr1_keys;
 pub mod medias;
 pub mod payment_ops_settings;
 pub mod payments_networks;

@@ -91,8 +91,9 @@ Five workers start in-process at boot; no external queue or broker is required:
 - **Webhook delivery** (`webhook_worker.rs`) — delivers queued webhook events.
   `WEBHOOK_WORKER_ENABLED` (default on; `0`/`false`/`off` disables).
 - **Chain observer** (`chain_observer.rs`) — observes/confirms on-chain KPR-1
-  payments. `CHAIN_OBSERVER_ENABLED` (default on only when `KASPA_NODE_URL` is
-  set). See below.
+  payments and emits `payment.confirmed` once a covenant is funded.
+  `CHAIN_OBSERVER_ENABLED` (default on only when `KASPA_NODE_URL` is set). See
+  below.
 - **Covenant keeper** (`covenant_keeper.rs`) — settles funded one-time invoice
   covenants after their capture window. The keeper only signs its own fee input.
   `COVENANT_KEEPER_ENABLED` (default on when a keeper fee key and
@@ -101,9 +102,10 @@ Five workers start in-process at boot; no external queue or broker is required:
   KPR-1 invoice for each due subscription cycle.
   `SUBSCRIPTION_BILLER_ENABLED` defaults to on.
 - **Invoice expirer** (`invoice_expirer.rs`) — expires an invoice and retires its
-  unfunded covenant when no wallet submission arrives within 15 minutes. A
-  transaction submitted before the deadline remains valid while confirmations
-  finish after the deadline.
+  unfunded covenant when no wallet submission arrives within its payment window
+  (at most 15 minutes). A transaction submitted before the deadline remains
+  valid while confirmations finish after the deadline.
+  `INVOICE_EXPIRER_ENABLED` (default on; `0`/`false`/`off` disables).
 
 ## Subscription payments
 
@@ -135,15 +137,22 @@ opcode anywhere in Kasway. All Kaspa consensus crypto is confined to
 `kasway-covenant`.
 
 The **chain observer** closes the loop: txid submitted at checkout → observed on
-chain → confirmations tracked → covenant `funded`, and (via the keeper /
-customer confirmation) release or auto-refund. It verifies each transaction's
-outputs against the intent's required outputs (exact address + amount —
-mismatches fail closed: `verification_status = failed` + a
-`payment_anomaly_signals` row; the invoice is never marked paid), records the
-`payment_observations` row, and settles once confirmations (virtual DAA −
-accepting DAA) meet the tenant's confirmation policy (`payment_tenant_settings`,
-platform default 10). Progress is checkpointed in
-`payment_indexer_checkpoints` (source `chain_observer`).
+chain → confirmations tracked → covenant `funded` (+ a `payment.confirmed`
+webhook), and then (via the keeper's auto-capture, customer release, or a
+dispute) settlement (`invoice.paid` / `invoice.refunded`). It verifies the
+single covenant funding output — exactly one output to the covenant address
+paying exactly the gross; a second covenant output or an under-/overfunded one
+fails closed: `verification_status = failed` + a `payment_anomaly_signals` row,
+and the invoice is never marked paid — records the `payment_observations` row,
+and marks the covenant funded once confirmations (virtual DAA − accepting DAA)
+meet the tenant's confirmation policy (`payment_tenant_settings`, platform
+default 10). Progress is checkpointed in `payment_indexer_checkpoints` (source
+`chain_observer`).
+
+`GET /api/kpr1/signing-keys` publishes the Ed25519 key(s) intents are signed
+with (`keyId`, raw base64 `publicKey`, SPKI `publicKeyPem`), so any wallet or
+auditor can verify an intent signature offline; the explorer's settlement proof
+uses the same key.
 
 Not yet: no address watching — payments are only observed for transactions whose
 txid a wallet submitted; unsolicited transfers to merchant addresses arrive with

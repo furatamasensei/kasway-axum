@@ -141,6 +141,15 @@ pub fn signing_public_key_b64(seed: &[u8; 32]) -> String {
     B64.encode(SigningKey::from_bytes(seed).verifying_key().to_bytes())
 }
 
+/// The same key as an RFC 8410 SubjectPublicKeyInfo PEM for tools that expect
+/// the standard container: DER = `302a300506032b6570032100` ‖ raw 32 bytes.
+pub fn signing_public_key_pem(seed: &[u8; 32]) -> String {
+    const ED25519_SPKI_PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+    let mut der = ED25519_SPKI_PREFIX.to_vec();
+    der.extend_from_slice(&SigningKey::from_bytes(seed).verifying_key().to_bytes());
+    format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----", B64.encode(der))
+}
+
 /// Verify a base64 ed25519 `signature` over `message` against the seed's public
 /// key. Used by the self-verifying settlement proof — it recomputes the answer
 /// instead of trusting a stored DB flag.
@@ -205,7 +214,6 @@ struct TaxConfig {
 struct SplitOut {
     address: String,
     identifier: String,
-    percentage: f64,
     bps: i64,
 }
 
@@ -259,7 +267,7 @@ fn resolve_split_config(setup: &SetupRow) -> AppResult<(i64, Vec<SplitOut>)> {
         if bps <= 0 {
             return Err(err("Every split payment row must define a percentage greater than 0"));
         }
-        splits.push(SplitOut { address, identifier, percentage: percentage.parse().unwrap_or(0.0), bps });
+        splits.push(SplitOut { address, identifier, bps });
     }
     let ids: std::collections::HashSet<_> = splits.iter().map(|s| &s.identifier).collect();
     if ids.len() != splits.len() {
@@ -379,7 +387,10 @@ impl SplitPlan {
                 "address": s.address,
                 "amountSompi": amt.to_string(),
                 "identifier": s.identifier,
-                "percentage": s.percentage,
+                // Derived from bps so the JSON number is one JavaScript's
+                // `JSON.stringify` reproduces byte-for-byte: `10` (never
+                // `10.0`), `2.5`, `0.01`.
+                "percentage": if s.bps % 100 == 0 { json!(s.bps / 100) } else { json!(s.bps as f64 / 100.0) },
             }));
         }
         outputs.push(json!({
@@ -1095,5 +1106,44 @@ mod tests {
         assert!(!verify_intent_signature(&[8u8; 32], msg, &sig));
         // Public key export is stable base64.
         assert_eq!(signing_public_key_b64(&seed), signing_public_key_b64(&seed));
+    }
+
+    #[test]
+    fn signing_public_key_pem_wraps_the_raw_key_in_spki() {
+        let seed = [9u8; 32];
+        let pem = signing_public_key_pem(&seed);
+        let body = pem
+            .strip_prefix("-----BEGIN PUBLIC KEY-----\n")
+            .and_then(|s| s.strip_suffix("\n-----END PUBLIC KEY-----"))
+            .expect("pem armor");
+        let der = B64.decode(body).unwrap();
+        assert_eq!(der.len(), 44);
+        assert_eq!(encode_hex(&der[..12]), "302a300506032b6570032100");
+        assert_eq!(B64.encode(&der[12..]), signing_public_key_b64(&seed));
+    }
+
+    /// I-10: a wallet re-canonicalizes the intent with `JSON.stringify`, so the
+    /// `percentage` number must survive the JS round trip byte-for-byte.
+    #[test]
+    fn split_percentage_serializes_as_a_javascript_number() {
+        let plan = SplitPlan {
+            merchant_address: "kaspatest:merchant0001".into(),
+            platform_fee_address: "kaspatest:fee0001".into(),
+            tax: TaxConfig { enabled: false, bps: 0, address: None },
+            split_outs: vec![
+                SplitOut { address: "kaspatest:aaa0000000001".into(), identifier: "ten".into(), bps: 1000 },
+                SplitOut { address: "kaspatest:bbb0000000001".into(), identifier: "two-and-a-half".into(), bps: 250 },
+                SplitOut { address: "kaspatest:ccc0000000001".into(), identifier: "one-bp".into(), bps: 1 },
+            ],
+            split_amounts: vec![1000, 250, 1],
+            platform_fee: 100,
+            tax_amount: 0,
+            merchant_net: 8649,
+        };
+        let json = canonicalize(&Value::Array(plan.outputs_json()));
+        assert!(json.contains(r#""percentage":10,"#), "{json}");
+        assert!(json.contains(r#""percentage":2.5,"#), "{json}");
+        assert!(json.contains(r#""percentage":0.01,"#), "{json}");
+        assert!(!json.contains("10.0"), "{json}");
     }
 }

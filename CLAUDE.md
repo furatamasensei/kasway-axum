@@ -85,9 +85,10 @@ payments):
 2. Finalize derives the covenant P2SH address from the signed terms plus the
    payer's refund address; `script_hash`/`covenant_address` are unknown at mint.
 3. `chain_observer.rs` closes the loop for submitted txids only (no address
-   watching): verifies exact required outputs, tracks confirmations
-   (virtual DAA − accepting DAA vs `payment_tenant_settings`), checkpoints in
-   `payment_indexer_checkpoints`.
+   watching): verifies the single covenant funding output (address + exact
+   amount), tracks confirmations (virtual DAA − accepting DAA vs
+   `payment_tenant_settings`), emits `payment.confirmed` on funding, checkpoints
+   in `payment_indexer_checkpoints`.
 4. `covenant_keeper.rs` settles funded covenants after the capture window; the
    keeper only ever signs its own fee input.
 

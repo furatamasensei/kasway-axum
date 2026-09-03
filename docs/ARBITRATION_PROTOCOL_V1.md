@@ -27,6 +27,91 @@ ciphertext, and transaction references. It has no field for a seed phrase,
 private key, decryption key, legal name, email, telephone number, address, or
 identity document.
 
+## Signed envelope and replay protection
+
+Every signed payload carries, in addition to its domain-specific fields:
+
+```json
+{
+  "domain": "kasway/<name>/v1",
+  "protocolVersion": "1",
+  "network": "tn10",
+  "action": "<see table>",
+  "nonce": "<32-byte hex, caller-generated random>",
+  "expiresAt": "<RFC3339, later than server time at submission>"
+}
+```
+
+| Domain | `action` |
+| --- | --- |
+| `kasway/evaluator-profile/v1` | `publish_profile` |
+| `kasway/evaluator-quote/v1` | `issue_quote` |
+| `kasway/evaluator-engagement/v1` | `accept_engagement` |
+| `kasway/dispute-open/v1` | `open_case` |
+| `kasway/case-message/v1` | `negotiation`, `evidence`, `question`, `response`, or `statement` |
+| `kasway/evaluator-decision-commit/v1` | `commit_decision` |
+| `kasway/evaluator-decision-reveal/v1` | `reveal_decision` |
+| `kasway/evaluator-feedback/v1` | `submit_feedback` |
+
+`(signer key, nonce)` is stored in `arbitration_nonces` when the write is
+accepted; a payload whose pair already exists is rejected with HTTP 409
+`{ "message": "...", "code": "ARBITRATION_NONCE_REPLAY" }`. The engagement
+consumes the nonce once per signer (three rows). A request refused by
+validation does not spend its nonce.
+
+## Fee fields (quote and engagement)
+
+```
+feeSompi      string|int, required, > 0
+feePayer      "customer", required
+feeBps        int 0..10000, optional
+feeCapSompi   string|int, optional, > 0
+```
+
+The quote must satisfy `profile.fee.minimumSompi <= feeSompi <=
+profile.fee.maximumSompi` (upper bound only when the profile sets one). When
+`feeBps` is present, `feeSompi == min(feeCapSompi ?? unbounded,
+floor(invoiceGrossSompi * feeBps / 10000))`. Engagement values must equal the
+quote values, and the quote must not have expired.
+
+## Engagement terms
+
+The canonical, three-party-signed terms object contains the envelope fields plus:
+
+```
+engagementId        string
+engagementVersion   int >= 1
+invoiceId           string (invoice public id)
+orderId             string, optional; must equal the invoice external id when both exist
+caseId              string, 1..128 chars; a later dispute MUST open under this id
+quoteId, profileId
+customerKey, sellerKey, evaluatorKey        32-byte x-only hex
+messagingKeys { customer, seller, evaluator }
+caseKeyCommitment, policyHash, evidenceFormatHash   32-byte hex
+rewardAddress       Schnorr P2PK Kaspa address
+disputeDeadline     RFC3339
+decisionSlaSeconds  int > 0
+feeSompi, feePayer, feeBps?, feeCapSompi?
+allowedOutcomes     ["release"] | ["refund"] | ["release","refund"]
+backupEvaluatorKey  32-byte hex, optional
+```
+
+`engagementHash = SHA-256(canonical(terms))`. `GET
+/api/arbitration/engagements/:engagementId` returns the stored terms verbatim
+with all three signatures so a wallet can re-verify before funding:
+
+```json
+{
+  "engagementId": "...",
+  "engagementHash": "<64 hex>",
+  "status": "accepted|funded|disputed|settled|cancelled|expired",
+  "terms": { "...": "exact stored terms object" },
+  "customerSignature": "<128 hex>",
+  "sellerSignature": "<128 hex>",
+  "evaluatorSignature": "<128 hex>"
+}
+```
+
 ## Lifecycle
 
 1. An evaluator publishes a versioned, expiring signed profile.
@@ -62,6 +147,7 @@ identity document.
 | `GET /api/arbitration/evaluators/:profileId/reputation` | Settled-case aggregates |
 | `POST /api/arbitration/quotes` | Publish an evaluator-signed quote |
 | `POST /api/arbitration/engagements` | Submit all three engagement signatures |
+| `GET /api/arbitration/engagements/:id` | Stored terms plus all three signatures |
 | `POST /api/arbitration/engagements/:id/dispute/prepare` | Build participant and fee sighashes |
 | `POST /api/arbitration/engagements/:id/dispute/submit` | Attach signatures and broadcast transition |
 | `POST /api/arbitration/cases` | Publish signed case opening |
@@ -71,14 +157,71 @@ identity document.
 | `POST /api/arbitration/cases/:caseId/decision/reveal` | Verify and store reveal |
 | `POST /api/arbitration/cases/:caseId/settlement/prepare` | Build evaluator and fee sighashes |
 | `POST /api/arbitration/cases/:caseId/settlement/submit` | Broadcast and record terminal spend |
+| `POST /api/arbitration/cases/:caseId/mutual-settlement/prepare` | Customer+seller escape hatch sighashes |
+| `POST /api/arbitration/cases/:caseId/mutual-settlement/submit` | Broadcast the co-signed escape hatch |
 | `POST /api/arbitration/cases/:caseId/feedback` | Publish one bounded role-specific rating |
+
+### Evaluator listing
+
+`GET /api/arbitration/evaluators?category=&language=&maxFeeSompi=&sort=&order=&limit=&offset=`
+
+`sort` is one of `newest` (default), `fee`, `cases`, `resolution_time`, or
+`rating`; `order` is `asc` or `desc` (default `desc`, except `fee` and
+`resolution_time` default to `asc`). `limit` defaults to 50 (max 100),
+`offset` to 0. `maxFeeSompi` compares against the fixed fee or, for bps
+profiles, the minimum fee. Filtering and ordering happen in SQL. Each item is
+the profile plus `reputation`; `meta` is `{ limit, offset, count }`.
+
+### Reputation
+
+Served by `GET /api/arbitration/evaluators/:profileId/reputation` and embedded
+in the profile show/index responses:
+
+```json
+{
+  "verifiedCases": 0,
+  "ratings": 0,
+  "customerAverage": null,
+  "sellerAverage": null,
+  "medianResponseSeconds": null,
+  "medianResolutionSeconds": null,
+  "slaCompletionRate": null,
+  "outcomes": { "release": 0, "refund": 0 }
+}
+```
+
+`verifiedCases` counts settled cases. `medianResponseSeconds` is the median of
+(first evaluator message − case opened) over settled cases, null when the
+evaluator never wrote. `medianResolutionSeconds` is the median of (settled −
+opened). `slaCompletionRate` is the share of settled cases with `settledAt <=
+decisionDueAt`. `outcomes` counts revealed decisions.
+
+### Mutual settlement from a dispute
+
+After the dispute transition, customer and seller may still settle without
+the evaluator by co-signing a spend of the `DisputeV1` covenant
+(`EP_RELEASE_SETTLED`):
+
+`POST /api/arbitration/cases/:caseId/mutual-settlement/prepare` with
+`{ "split": [{ "address": "kaspa:...", "amountSompi": "..." }], "feePayerAddress": "kaspa:..." }`.
+The case must be `open`, `committed`, or `revealed`, the intent
+`dispute_open`, `sum(split) == gross + evaluatorFee`, and `feePayerAddress`
+a Schnorr P2PK address holding a fee UTXO. Response:
+`{ caseId, covenantSighash, feeSighash, feePayerAddress, totalSompi, sigHashType: "SIG_HASH_ALL", algorithm: "schnorr" }`.
+
+`POST /api/arbitration/cases/:caseId/mutual-settlement/submit` takes the same
+body plus `customerSignature`, `sellerSignature`, and `feeSignature` (65-byte
+hex each). On success the case is `settled` (`settlementTxId`, `settledAt`),
+the engagement `settled`, the intent `covenant_state = settled_mutual`, the
+invoice `paid`, and `invoice.paid` is emitted. Response:
+`{ caseId, state: "settled", resolution: "mutual", settlementTxId }`.
 
 ## Message envelope and anchor
 
-The signed message payload includes at least `domain`, `protocolVersion`,
-`network`, `messageId`, `caseId`, `participantRole`, `senderKey`, `sequence`,
-`previousMessageHash`, `payloadHash`, `ciphertext`, and `createdAt`. The request
-wraps it as:
+The signed message payload includes the envelope (`action` is the message
+kind, `expiresAt` is required) plus `messageId`, `caseId`, `participantRole`,
+`senderKey`, `sequence`, `previousMessageHash`, `payloadHash`, `ciphertext`,
+and `createdAt`. The request wraps it as:
 
 ```json
 {

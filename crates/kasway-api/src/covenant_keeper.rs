@@ -1,15 +1,18 @@
 //! Covenant settlement keeper.
 //!
 //! Once the chain observer marks a covenant `funded`, this worker handles the
-//! **auto-refund** side: at/after `expiry`, `refund()` returns the gross to the
-//! customer's address (permissionless — no customer key needed), marks the
-//! invoice `expired`, and emits `invoice.refunded`.
+//! time-based **auto-capture** side: at/after the capture window (judged by
+//! consensus time) it spends the permissionless `release_captured` path, paying
+//! the signed payout split to the merchant, marks the invoice `paid`, and emits
+//! `invoice.paid`. There is no auto-refund.
 //!
-//! The **release** side (paying the merchant) is NOT done here: release now
-//! requires the CUSTOMER's signature (their "confirm delivery"), so it is driven
-//! by a customer-facing endpoint, not this background worker. The keeper only
-//! ever signs its own fee input to pay the miner fee; it never holds a key over
-//! the covenant value. All covenant script/tx crypto lives in `kasway_covenant`.
+//! Everything else is driven by the parties, not this loop: before the window
+//! the customer can release early or open a dispute through the customer-facing
+//! endpoints, and a refund is only ever an authorized covenant spend (merchant
+//! co-sign, arbiter panel, or evaluator decision — the `*_prepare`/`*_submit`
+//! helpers below). The keeper only ever signs its own fee input to pay the
+//! miner fee; it never holds a key over the covenant value. All covenant
+//! script/tx crypto lives in `kasway_covenant`.
 //!
 //! Env: `COVENANT_KEEPER_ENABLED` gate (default on when a keeper fee key and
 //! `KASPA_NODE_URL` are set), `COVENANT_KEEPER_FEE_SECRET` (32-byte hex),
@@ -108,8 +111,8 @@ mod fee_utxo_tests {
 /// Defaults on only when a keeper fee key and a node URL are configured;
 /// `0`/`false`/`off` force-disable.
 pub fn keeper_enabled(toggle_var: &str) -> bool {
-    match std::env::var(toggle_var).ok().as_deref().map(str::trim) {
-        Some("0") | Some("false") | Some("off") | Some("FALSE") | Some("Off") => false,
+    match std::env::var(toggle_var).ok().map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0") | Some("false") | Some("off") => false,
         Some(v) if !v.is_empty() => true,
         _ => {
             std::env::var("COVENANT_KEEPER_FEE_SECRET").ok().filter(|s| !s.trim().is_empty()).is_some()
@@ -183,8 +186,9 @@ pub async fn run_tick(state: &AppState, client: &KaspaWrpcClient) -> Result<usiz
     };
     let min_fee = state.config.covenant.keeper_min_fee_sompi;
 
-    // Only past-expiry funded covenants are auto-refunded here. Before expiry the
-    // covenant waits for the customer to confirm release (a separate endpoint).
+    // Only past-window funded covenants are auto-captured (paid to the merchant)
+    // here. Before that the covenant waits for the customer to confirm release
+    // or open a dispute (separate endpoints).
     //
     // "Past expiry" must be judged by CONSENSUS time, not the wall clock. The
     // release tx carries lock_time = expiry, and the node only accepts it once
@@ -393,7 +397,7 @@ pub(crate) async fn emit_invoice_event(
 }
 
 /// Serialized invoice (post-update) for the settlement webhook payload.
-async fn invoice_payload(state: &AppState, invoice_id: i64) -> Option<serde_json::Value> {
+pub(crate) async fn invoice_payload(state: &AppState, invoice_id: i64) -> Option<serde_json::Value> {
     let inv = invoices::load_by_id(state, invoice_id).await.ok()?;
     let (items, intent) = invoices::load_relations(state, invoice_id).await.ok()?;
     Some(invoices::serialize_invoice(&inv, &items, intent.as_ref()))
@@ -957,11 +961,131 @@ pub async fn evaluator_settlement_submit(
                     .bind(&now).bind(ctx.c.invoice_id).execute(&mut *dbtx).await.map_err(AppError::Database)?;
             }
             dbtx.commit().await.map_err(AppError::Database)?;
+            let event = if release { "invoice.paid" } else { "invoice.refunded" };
+            let _ = emit_invoice_event(state, ctx.c.invoice_id, &ctx.c.public_id, ctx.c.user_id, ctx.c.store_id, event, &tx_id).await;
             Ok(json!({ "caseId":case_id, "state":"settled", "outcome":ctx.outcome, "settlementTxId":tx_id }))
         }
         Err(e) => {
             sqlx::query("UPDATE dispute_cases SET state='revealed',updated_at=$1 WHERE case_id=$2 AND state='settling'").bind(now_iso()).bind(case_id).execute(&state.db.pool).await.ok();
             sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='dispute_open',updated_at=$1 WHERE id=$2 AND covenant_state='dispute_settling'").bind(now_iso()).bind(ctx.c.intent_pk).execute(&state.db.pool).await.ok();
+            Err(e)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Evaluator-protocol escape hatch: after the dispute transition, customer AND
+// seller may co-sign any split of `gross + evaluator fee` out of the DisputeV1
+// covenant (`EP_RELEASE_SETTLED`), bypassing the evaluator decision. Same
+// prepare/submit shape as the decision path; DB preconditions are checked
+// before the node is needed so a bad request never depends on chain access.
+// ---------------------------------------------------------------------------
+
+struct V3MutualCtx {
+    c: Funded,
+    case_state: String,
+    client: KaspaWrpcClient,
+    contracts: kasway_covenant::escrow_v3::EscrowV3Contracts,
+    split: Vec<(Destination, u64)>,
+    dispute_utxo: Utxo,
+    fee_utxo: Utxo,
+    fee_payer: Destination,
+    min_fee: u64,
+    total: u64,
+}
+
+async fn gather_v3_dispute_mutual(
+    state: &AppState, case_id: &str, fee_payer_address: &str, split: &[(String, u64)],
+) -> AppResult<V3MutualCtx> {
+    let case: (String, String) = sqlx::query_as("SELECT engagement_id,state FROM dispute_cases WHERE case_id=$1")
+        .bind(case_id).fetch_optional(&state.db.pool).await.map_err(AppError::Database)?
+        .ok_or_else(AppError::row_not_found)?;
+    if !matches!(case.1.as_str(), "open" | "committed" | "revealed") {
+        return Err(rerr("mutual settlement requires an open, committed, or revealed case"));
+    }
+    let c = load_v3_engagement(state, &case.0, &["dispute_open"]).await?;
+    let (params, prefix, _) = rebuild_v3(state, &c).await?;
+    let contracts = kasway_covenant::escrow_v3::compile_escrow_v3(&params).map_err(|e| rerr(e.to_string()))?;
+    let dispute_address = covenant_address(&contracts.dispute, prefix).map_err(|e| rerr(e.to_string()))?.to_string();
+    let stored: Option<String> = sqlx::query_scalar("SELECT dispute_covenant_address FROM kpr1_payment_intents WHERE id=$1")
+        .bind(c.intent_pk).fetch_one(&state.db.pool).await.map_err(AppError::Database)?;
+    if stored.as_deref() != Some(dispute_address.as_str()) { return Err(rerr("dispute covenant address mismatch")); }
+    kasway_covenant::schnorr_pubkey_from_address(fee_payer_address)
+        .map_err(|_| rerr("feePayerAddress must be a Schnorr P2PK address"))?;
+    let fee_payer = Destination::parse(fee_payer_address).map_err(|e| rerr(format!("invalid fee payer address: {e}")))?;
+    let total = params.dispute.gross_amount.checked_add(params.dispute.evaluator_fee).ok_or_else(|| rerr("escrow_v3 total overflow"))?;
+    let split = parse_split(split, total)?;
+    let client = KaspaWrpcClient::from_env().ok_or_else(|| rerr("Kaspa node is not configured"))?;
+    let (dispute_utxos, fee_utxos) = tokio::join!(client.fetch_utxos(&dispute_address), client.fetch_utxos(fee_payer_address));
+    let dispute_utxo = dispute_utxos.map_err(|e| rerr(e.to_string()))?.into_iter().find(|(_,_,v)| *v==total)
+        .map(|(transaction_id,index,value)| Utxo { transaction_id,index,value }).ok_or_else(|| rerr("dispute covenant UTXO not visible"))?;
+    let min_fee = state.config.covenant.keeper_min_fee_sompi;
+    let fee_utxo = pick_fee_utxo(fee_utxos.map_err(|e| rerr(e.to_string()))?, min_fee)
+        .map(|(transaction_id,index,value)| Utxo { transaction_id,index,value }).ok_or_else(|| rerr("fee payer has no suitable fee UTXO"))?;
+    Ok(V3MutualCtx { c, case_state: case.1, client, contracts, split, dispute_utxo, fee_utxo, fee_payer, min_fee, total })
+}
+
+pub(crate) async fn dispute_mutual_settle_prepare(
+    state: &AppState, case_id: &str, fee_payer_address: &str, split: &[(String, u64)],
+) -> AppResult<serde_json::Value> {
+    let ctx = gather_v3_dispute_mutual(state, case_id, fee_payer_address, split).await?;
+    let draft = kasway_covenant::escrow_v3::prepare_dispute_settlement(
+        &ctx.contracts, &ctx.split, &ctx.dispute_utxo, &ctx.fee_utxo, ctx.min_fee, ctx.fee_payer.address(),
+    ).map_err(|e| rerr(e.to_string()))?;
+    Ok(json!({
+        "caseId": case_id,
+        "covenantSighash": encode_hex(&draft.covenant_sighash),
+        "feeSighash": encode_hex(&draft.fee_sighash.ok_or_else(|| rerr("missing fee sighash"))?),
+        "feePayerAddress": ctx.fee_payer.address().to_string(),
+        "totalSompi": ctx.total.to_string(),
+        "sigHashType": "SIG_HASH_ALL", "algorithm": "schnorr",
+    }))
+}
+
+pub(crate) async fn dispute_mutual_settle_submit(
+    state: &AppState, case_id: &str, fee_payer_address: &str, split: &[(String, u64)],
+    customer_sig_hex: &str, seller_sig_hex: &str, fee_sig_hex: &str,
+) -> AppResult<serde_json::Value> {
+    let customer_sig = decode_sig65(customer_sig_hex)?;
+    let seller_sig = decode_sig65(seller_sig_hex)?;
+    let fee_sig = decode_sig65(fee_sig_hex)?;
+    let ctx = gather_v3_dispute_mutual(state, case_id, fee_payer_address, split).await?;
+    let mut tx = state.db.pool.begin().await.map_err(AppError::Database)?;
+    let case_claim = sqlx::query("UPDATE dispute_cases SET state='settling',updated_at=$1 WHERE case_id=$2 AND state=$3")
+        .bind(now_iso()).bind(case_id).bind(&ctx.case_state).execute(&mut *tx).await.map_err(AppError::Database)?;
+    let intent_claim = sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='dispute_settling',updated_at=$1 WHERE id=$2 AND covenant_state='dispute_open'")
+        .bind(now_iso()).bind(ctx.c.intent_pk).execute(&mut *tx).await.map_err(AppError::Database)?;
+    if case_claim.rows_affected()!=1 || intent_claim.rows_affected()!=1 { return Err(rerr("case is already settling or settled")); }
+    tx.commit().await.map_err(AppError::Database)?;
+    let result = async {
+        let draft = kasway_covenant::escrow_v3::prepare_dispute_settlement(
+            &ctx.contracts, &ctx.split, &ctx.dispute_utxo, &ctx.fee_utxo, ctx.min_fee, ctx.fee_payer.address(),
+        ).map_err(|e| rerr(e.to_string()))?;
+        let spend = kasway_covenant::escrow_v3::complete_dispute_settlement(&ctx.contracts, draft, &customer_sig, &seller_sig, &fee_sig)
+            .map_err(|e| rerr(e.to_string()))?;
+        ctx.client.submit_transaction(rpc_submit_params(&spend)).await.map_err(|e| rerr(e.to_string()))
+    }.await;
+    match result {
+        Ok(tx_id) => {
+            let now = now_iso();
+            let mut dbtx = state.db.pool.begin().await.map_err(AppError::Database)?;
+            sqlx::query("UPDATE dispute_cases SET state='settled',settlement_tx_id=$1,settled_at=$2,updated_at=$2 WHERE case_id=$3 AND state='settling'")
+                .bind(&tx_id).bind(&now).bind(case_id).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+            sqlx::query("UPDATE evaluator_engagements SET status='settled',updated_at=$1 WHERE engagement_id=$2")
+                .bind(&now).bind(&ctx.c.engagement_id).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+            sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='settled_mutual',status='settled',release_tx_id=$1,settled_at=$2,updated_at=$2 WHERE id=$3")
+                .bind(&tx_id).bind(&now).bind(ctx.c.intent_pk).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+            sqlx::query("UPDATE invoices SET status='paid',paid_at=COALESCE(paid_at,$1),updated_at=$1 WHERE id=$2 AND status='open'")
+                .bind(&now).bind(ctx.c.invoice_id).execute(&mut *dbtx).await.map_err(AppError::Database)?;
+            dbtx.commit().await.map_err(AppError::Database)?;
+            let _ = emit_invoice_event(state, ctx.c.invoice_id, &ctx.c.public_id, ctx.c.user_id, ctx.c.store_id, "invoice.paid", &tx_id).await;
+            Ok(json!({ "caseId": case_id, "state": "settled", "resolution": "mutual", "settlementTxId": tx_id }))
+        }
+        Err(e) => {
+            sqlx::query("UPDATE dispute_cases SET state=$1,updated_at=$2 WHERE case_id=$3 AND state='settling'")
+                .bind(&ctx.case_state).bind(now_iso()).bind(case_id).execute(&state.db.pool).await.ok();
+            sqlx::query("UPDATE kpr1_payment_intents SET covenant_state='dispute_open',updated_at=$1 WHERE id=$2 AND covenant_state='dispute_settling'")
+                .bind(now_iso()).bind(ctx.c.intent_pk).execute(&state.db.pool).await.ok();
             Err(e)
         }
     }

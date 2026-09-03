@@ -69,6 +69,9 @@ impl InvoiceRow {
     }
 }
 
+/// Shortest payment window a caller may request; anything under it is unpayable.
+pub const MIN_EXPIRES_IN_SECONDS: i64 = 60;
+
 const INVOICE_COLS: &str = "id, user_id, store_id, public_id, external_id, subscription_id, \
     subscription_cycle_id, payment_link_id, status, payment_address, payment_network, \
     payment_asset, payment_reference, subtotal_amount, total_amount, fee_delegation, \
@@ -899,15 +902,24 @@ pub(crate) async fn create_for_merchant(
         }
     }
 
-    // One contract for every payment request: exactly 15 minutes from mint.
-    // `expiresAt` remains accepted for wire compatibility, but cannot lengthen
-    // or shorten the payment account's lifetime.
-    if input.expires_at.as_deref().is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_err()) {
-        return Err(AppError::commerce(422, "expiresAt must be a valid ISO 8601 date-time"));
-    }
-    let expires_at = Some(to_iso(
-        chrono::Utc::now() + chrono::Duration::seconds(kpr1::PAYMENT_WINDOW_SECONDS),
-    ));
+    // The payment window is capped at 15 minutes from mint. A caller may ask
+    // for a SHORTER `expiresAt` (never a longer one — anything past the cap is
+    // clamped to it); anything under a 60-second floor is rejected as unpayable.
+    let now = chrono::Utc::now();
+    let max_expires_at = now + chrono::Duration::seconds(kpr1::PAYMENT_WINDOW_SECONDS);
+    let expires_at = match input.expires_at.as_deref() {
+        None => max_expires_at,
+        Some(s) => {
+            let requested = chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|_| AppError::commerce(422, "expiresAt must be a valid ISO 8601 date-time"))?
+                .with_timezone(&chrono::Utc);
+            if requested < now + chrono::Duration::seconds(MIN_EXPIRES_IN_SECONDS) {
+                return Err(AppError::commerce(422, "expiresAt must be at least 60 seconds in the future"));
+            }
+            requested.min(max_expires_at)
+        }
+    };
+    let expires_at = Some(to_iso(expires_at));
 
     // amounts — guard every multiply/add against i128 overflow, then bound the
     // results to i64 before the DB casts.

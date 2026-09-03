@@ -302,7 +302,8 @@ async fn serialize(
         },
         "signature": {
             "alg": intent.signature_algorithm, "keyId": intent.signature_key_id, "intentHash": intent.canonical_hash,
-            "payloadHashRule": "canonical_kpr1_intent_sha256", "signaturePayloadRule": "sign_canonical_intent_hash",
+            "payloadHashRule": "canonical_kpr1_intent_sha256", "signaturePayloadRule": "sign_canonical_unsigned_intent",
+            "canonicalization": "json_sorted_keys_utf8",
         },
         "covenant": covenant,
         "outputs": outputs,

@@ -27,6 +27,8 @@ async fn show_intent_projects_payment_facts() {
     assert_eq!(res["payment"]["amountSompi"], "1000");
     assert_eq!(res["signature"]["alg"], "ed25519");
     assert_eq!(res["signature"]["payloadHashRule"], "canonical_kpr1_intent_sha256");
+    assert_eq!(res["signature"]["signaturePayloadRule"], "sign_canonical_unsigned_intent");
+    assert_eq!(res["signature"]["canonicalization"], "json_sorted_keys_utf8");
     assert_eq!(res["outputs"].as_array().unwrap().len(), 2);
     assert_eq!(res["outputs"][0]["role"], "merchant_net");
     assert_eq!(res["outputs"][0]["matched"], false);

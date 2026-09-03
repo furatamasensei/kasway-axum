@@ -37,8 +37,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Background covenant keeper (COVENANT_KEEPER_ENABLED; default on only when a
-    // keeper fee key and KASPA_NODE_URL are configured). Releases funded covenants
-    // before expiry and auto-refunds after.
+    // keeper fee key and KASPA_NODE_URL are configured). Auto-captures funded
+    // covenants to the merchant after the capture window (no auto-refund).
     if kasway_api::covenant_keeper::keeper_enabled("COVENANT_KEEPER_ENABLED") {
         kasway_api::covenant_keeper::spawn(state.clone());
     } else {
@@ -53,9 +53,14 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("subscription biller disabled via SUBSCRIPTION_BILLER_ENABLED");
     }
 
-    // Every KPR-1 payment address is single-use and payable for 15 minutes.
-    // Timely submissions remain open while confirmations finish.
-    kasway_api::invoice_expirer::spawn(state.clone());
+    // Background invoice expirer (INVOICE_EXPIRER_ENABLED, default on). Every
+    // KPR-1 payment address is single-use and payable for at most 15 minutes;
+    // timely submissions remain open while confirmations finish.
+    if kasway_api::invoice_expirer::enabled_from_env() {
+        kasway_api::invoice_expirer::spawn(state.clone());
+    } else {
+        tracing::info!("invoice expirer disabled via INVOICE_EXPIRER_ENABLED");
+    }
 
     let app = kasway_api::build_router(state);
 

@@ -327,3 +327,75 @@ async fn changed_plan_price_is_signed_and_emits_customer_notice_event() {
     .unwrap();
     assert_eq!(notices, 1);
 }
+
+// A plan row whose `invoice_expires_after_seconds` is SHORTER than the 15-minute
+// cap is honored on the cycle invoice (and reported honestly in the snapshot);
+// longer ones are capped at 900 — see
+// `legacy_autopay_input_creates_an_ordinary_subscription_invoice` (86400 -> 900).
+// The plan API pins new plans to the cap, so the shorter window is set on the row.
+#[tokio::test]
+async fn short_plan_window_shortens_the_cycle_invoice() {
+    let app = common::spawn_app().await;
+    let token = common::merchant_with_setup(&app, "short-window@example.com").await;
+    let plan: Value = app
+        .client
+        .post(app.url("/api/commerce/subscription-plans"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "name": "Monthly",
+            "amount": "500000000",
+            "intervalUnit": "month",
+            "intervalCount": 1
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    sqlx::query("UPDATE subscription_plans SET invoice_expires_after_seconds = 300 WHERE public_id = $1")
+        .bind(plan["publicId"].as_str().unwrap())
+        .execute(&app.db.pool)
+        .await
+        .unwrap();
+    let before = chrono::Utc::now();
+    let subscription: Value = app
+        .client
+        .post(app.url("/api/commerce/subscriptions"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "planPublicId": plan["publicId"],
+            "customer": { "email": "buyer@example.com" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(subscription["planSnapshot"]["invoiceExpiresAfterSeconds"], 300);
+
+    let public_id = subscription["publicId"].as_str().unwrap();
+    let checkout: Value = app
+        .client
+        .get(app.url(&format!("/api/checkout/subscriptions/{public_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let invoice_public_id = checkout["currentInvoice"]["publicId"].as_str().unwrap();
+    let intent: Value = app
+        .client
+        .get(app.url(&format!("/api/checkout/invoices/{invoice_public_id}/kpr1-intent")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let expires_at = chrono::DateTime::parse_from_rfc3339(intent["expiresAt"].as_str().unwrap()).unwrap();
+    let secs = (expires_at.with_timezone(&chrono::Utc) - before).num_seconds();
+    assert!((295..=310).contains(&secs), "expected ~300 s window, got {secs} s");
+}

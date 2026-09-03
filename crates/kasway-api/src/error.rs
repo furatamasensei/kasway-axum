@@ -35,6 +35,10 @@ pub enum AppError {
     /// Kpr1PaymentIntentError surfaced directly (checkout): 422 `{ message, code }`.
     #[error("kpr1 error")]
     Kpr1 { code: String, message: String },
+    /// Arbitrary status + `{ message, code }` for machine-readable refusals
+    /// (e.g. 409 `ARBITRATION_NONCE_REPLAY`).
+    #[error("coded error")]
+    Coded { status: u16, code: String, message: String },
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error("internal error")]
@@ -93,6 +97,11 @@ impl AppError {
         AppError::Commerce { status, message: msg.into() }
     }
 
+    /// Status + `{ message, code }`.
+    pub fn coded(status: u16, code: &str, msg: impl Into<String>) -> Self {
+        AppError::Coded { status, code: code.into(), message: msg.into() }
+    }
+
     /// 401 `{ message: "Invalid credentials" }` (AuthController.login).
     pub fn bad_credentials() -> Self {
         AppError::Unauthorized("Invalid credentials")
@@ -120,6 +129,10 @@ impl IntoResponse for AppError {
             AppError::Commerce { status, message } => {
                 let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 (code, Json(MessageBody { message })).into_response()
+            }
+            AppError::Coded { status, code, message } => {
+                let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                (status, Json(serde_json::json!({ "message": message, "code": code }))).into_response()
             }
             AppError::Kpr1 { code, message } => {
                 // The other funnel for KPR-1 refusals (checkout.rs has its own,
